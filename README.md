@@ -2,11 +2,11 @@
 
 [![tests](../../actions/workflows/tests.yml/badge.svg)](../../actions/workflows/tests.yml)
 
-Hand-segmenting axon ROIs took days for each dataset, and the resulting boundaries varied between people. Fibre Sight reads two-dimensional channel-2 reference arrays (`ref_mat_ch2.npy`) and predicts candidate ROIs; the workbench combines a bundled U-Net, the older MSER proposal route, and manual curation, so each proposal can be inspected, deleted, or merged before the resulting `xpix` and `ypix` dictionary is saved.
+With tens of sessions and hundreds of axon/dendrite ROIs, manual curation of these ROIs can take days of effort, and the resulting segmentation also varies between experimenters. Fibre Sight reads two-dimensional channel-2 reference arrays (`ref_mat_ch2.npy`) and predicts candidate ROIs; the workbench combines a bundled U-Net, the older MSER proposal route, and manual curation, so each proposal can be inspected, deleted, or merged before the resulting `xpix` and `ypix` dictionary is saved.
 
 ![Fibre Sight workbench with predicted ROI outlines and the model confidence map](docs/images/fibre-sight-workbench.png)
 
-The bundled `fibre_sight_ch2_v1.pt` checkpoint ([model card](MODEL_CARD.md); [methods and training record](METHODS.md)) was trained on hand-labelled channel-2 axon images. Its default operating point favours recall, with a confidence threshold of `0.25`, a minimum component size of `45` pixels, and four-view flip test-time augmentation.
+This repository comes with a `fibre_sight_ch2_v1.pt` checkpoint ([model card](MODEL_CARD.md); [methods and training record](METHODS.md)) trained on hand-labelled channel-2 axon images from our lab; the data are not included, but 3 example sessions (cropped) are bundled. The checkpoint's default operating point favours recall, with a confidence threshold of `0.25`, a minimum component size of `45` pixels, and four-view flip test-time augmentation.
 
 ## quick start
 
@@ -38,7 +38,7 @@ fibre-sight
 
 PyTorch selects CUDA when a compatible GPU build is present; CPU inference uses the same checkpoint.
 
-On macOS the Python interpreter must be arm64. PyTorch has published no macOS x86_64 wheels since 2.2.2, so an Intel build, including an Anaconda installation running under Rosetta, cannot satisfy the `torch>=2.3` requirement; pip reports that no matching distribution was found and lists nothing above 2.2.2. Check with `python -c "import platform; print(platform.machine())"`, which should print `arm64`. If it prints `x86_64`, install a native arm64 conda such as Miniforge, or use an arm64 Homebrew Python.
+On macOS the Python interpreter *must* be arm64. PyTorch has published no macOS x86_64 wheels since 2.2.2, so an Intel build, including an Anaconda installation running under Rosetta, cannot satisfy the `torch>=2.3` requirement; pip reports that no matching distribution was found and lists nothing above 2.2.2. Check with `python -c "import platform; print(platform.machine())"`, which should print `arm64`. If it prints `x86_64`, install a native arm64 conda such as Miniforge, or use an arm64 Homebrew Python.
 
 ## quick demo
 
@@ -63,7 +63,98 @@ The command uses the bundled checkpoint, prints the number of predicted ROIs, an
 
 Higher `strictness` values retain fewer pixels. `min ROI size` removes small connected components after thresholding. `show model confidence` places the confidence map beneath the ROI outlines; `ROI on / ROI off` leaves the image visible without outlines when the raw channel-2 reference needs inspection. The [methods](METHODS.md#prediction-controls) record gives the defaults and the direction of every prediction and MSER control.
 
-The `MSER + training` tab keeps the earlier MSER proposal route available for new labelling and difficult images. Running MSER again leaves fixed ROIs in place; MSER proposals, loaded labels, and U-Net predictions appear in the same editor.
+## training a new model
+
+The bundled checkpoint covers only our lab's data. It has worked for multiple sensors and animals, but it is not guaranteed that a different indicator, microscope or labelling convention does not need its own model. The training loop is included below for retraining a model fit for new data.
+
+### 1. label sessions
+
+Open the `MSER + training` tab in order to hand-label session images. One can delete, merge, and/or fix proposals made by the MSER algorithm here. Once curation is done for one session, the ROI dictionary can be saved.
+
+Arrange the results so each session directory holds both files:
+
+```
+workspace/labelled_sessions/<session>/processed_data/ref_mat_ch2.npy
+workspace/labelled_sessions/<session>/processed_data/<name>_ROI_dict.npy
+```
+
+The reference array and the ROI dictionary must describe the same image.
+
+### 2. build a manifest
+
+```
+fibre-sight-build-manifest
+```
+
+This scans the labelled sessions, writes `workspace/manifests/ch2_manifest.csv`, and prints the number of included sessions, the animals found, the total ROI count and the split sizes. Splits are assigned at session level with a 15% validation and 15% test fraction by default:
+
+```
+fibre-sight-build-manifest --val-fraction 0.2 --test-fraction 0.2 --seed 11
+```
+
+Use `--no-splits` to write the manifest without splits and assign them in the CSV, which only applies if an animal-held-out design is preferred, rather than the session-level default. `--source-root` and `--out` move the input and output locations.
+
+### 3. edit a training recipe
+
+Copy a shipped config and edit it rather than modifying the packaged file:
+
+```
+cp src/fibre_sight/configs/ch2_unet.yaml workspace/my_recipe.yaml
+```
+
+Paths inside the config resolve against the workspace root, so `data.manifest` of `manifests/ch2_manifest.csv` and `train.out_dir` of `output/runs` need no change at the default locations.
+
+A new dataset usually needs only a few changes: `data.patch_size` and `data.patches_per_image` follow from the field size, with the defaults assuming 256-pixel crops; `data.foreground_fraction` sets how often a crop is centred on labelled pixels, where 0.75 suits sparse fibre masks; `data.normalise_percentiles` clips at the 1st and 99.7th percentiles before scaling; and `train.run_name` names the output directory.
+
+`ch2_unet_aux_recall.yaml` and `ch2_unet_512.yaml` are the two retained trials described in the [methods record](METHODS.md#retained-experiments). They are working experiments rather than tuned alternatives.
+
+### 4. train
+
+```
+fibre-sight-train --config workspace/my_recipe.yaml
+```
+
+Each epoch prints training loss, validation loss and validation Dice, and writes into `workspace/output/runs/<run_name>/`:
+
+- `best.pt`, the weights with the highest mean validation patch Dice, measured at a probability threshold of `0.5` before any component filtering. This is the checkpoint to use for prediction.
+- `latest.pt`, the final epoch, which records where a long run ended.
+- `history.csv`, rewritten every epoch, alongside a `history.png` under the figures directory.
+
+Selection on validation Dice is fixed in the training code, so the saved epoch is often not the epoch where validation loss bottoms out; for the bundled model those were epoch 37 and epoch 59.
+
+Training uses CUDA when available and falls back to CPU. On Apple silicon the run stays on CPU, since MPS is not used.
+
+### 5. evaluate on the held-out split
+
+```
+fibre-sight-evaluate \
+  --manifest workspace/manifests/ch2_manifest.csv \
+  --checkpoint workspace/output/runs/<run_name>/best.pt \
+  --split test \
+  --tta \
+  --out workspace/output/test_metrics.csv
+```
+
+This reports Dice, intersection over union, precision, recall and F2 per session. `--threshold` and `--min-size` override the postprocessing values for sweeping an operating point; unset, they fall back to the recipe defaults.
+
+Choose the operating point after the weights are fixed, and inspect overlays alongside the numbers. Pixel scores describe foreground overlap and hide split and merge errors, so a setting that looks better on Dice can produce visibly worse ROIs. The [methods record](METHODS.md#choosing-the-released-operating-point) shows the sweep behind the bundled `0.25 / 45` default and why it sits between the recall-heavy and Dice-heavy optima.
+
+If the test split shares animals with the training split, as the bundled model's does, treat the result as a descriptive check rather than an external estimate.
+
+### 6. use the new checkpoint
+
+```
+fibre-sight-predict \
+  --image path/to/ref_mat_ch2.npy \
+  --checkpoint workspace/output/runs/<run_name>/best.pt \
+  --threshold 0.25 \
+  --min-size 45 \
+  --out workspace/output/predicted_ROI_dict.npy
+```
+
+Add `--no-tta` to disable four-view flip averaging, which is on by default. In the GUI, use `browse` beside `trained model` on the `predict + curate` tab to point at the new `best.pt` instead of the bundled checkpoint.
+
+A new checkpoint that predicts well enough to seed curation replaces MSER as the proposal route for the next labelling round.
 
 ## common questions
 
