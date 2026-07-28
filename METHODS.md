@@ -1,20 +1,20 @@
-# Fibre Sight methods
+# FibreSight methods
 
 `fibre_sight_ch2_v1.pt` came from 53 hand-labelled dLight imaging sessions and an 80-epoch training run completed on 12 May 2026. The workbench controls, labelling decisions and training record are kept here; fixed artefact details, intended use and licence remain in the [model card](MODEL_CARD.md).
 
 ## prediction controls
 
-The network produces one foreground probability for every image pixel. The controls below change how that probability map is displayed or converted into connected ROI components; changing `strictness` or `min ROI size` reuses the probability map already held in memory.
+The network produces one foreground probability for every image pixel. The controls below change how that probability map is displayed or converted into connected ROI components; changing `strictness` or `minimum ROI size` reuses the probability map already held in memory.
 
 | control | default | effect |
 | --- | ---: | --- |
 | `strictness` | `0.25` | Confidence threshold applied to each pixel. Lower values retain weaker and dimmer responses; higher values retain fewer pixels. |
-| `min ROI size` | `45` pixels | Removes connected components smaller than this area after thresholding. Dimness sensitivity stays unchanged. |
+| `minimum ROI size` | `45` pixels | Removes connected components smaller than this area after thresholding. Dimness sensitivity stays unchanged. |
 | `show model confidence` | off | Displays the probability map beneath the ROI colours. This changes the display only. |
 | `ROI on / ROI off` | on | Shows or hides the ROI overlay while leaving the channel-2 reference visible. |
 | four-view TTA | on | Averages the original image and its horizontal, vertical and two-axis flips. The CLI and API can disable it. |
 
-A faint process with visible confidence can sometimes be recovered by lowering `strictness`. A process absent from the confidence map falls outside the class learned by this checkpoint; `min ROI size` acts only on components already present.
+A faint process with visible confidence can sometimes be recovered by lowering `strictness`. A process absent from the confidence map falls outside the class learned by this checkpoint; `minimum ROI size` acts only on components already present.
 
 ## MSER controls
 

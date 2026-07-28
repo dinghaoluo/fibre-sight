@@ -1,10 +1,21 @@
-.DS_Store
-Thumbs.db
+# local environment files
+.env
+.venv/
+
+# Python cache and build files
+.pytest_cache/
 __pycache__/
 *.py[cod]
 *.egg-info/
 build/
 dist/
-.venv/
+
+# operating-system metadata
+.DS_Store
+Thumbs.db
+
+# generated FibreSight workspace
 workspace/
+
+# log files
 *.log

@@ -1,6 +1,7 @@
 '''
 Created on 24 July 2026
-launch the Fibre Sight workbench
+
+launch the FibreSight workbench
 
 @author: Dinghao Luo
 '''
@@ -12,4 +13,3 @@ from .fibre_sight_workbench_gui import main
 #%% entry point
 if __name__ == '__main__':
     main()
-

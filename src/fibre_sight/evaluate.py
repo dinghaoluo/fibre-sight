@@ -1,5 +1,6 @@
 '''
 Created on 23 April 2026
+
 Modified on 2 June 2026
 Modified on 23 June 2026
 Modified on 23 July 2026 to keep held-out scoring in this script
@@ -16,6 +17,7 @@ import csv
 
 import numpy as np
 
+from ._device import resolve_device
 from ._formatting import print_files_saved
 from .manifest import read_manifest
 from .postprocess import probability_to_labels
@@ -77,11 +79,7 @@ def parse_args():
 
 #%% evaluation
 def evaluate_rows(rows, checkpoint_path, threshold=None, min_size=None, device='auto', tta=False):
-    import torch
-
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    device = torch.device(device)
+    device = resolve_device(device)
 
     model, checkpoint = load_trained_model(checkpoint_path, device)
     data_cfg = checkpoint.get('data_config', {})

@@ -1,5 +1,6 @@
 '''
 Created on 24 July 2026
+
 small console and matplotlib formatting helpers
 
 @author: Dinghao Luo

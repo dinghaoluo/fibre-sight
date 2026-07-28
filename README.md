@@ -1,10 +1,10 @@
-# Fibre Sight
+# FibreSight
 
 [![tests](../../actions/workflows/tests.yml/badge.svg)](../../actions/workflows/tests.yml)
 
-With tens of sessions and hundreds of axon/dendrite ROIs, manual curation of these ROIs can take days of effort, and the resulting segmentation also varies between experimenters. Fibre Sight reads two-dimensional channel-2 reference arrays (`ref_mat_ch2.npy`) and predicts candidate ROIs; the workbench combines a bundled U-Net, the older MSER proposal route, and manual curation, so each proposal can be inspected, deleted, or merged before the resulting `xpix` and `ypix` dictionary is saved.
+With tens of sessions and hundreds of axon/dendrite ROIs, manual curation of these ROIs can take days of effort, and the resulting segmentation also varies between experimenters. FibreSight reads two-dimensional channel-2 reference arrays (`ref_mat_ch2.npy`) and predicts candidate ROIs; the workbench combines a bundled U-Net, the older MSER proposal route, and manual curation, so each proposal can be inspected, deleted, or merged before the resulting `xpix` and `ypix` dictionary is saved.
 
-![Fibre Sight workbench with predicted ROI outlines and the model confidence map](docs/images/fibre-sight-workbench.png)
+![FibreSight workbench with predicted ROI outlines and curation controls](docs/images/fibre-sight-workbench.png)
 
 This repository comes with a `fibre_sight_ch2_v1.pt` checkpoint ([model card](MODEL_CARD.md); [methods and training record](METHODS.md)) trained on hand-labelled channel-2 axon images from our lab; the data are not included, but 3 example sessions (cropped) are bundled. The checkpoint's default operating point favours recall, with a confidence threshold of `0.25`, a minimum component size of `45` pixels, and four-view flip test-time augmentation.
 
@@ -36,9 +36,9 @@ python -m pip install -e .
 fibre-sight
 ```
 
-PyTorch selects CUDA when a compatible GPU build is present; CPU inference uses the same checkpoint.
+Training and inference both default to automatic device selection: PyTorch uses CUDA when it is available, then Apple's MPS backend on Apple silicon, then CPU. The same checkpoint works on all three devices.
 
-On macOS the Python interpreter *must* be arm64. PyTorch has published no macOS x86_64 wheels since 2.2.2, so an Intel build, including an Anaconda installation running under Rosetta, cannot satisfy the `torch>=2.3` requirement; pip reports that no matching distribution was found and lists nothing above 2.2.2. Check with `python -c "import platform; print(platform.machine())"`, which should print `arm64`. If it prints `x86_64`, install a native arm64 conda such as Miniforge, or use an arm64 Homebrew Python.
+On macOS the Python interpreter *must* be arm64. PyTorch has published no macOS x86_64 wheels since 2.2.2, so an Intel build, including an Anaconda installation running under Rosetta, cannot satisfy the `torch>=2.3` requirement; pip reports that no matching distribution was found and lists nothing above 2.2.2. Check with `python -c "import platform; print(platform.machine())"`, which should print `arm64`. If it prints `x86_64`, install a native arm64 conda such as Miniforge, or use an arm64 Homebrew Python. MPS also requires macOS 12.3 or later. Its PyTorch status can be checked with `python -c "import torch; print(torch.backends.mps.is_built(), torch.backends.mps.is_available())"`; both values should be `True` for GPU use.
 
 ## quick demo
 
@@ -47,21 +47,21 @@ Three unlabelled 256 × 256 crops are included under `examples/`: two come from 
 From the repository root:
 
 ```sh
-fibre-sight-predict --image examples/demo_test_ref_mat_ch2.npy --out workspace/output/demo_predicted_ROI_dict.npy --device cpu
+fibre-sight-predict --image examples/demo_test_ref_mat_ch2.npy --out workspace/output/demo_predicted_ROI_dict.npy
 ```
 
-The command uses the bundled checkpoint, prints the number of predicted ROIs, and creates `workspace/output/` when needed. To inspect the same crop in the GUI, start `fibre-sight`, open `predict + curate`, select `examples/demo_test_ref_mat_ch2.npy`, click `load trained model`, then `predict`. `show model confidence` places the confidence map beneath the editable ROI outlines.
+The command uses the bundled checkpoint, chooses the available compute device, prints the number of predicted ROIs, and creates `workspace/output/` when needed. To inspect the same crop in the GUI, start `fibre-sight`, open `predict`, select `examples/demo_test_ref_mat_ch2.npy`, then click `run prediction`. `show model confidence` places the confidence map beneath the editable ROI outlines.
 
 ## predict and curate
 
-1. Open the `predict + curate` tab and select a two-dimensional channel-2 reference `.npy` file.
-2. Leave the bundled checkpoint selected, then click `load trained model`.
-3. Click `predict`. The confidence map is retained in memory, so `strictness` and `min ROI size` can be adjusted without another model pass.
+1. Open the `predict` tab and select a two-dimensional channel-2 reference `.npy` file.
+2. Leave the bundled checkpoint selected, then click `run prediction`.
+3. The confidence map is retained in memory, so `strictness` and `minimum ROI size` can be changed without another model pass. Click `apply settings` to rebuild the proposals from that map.
 4. Inspect the outlines, delete poor proposals, merge fragments when needed, and save the ROI dictionary.
 
-![Switching between the MSER + training and predict + curate tabs](docs/images/predict-curate.gif)
+![the predict, label and train tabs in light and dark mode](docs/images/predict-curate.gif)
 
-Higher `strictness` values retain fewer pixels. `min ROI size` removes small connected components after thresholding. `show model confidence` places the confidence map beneath the ROI outlines; `ROI on / ROI off` leaves the image visible without outlines when the raw channel-2 reference needs inspection. The [methods](METHODS.md#prediction-controls) record gives the defaults and the direction of every prediction and MSER control.
+Higher `strictness` values retain fewer pixels. `minimum ROI size` removes small connected components after thresholding. `show model confidence` places the confidence map beneath the ROI outlines; `ROI on / ROI off` leaves the image visible without outlines when the raw channel-2 reference needs inspection. The [methods](METHODS.md#prediction-controls) record gives the defaults and the direction of every prediction and MSER control.
 
 ## training a new model
 
@@ -69,7 +69,7 @@ The bundled checkpoint covers only our lab's data. It has worked for multiple se
 
 ### 1. label sessions
 
-Open the `MSER + training` tab in order to hand-label session images. One can delete, merge, and/or fix proposals made by the MSER algorithm here. Once curation is done for one session, the ROI dictionary can be saved.
+Open the `label` tab to hand-label session images. One can delete, merge, and/or fix proposals made by the MSER algorithm here. Once curation is done for one session, the ROI dictionary can be saved.
 
 Arrange the results so each session directory holds both files:
 
@@ -96,7 +96,7 @@ Use `--no-splits` to write the manifest without splits and assign them in the CS
 
 ### 3. edit a training recipe
 
-Copy a shipped config and edit it rather than modifying the packaged file:
+Copy a shipped config and edit it without modifying the packaged file:
 
 ```
 cp src/fibre_sight/configs/ch2_unet.yaml workspace/my_recipe.yaml
@@ -104,9 +104,9 @@ cp src/fibre_sight/configs/ch2_unet.yaml workspace/my_recipe.yaml
 
 Paths inside the config resolve against the workspace root, so `data.manifest` of `manifests/ch2_manifest.csv` and `train.out_dir` of `output/runs` need no change at the default locations.
 
-A new dataset usually needs only a few changes: `data.patch_size` and `data.patches_per_image` follow from the field size, with the defaults assuming 256-pixel crops; `data.foreground_fraction` sets how often a crop is centred on labelled pixels, where 0.75 suits sparse fibre masks; `data.normalise_percentiles` clips at the 1st and 99.7th percentiles before scaling; and `train.run_name` names the output directory.
+A new dataset usually needs only a few changes: `data.patch_size` and `data.patches_per_image` follow from the field size, with the defaults assuming 256-pixel crops; `data.foreground_fraction` sets how often a crop is centred on labelled pixels, where 0.75 suits sparse fibre masks; `data.normalise_percentiles` clips at the 1st and 99.7th percentiles before scaling; and `train.run_name` names the output directory. `train.device` defaults to `auto`; it can be set to `mps`, `cuda`, or `cpu` to require one backend. The GUI exposes the same choice under `train` > `advanced options`.
 
-`ch2_unet_aux_recall.yaml` and `ch2_unet_512.yaml` are the two retained trials described in the [methods record](METHODS.md#retained-experiments). They are working experiments rather than tuned alternatives.
+`ch2_unet_aux_recall.yaml` and `ch2_unet_512.yaml` are the two retained trials described in the [methods record](METHODS.md#retained-experiments).
 
 ### 4. train
 
@@ -122,7 +122,7 @@ Each epoch prints training loss, validation loss and validation Dice, and writes
 
 Selection on validation Dice is fixed in the training code, so the saved epoch is often not the epoch where validation loss bottoms out; for the bundled model those were epoch 37 and epoch 59.
 
-Training uses CUDA when available and falls back to CPU. On Apple silicon the run stays on CPU, since MPS is not used.
+Training uses CUDA when available, then MPS on Apple silicon, then CPU. CUDA can use automatic mixed precision when `train.amp` is enabled; MPS training stays in float32, and pinned-memory loading is disabled there because it is CUDA-specific.
 
 ### 5. evaluate on the held-out split
 
@@ -139,8 +139,6 @@ This reports Dice, intersection over union, precision, recall and F2 per session
 
 Choose the operating point after the weights are fixed, and inspect overlays alongside the numbers. Pixel scores describe foreground overlap and hide split and merge errors, so a setting that looks better on Dice can produce visibly worse ROIs. The [methods record](METHODS.md#choosing-the-released-operating-point) shows the sweep behind the bundled `0.25 / 45` default and why it sits between the recall-heavy and Dice-heavy optima.
 
-If the test split shares animals with the training split, as the bundled model's does, treat the result as a descriptive check rather than an external estimate.
-
 ### 6. use the new checkpoint
 
 ```
@@ -152,7 +150,7 @@ fibre-sight-predict \
   --out workspace/output/predicted_ROI_dict.npy
 ```
 
-Add `--no-tta` to disable four-view flip averaging, which is on by default. In the GUI, use `browse` beside `trained model` on the `predict + curate` tab to point at the new `best.pt` instead of the bundled checkpoint.
+Add `--no-tta` to disable four-view flip averaging, which is on by default. In the GUI, use `browse` beside `trained model` on the `predict` tab to point at the new `best.pt` instead of the bundled checkpoint.
 
 A new checkpoint that predicts well enough to seed curation replaces MSER as the proposal route for the next labelling round.
 
@@ -164,7 +162,7 @@ The hand labels generally excluded dim, out-of-plane processes. In dLight imagin
 
 ### Why are there too many or fragmented ROIs?
 
-The released `0.25 / 45` operating point favours recall, so false-positive pixels and fragmented components are expected. Raising `strictness` removes weaker responses; raising `min ROI size` removes small connected components. The remaining proposals can be deleted or merged in the editor before the ROI dictionary is saved.
+The released `0.25 / 45` operating point favours recall, so false-positive pixels and fragmented components are expected. Raising `strictness` removes weaker responses; raising `minimum ROI size` removes small connected components. The remaining proposals can be deleted or merged in the editor before the ROI dictionary is saved.
 
 ### Will the bundled checkpoint work on images from another setup?
 
@@ -196,7 +194,7 @@ The reference array and ROI dictionary must describe the same image. `scan label
 
 ## command-line tools
 
-Installing Fibre Sight adds four command-line tools alongside the GUI:
+Installing FibreSight adds four command-line tools alongside the GUI:
 
 ```text
 fibre-sight-build-manifest
@@ -210,7 +208,7 @@ Each command accepts `--help`. The same tools can be run as modules, for example
 The prediction command uses the bundled checkpoint and its saved operating point by default:
 
 ```sh
-fibre-sight-predict --image examples/demo_test_ref_mat_ch2.npy --out workspace/output/demo_predicted_ROI_dict.npy --device cpu
+fibre-sight-predict --image examples/demo_test_ref_mat_ch2.npy --out workspace/output/demo_predicted_ROI_dict.npy
 ```
 
 Three training recipes are retained under `src/fibre_sight/configs/`: `ch2_unet.yaml` is the default 256-pixel crop recipe, `ch2_unet_aux_recall.yaml` is the support-target recall trial, and `ch2_unet_512.yaml` is the wider 512-pixel crop trial. These are working experiments; no exhaustive model comparison was run.
@@ -225,6 +223,6 @@ python -m unittest discover -s tests -v
 
 ## repository scope
 
-This repository contains the active Fibre Sight workbench extracted from a larger analysis repository. The pretrained checkpoint contains model weights and inference metadata; full source images and hand-labelled ROI dictionaries remain private. The three arrays under `examples/` are the cropped, unlabelled references described above.
+This repository contains the active FibreSight workbench extracted from a larger analysis repository. The pretrained checkpoint contains model weights and inference metadata; full source images and hand-labelled ROI dictionaries remain private. The three arrays under `examples/` are the cropped, unlabelled references described above.
 
 The source code, bundled checkpoint, and demonstration arrays are released under the [MIT License](LICENSE). Mononoki 1.006 by Matthias Tellen is bundled for the interface under the [SIL Open Font License 1.1](src/fibre_sight/assets/fonts/mononoki/LICENSE); its [font note](src/fibre_sight/assets/fonts/mononoki/README.md) records the upstream release.

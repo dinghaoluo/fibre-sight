@@ -1,5 +1,6 @@
 '''
 Created on 22 April 2026
+
 Modified on 23 June 2026
 Modified on 24 July 2026 to use the bundled checkpoint by default
 run a trained model on channel-2 references and save ROI dictionaries
@@ -13,6 +14,7 @@ import argparse
 
 import numpy as np
 
+from ._device import resolve_device
 from ._repo import package_path
 from .image_ops import robust_normalise
 from .model import build_model
@@ -100,11 +102,7 @@ def predict_roi_dict(
         device='auto',
         tta=False,
         ):
-    import torch
-
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    device = torch.device(device)
+    device = resolve_device(device)
 
     model, checkpoint = load_trained_model(checkpoint_path, device)
     data_cfg = checkpoint.get('data_config', {})
