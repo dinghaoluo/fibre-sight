@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from ._device import resolve_device
 from ._formatting import mpl_formatting
 from ._repo import default_figure_root, get_workspace_root, package_path
 from .config import get_section, load_config, resolve_path, save_config
@@ -123,18 +124,21 @@ def parse_args():
 
 #%% setup
 def get_device(device_name):
-    import torch
-
-    if device_name == 'auto':
-        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    return torch.device(device_name)
+    return resolve_device(device_name)
 
 
-def make_dataloaders(config):
+def use_pinned_memory(config, device):
+    train_cfg = get_section(config, 'train')
+    return bool(train_cfg.get('pin_memory', True) and device.type == 'cuda')
+
+
+def make_dataloaders(config, device=None):
     from torch.utils.data import DataLoader
 
     data_cfg = get_section(config, 'data')
     train_cfg = get_section(config, 'train')
+    if device is None:
+        device = get_device(train_cfg.get('device', 'auto'))
 
     manifest_path = resolve_path(data_cfg['manifest'], WORKSPACE_ROOT)
     normalise_percentiles = data_cfg.get('normalise_percentiles', [1, 99.7])
@@ -169,7 +173,7 @@ def make_dataloaders(config):
     loader_args = {
         'batch_size': train_cfg.get('batch_size', 8),
         'num_workers': train_cfg.get('num_workers', 0),
-        'pin_memory': train_cfg.get('pin_memory', True),
+        'pin_memory': use_pinned_memory(config, device),
         }
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_args)
     # validation keeps the image unchanged; only crop selection moves with the epoch
@@ -351,15 +355,15 @@ def main():
 
     args = parse_args()
     config = load_config(args.config)
+    train_cfg = get_section(config, 'train')
+    device = get_device(train_cfg.get('device', 'auto'))
     run_dir = prepare_run_dir(config)
     figure_run_dir = prepare_figure_run_dir(run_dir.name)
 
-    train_cfg = get_section(config, 'train')
-    device = get_device(train_cfg.get('device', 'auto'))
     print(f'training on {device}')
     print(f'run directory: {run_dir}')
 
-    train_dataset, val_dataset, train_loader, val_loader = make_dataloaders(config)
+    train_dataset, val_dataset, train_loader, val_loader = make_dataloaders(config, device)
     print(f'train sessions: {len(train_dataset.rows)}')
     print(f'validation sessions: {len(val_dataset.rows)}')
 

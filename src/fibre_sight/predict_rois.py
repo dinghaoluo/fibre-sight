@@ -13,6 +13,7 @@ import argparse
 
 import numpy as np
 
+from ._device import resolve_device
 from ._repo import package_path
 from .image_ops import robust_normalise
 from .model import build_model
@@ -100,11 +101,7 @@ def predict_roi_dict(
         device='auto',
         tta=False,
         ):
-    import torch
-
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    device = torch.device(device)
+    device = resolve_device(device)
 
     model, checkpoint = load_trained_model(checkpoint_path, device)
     data_cfg = checkpoint.get('data_config', {})

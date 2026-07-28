@@ -3,6 +3,7 @@ Created on 27 April 2026
 Modified on 2 June 2026
 Modified on 23 June 2026
 Modified on 24 July 2026 to use local figure paths and the bundled model
+Modified on 25 July 2026 to follow the selected compute device
 compare held-out model predictions with curated ROIs
 
 @author: Dinghao Luo
@@ -32,6 +33,7 @@ def parse_args():
     parser.add_argument('--checkpoint', type=Path, default=None)
     parser.add_argument('--threshold', type=float, default=None)
     parser.add_argument('--min-size', type=int, default=None)
+    parser.add_argument('--device', default='auto')
     parser.add_argument('--no-tta', action='store_true')
     parser.add_argument('--n', type=int, default=4)
     parser.add_argument('--seed', type=int, default=17)
@@ -118,6 +120,7 @@ def main():
         model_name=args.model_name,
         threshold=args.threshold,
         min_size=args.min_size,
+        device=args.device,
         tta=False if args.no_tta else None,
     )
     plot_rows(rows, predictor, args.out)

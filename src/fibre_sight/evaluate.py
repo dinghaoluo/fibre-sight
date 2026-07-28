@@ -16,6 +16,7 @@ import csv
 
 import numpy as np
 
+from ._device import resolve_device
 from ._formatting import print_files_saved
 from .manifest import read_manifest
 from .postprocess import probability_to_labels
@@ -77,11 +78,7 @@ def parse_args():
 
 #%% evaluation
 def evaluate_rows(rows, checkpoint_path, threshold=None, min_size=None, device='auto', tta=False):
-    import torch
-
-    if device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    device = torch.device(device)
+    device = resolve_device(device)
 
     model, checkpoint = load_trained_model(checkpoint_path, device)
     data_cfg = checkpoint.get('data_config', {})

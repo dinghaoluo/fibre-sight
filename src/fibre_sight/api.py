@@ -1,5 +1,6 @@
 '''
 Created on 29 April 2026
+
 Modified on 3 June 2026
 Modified on 24 July 2026 to load the bundled channel-2 checkpoint
 model loading and prediction used by the workbench
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ._device import resolve_device
 from ._repo import package_path
 from .config import load_config
 from .fibre_segger_params import recommend_fibre_segger_params
@@ -82,7 +84,7 @@ class AxonROIPredictor:
             model_name,
             registry_path=registry_path,
             )
-        self.device = self._get_device(device)
+        self.device = resolve_device(device)
         self.model = None
         self.checkpoint = None
         self.threshold = threshold
@@ -154,14 +156,6 @@ class AxonROIPredictor:
             save_roi_dict(prediction.roi_dict, out_path)
 
         return prediction
-
-    @staticmethod
-    def _get_device(device):
-        import torch
-
-        if device == 'auto':
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        return torch.device(device)
 
 
 #%% convenience functions
