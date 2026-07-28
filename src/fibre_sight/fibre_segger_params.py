@@ -1,5 +1,6 @@
 '''
 Created on 12 May 2026
+
 starting values for the MSER controls carried over from FibreSegger
 
 @author: Dinghao Luo
