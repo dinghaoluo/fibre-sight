@@ -4,17 +4,15 @@
 
 ## prediction controls
 
-The network produces one foreground probability for every image pixel. The controls below change how that probability map is displayed or converted into connected ROI components; changing `strictness` or `minimum ROI size` reuses the probability map already held in memory.
+The network produces one foreground probability for every image pixel. The controls below convert that probability map into connected ROI components; changing `prediction threshold` or `minimum ROI area (pixels)` reuses the probability map already held in memory.
 
 | control | default | effect |
 | --- | ---: | --- |
-| `strictness` | `0.25` | Confidence threshold applied to each pixel. Lower values retain weaker and dimmer responses; higher values retain fewer pixels. |
-| `minimum ROI size` | `45` pixels | Removes connected components smaller than this area after thresholding. Dimness sensitivity stays unchanged. |
-| `show model confidence` | off | Displays the probability map beneath the ROI colours. This changes the display only. |
-| `ROI on / ROI off` | on | Shows or hides the ROI overlay while leaving the channel-2 reference visible. |
+| `prediction threshold` | `0.25` | Confidence threshold applied to each pixel. Lower values retain weaker and dimmer responses; higher values retain fewer pixels. |
+| `minimum ROI area (pixels)` | `45` pixels | Removes connected components smaller than this area after thresholding. Dimness sensitivity stays unchanged. |
 | four-view TTA | on | Averages the original image and its horizontal, vertical and two-axis flips. The CLI and API can disable it. |
 
-A faint process with visible confidence can sometimes be recovered by lowering `strictness`. A process absent from the confidence map falls outside the class learned by this checkpoint; `minimum ROI size` acts only on components already present.
+A faint process with visible confidence can sometimes be recovered by lowering the `prediction threshold`. A process absent from the confidence map falls outside the class learned by this checkpoint; `minimum ROI area (pixels)` acts only on components already present.
 
 ## MSER controls
 
@@ -22,19 +20,19 @@ The older MSER route remains in the workbench because it was the proposal method
 
 | control | default | effect |
 | --- | ---: | --- |
-| `MSER threshold` | `85.0` | Brightness percentile applied before candidate detection. |
-| `MSER min area` | `30` pixels | Smallest region passed to MSER. |
-| `MSER max area` | `15000` pixels | Largest region passed to MSER. |
-| `MSER delta` | `5` | Intensity step used when MSER tests region stability. |
-| `MSER max variation` | `1.2` | Stability filter; lower values are stricter. |
-| `area min` | `30` pixels | Smallest final ROI retained after the shape filters. |
-| `eccentricity min` | `0.75` | Higher values favour elongated regions. |
-| `aspect ratio min` | `1.2` | Minimum long-axis to short-axis ratio. |
-| `solidity min` | `0.1` | Minimum filled-area ratio accepted for a candidate. |
-| `thinness max` | `0.8` | Compactness ceiling; lower values favour thinner regions. |
+| `brightness threshold` | `85.0` | Brightness percentile applied before candidate detection. |
+| `candidate area minimum` | `30` pixels | Lower bound for regions passed to MSER. |
+| `candidate area maximum` | `15000` pixels | Upper bound for regions passed to MSER. |
+| `delta` | `5` | Intensity step used when MSER tests region stability. |
+| `maximum variation` | `1.2` | Stability filter; lower values are stricter. |
+| `ROI area minimum` | `30` pixels | Lower bound for final ROIs after shape filtering. |
+| `eccentricity minimum` | `0.75` | Higher values favour elongated regions. |
+| `aspect-ratio minimum` | `1.2` | Minimum long-axis to short-axis ratio. |
+| `solidity minimum` | `0.1` | Minimum filled-area ratio accepted for a candidate. |
+| `thinness maximum` | `0.8` | Compactness ceiling; lower values favour thinner regions. |
 | `tophat kernel` | `11` pixels | Scale of the background-removal filter used before MSER. |
-| `clahe clip` | `2.0` | Strength of local contrast equalisation. |
-| `clip-percentile` | `99.0` | Upper intensity percentile used before MSER normalisation. |
+| `CLAHE clip` | `2.0` | Strength of local contrast equalisation. |
+| `intensity clip` | `99.0` | Upper intensity percentile used before MSER normalisation. |
 
 Fixed ROIs are written into the label image before a new MSER pass, so a hand decision survives later changes to these controls.
 
@@ -56,13 +54,13 @@ The split was made at session level. All four animals appeared in each split, so
 
 ## image preparation and sampling
 
-Each full reference image was clipped and scaled between its 1st and 99.7th intensity percentiles. The training loader then drew 24 patches of 256 × 256 pixels per session during each epoch; 75% of crop centres were sampled from foreground pixels, while the remainder were placed randomly so that background-only patches remained part of the task. Validation used eight patches per session without augmentation.
+Each full reference image was clipped and scaled between its 1st and 99.7th intensity percentiles. The training loader then drew 24 patches of 256 × 256 pixels per session during each epoch; 75% of crop centres were sampled from foreground pixels, whilst the remainder were placed randomly so that background-only patches remained part of the task. Validation used eight patches per session without augmentation.
 
 Training augmentation used independent horizontal and vertical flips, rotations in 90-degree steps, intensity scaling of up to 15%, a small intensity offset, and Gaussian noise with a standard deviation of `0.02` after normalisation. The random crop and augmentation sequence changed with the epoch and remained reproducible from seed `7`.
 
 ## network and optimisation
 
-The selected model is the package's `SmallUNet`: one input channel, one foreground-logit output channel, four resolution levels and base width `24`, giving channel widths of 24, 48, 96 and 192. Each level uses two 3 × 3 convolution, batch-normalisation and ReLU blocks; downsampling uses max pooling, while the decoder uses transposed convolution and skip connections.
+The selected model is the package's `SmallUNet`: one input channel, one foreground-logit output channel, four resolution levels and base width `24`, giving channel widths of 24, 48, 96 and 192. Each level uses two 3 × 3 convolution, batch-normalisation and ReLU blocks; downsampling uses max pooling, whilst the decoder uses transposed convolution and skip connections.
 
 The loss was the equally weighted sum of binary cross-entropy with logits and soft Dice loss. AdamW used a learning rate of `3e-4`, weight decay of `1e-5` and batch size `8`; training ran for 80 epochs with automatic mixed precision when CUDA was available. The complete recipe remains in [`ch2_unet.yaml`](src/fibre_sight/configs/ch2_unet.yaml).
 
@@ -86,7 +84,7 @@ Threshold and minimum component size were tuned after the network weights had be
 
 The released `0.25 / 45` setting sits between the most recall-heavy and Dice-heavy validation optima. ROI overlays and component counts were inspected alongside these pixel scores because a setting with high foreground overlap can still split one axon into several proposals, or merge neighbouring axons into one.
 
-Gradient training and epoch selection used the training and validation splits. The nine test sessions entered the decision record later, when their results were consulted while settling the public postprocessing setting; the reported test scores are therefore a descriptive evaluation of the released configuration. A future animal-held-out evaluation with a fixed operating point would provide a cleaner external estimate.
+Gradient training and epoch selection used the training and validation splits. The nine test sessions entered the decision record later, when their results were consulted whilst settling the public postprocessing setting; the reported test scores are therefore a descriptive evaluation of the released configuration. A future animal-held-out evaluation with a fixed operating point would provide a cleaner external estimate.
 
 ## evaluation metrics
 
@@ -104,8 +102,8 @@ The released setting predicted a mean of 38.2 connected components per test sess
 
 ## retained experiments
 
-Two later recipes remain beside the selected baseline. `ch2_unet_aux_recall.yaml` added a dilated support target and Tversky loss; `ch2_unet_512.yaml` used 512-pixel crops and a wider network. The 256-pixel baseline remained the released model. The comparison stopped with these working trials while the labelling and curation loop was still changing.
+Two later recipes remain beside the selected baseline. `ch2_unet_aux_recall.yaml` added a dilated support target and Tversky loss; `ch2_unet_512.yaml` used 512-pixel crops and a wider network. The 256-pixel baseline remained the released model. The comparison stopped with these working trials whilst the labelling and curation loop was still changing.
 
 ## scope
 
-The checkpoint was trained and tested within one dLight acquisition source. Percentile normalisation handles simple changes in signal scale. A new indicator, microscope point-spread function, field size, background texture or labelling convention changes the spatial problem and remains outside that correction. Images from another domain need hand-labelled checks; repeated misses in the confidence map are evidence for retraining, while below-threshold responses can be explored with the prediction controls at the top of this file.
+The checkpoint was trained and tested within one dLight acquisition source. Percentile normalisation handles simple changes in signal scale. A new indicator, microscope point-spread function, field size, background texture or labelling convention changes the spatial problem and remains outside that correction. Images from another domain need hand-labelled checks; repeated misses in the confidence map are evidence for retraining, whilst below-threshold responses can be explored with the prediction controls at the top of this file.

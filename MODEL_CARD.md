@@ -46,7 +46,7 @@ The model is a research segmentation aid and has not been evaluated for clinical
 
 ## limits
 
-Recall was `0.9260965`, while precision was `0.5957682`; false-positive foreground is therefore expected at this operating point. Changes in indicator, microscope, field size, preprocessing, signal range, or axon morphology may reduce performance. Percentile normalisation cannot correct acquisition changes that alter spatial structure, background texture, or the appearance of labelled fibres.
+Recall was `0.9260965`, whilst precision was `0.5957682`; false-positive foreground is therefore expected at this operating point. Changes in indicator, microscope, field size, preprocessing, signal range, or axon morphology may reduce performance. Percentile normalisation cannot correct acquisition changes that alter spatial structure, background texture, or the appearance of labelled fibres.
 
 The nine test sessions came from the same data source as the training set; performance on other laboratories' images is unknown.
 
