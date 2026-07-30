@@ -1,7 +1,7 @@
 '''
 Created on 12 May 2026
 
-Modified on 13 May 2026 while wiring the MSER controls into the workbench
+Modified on 13 May 2026 whilst wiring the MSER controls into the workbench
 Modified on 21 May 2026 to separate labelling, training, prediction, and editing
 Modified on 2 June 2026 during the first command-line and diagnostics pass
 Modified on 23 June 2026 to bring the MSER editor and model workflow together
@@ -15,6 +15,8 @@ fibre-sight workbench for labelling, training, prediction, and ROI curation
 
 #%% imports
 from pathlib import Path
+import re
+import shlex
 import sys
 
 import matplotlib
@@ -24,18 +26,36 @@ matplotlib.use('Qt5Agg')
 import numpy as np
 from matplotlib import font_manager
 from matplotlib.figure import Figure
-from PyQt5.QtCore import QProcess, Qt
-from PyQt5.QtGui import QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPalette, QTextCursor
+from PyQt5.QtCore import (
+    QByteArray,
+    QItemSelectionModel,
+    QProcess,
+    QSignalBlocker,
+    QTimer,
+    Qt,
+    )
+from PyQt5.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QFontDatabase,
+    QIcon,
+    QKeySequence,
+    QPalette,
+    QTextCursor,
+    )
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QAbstractSpinBox,
     QApplication,
+    QButtonGroup,
     QCheckBox,
-    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -45,8 +65,11 @@ from PyQt5.QtWidgets import (
     QShortcut,
     QSizePolicy,
     QScrollArea,
+    QSlider,
     QSplitter,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -79,32 +102,291 @@ WORKSPACE_ROOT = get_workspace_root()
 APP_ICON_PATH = package_path('assets', 'fibresight_icon.ico')
 MONONOKI_FONT_DIR = package_path('assets', 'fonts', 'mononoki')
 MONONOKI_FONT_FAMILY = 'mononoki'
-CORE_SEGMENT_PARAMETERS = (
-    'MSER threshold',
-    'MSER min area',
-    'MSER max area',
-    'area min',
-    )
+DISPLAY_BLACK_DEFAULT = 1.0
+DISPLAY_WHITE_DEFAULT = 99.7
+DISPLAY_MIN_GAP = 1.0
+DISPLAY_REDRAW_MS = 33
+CURATION_WIDE_MIN_WIDTH = 650
+SELECTION_OUTER_COLOUR = '#1a1a1c'
+SELECTION_INNER_COLOUR = '#f4f2ec'
+SELECTION_OUTER_WIDTH = 4.2
+SELECTION_INNER_WIDTH = 2.4
+SELECTION_COLOUR_WIDTH = 1.0
+
+SEGMENT_GROUPS = (
+    (
+        'preprocessing',
+        (
+            ('tophat kernel', 'tophat kernel'),
+            ('clahe clip', 'CLAHE clip'),
+            ('clip-percentile', 'intensity clip'),
+        ),
+    ),
+    (
+        'MSER detection',
+        (
+            ('MSER threshold', 'brightness threshold'),
+            ('MSER delta', 'delta'),
+            ('MSER max variation', 'maximum variation'),
+            ('MSER min area', 'candidate area minimum'),
+            ('MSER max area', 'candidate area maximum'),
+        ),
+    ),
+    (
+        'ROI filters',
+        (
+            ('area min', 'ROI area minimum'),
+            ('solidity min', 'solidity minimum'),
+            ('eccentricity min', 'eccentricity minimum'),
+            ('thinness max', 'thinness maximum'),
+            ('aspect ratio min', 'aspect-ratio minimum'),
+        ),
+    ),
+)
+
+_GUI_FONT = None
+_GUI_BOLD_FONT = None
+_GUI_FONT_FAMILY = None
 
 
 #%% helpers
-def load_gui_font(size=9):
-    for font_path in sorted(MONONOKI_FONT_DIR.glob('*.ttf')):
-        QFontDatabase.addApplicationFont(str(font_path))
-        font_manager.fontManager.addfont(str(font_path))
+def _system_gui_font_size():
+    font = QFontDatabase.systemFont(QFontDatabase.GeneralFont)
+    point_size = font.pointSizeF()
+    if point_size > 0:
+        return point_size
+    app = QApplication.instance()
+    if app is not None and app.font().pointSizeF() > 0:
+        return app.font().pointSizeF()
+    return 10.0
 
-    matplotlib.rcParams['font.family'] = MONONOKI_FONT_FAMILY
-    matplotlib.rcParams['font.monospace'] = [MONONOKI_FONT_FAMILY, 'Consolas', 'Courier New']
-    return QFont(MONONOKI_FONT_FAMILY, size)
+
+def load_gui_font(size=None, bold=False):
+    global _GUI_FONT, _GUI_BOLD_FONT, _GUI_FONT_FAMILY
+    if _GUI_FONT is None:
+        families = set()
+        for font_path in sorted(MONONOKI_FONT_DIR.glob('*.ttf')):
+            # loading from data avoids macOS quarantine blocking application fonts
+            font_data = QByteArray(font_path.read_bytes())
+            font_id = QFontDatabase.addApplicationFontFromData(font_data)
+            if font_id >= 0:
+                families.update(QFontDatabase.applicationFontFamilies(font_id))
+            font_manager.fontManager.addfont(str(font_path))
+
+        expected = MONONOKI_FONT_FAMILY.casefold()
+        matches = [family for family in families if family.casefold() == expected]
+        family = matches[0] if matches else None
+        if family is not None:
+            styles = {style.casefold() for style in QFontDatabase().styles(family)}
+            if not {'regular', 'bold'}.issubset(styles):
+                family = None
+
+        if family is None:
+            fallback = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+            family = fallback.family()
+
+        _GUI_FONT_FAMILY = family
+        base_size = _system_gui_font_size()
+        _GUI_FONT = QFont(family)
+        _GUI_FONT.setPointSizeF(base_size)
+        _GUI_FONT.setWeight(QFont.Normal)
+        _GUI_BOLD_FONT = QFont(family)
+        _GUI_BOLD_FONT.setPointSizeF(base_size)
+        _GUI_BOLD_FONT.setWeight(QFont.Bold)
+        for font in (_GUI_FONT, _GUI_BOLD_FONT):
+            font.setStyleStrategy(QFont.PreferAntialias)
+
+        matplotlib.rcParams['font.family'] = family
+        matplotlib.rcParams['font.monospace'] = [
+            family,
+            'Menlo',
+            'Consolas',
+            'Courier New',
+            ]
+        matplotlib.rcParams['lines.antialiased'] = True
+        matplotlib.rcParams['patch.antialiased'] = True
+        matplotlib.rcParams['text.antialiased'] = True
+
+    source = _GUI_BOLD_FONT if bold else _GUI_FONT
+    font = QFont(source)
+    font.setPointSizeF(
+        _system_gui_font_size() if size is None else float(size)
+        )
+    return font
+
+
+def display_path(path):
+    path = Path(path)
+    try:
+        return str(path.resolve().relative_to(WORKSPACE_ROOT.resolve()))
+    except (OSError, ValueError):
+        try:
+            parts = path.resolve().relative_to(Path.home().resolve()).parts
+        except (OSError, ValueError):
+            parts = path.parts
+            if path.anchor and parts and parts[0] == path.anchor:
+                parts = parts[1:]
+        return str(Path('…', *parts[-3:]))
+
+
+def elide_path(path_text, metrics, width):
+    if not path_text or metrics.horizontalAdvance(path_text) <= width:
+        return path_text
+
+    path = Path(path_text)
+    parts = list(path.parts)
+    if len(parts) <= 1:
+        return metrics.elidedText(path_text, Qt.ElideMiddle, width)
+
+    filename = parts[-1]
+    prefix = parts[0] if parts[0] not in {'/', '\\'} else ''
+    candidates = []
+    if prefix and prefix != '…':
+        candidates.append(str(Path(prefix, '…', filename)))
+    candidates.append(str(Path('…', filename)))
+    for candidate in candidates:
+        if metrics.horizontalAdvance(candidate) <= width:
+            return candidate
+    return metrics.elidedText(filename, Qt.ElideMiddle, width)
+
+
+def format_log_text(text):
+    text = str(text)
+    try:
+        workspace = str(WORKSPACE_ROOT.resolve())
+    except OSError:
+        workspace = str(WORKSPACE_ROOT)
+    text = text.replace(workspace, '.')
+
+    quoted_path = re.compile(r'(?P<quote>[\'"])(?P<path>/[^\'"]+)(?P=quote)')
+    def replace_quoted_path(match):
+        quote = match.group('quote')
+        shortened_path = display_path(match.group('path'))
+        return f'{quote}{shortened_path}{quote}'
+
+    text = quoted_path.sub(replace_quoted_path, text)
+
+    home = str(Path.home())
+    lines = []
+    for line in text.splitlines(keepends=True):
+        line_end = len(line.rstrip('\r\n'))
+        content = line[:line_end]
+        path_start = None
+        for marker in (' from ', ' to ', ': '):
+            marker_idx = content.rfind(marker)
+            if marker_idx < 0:
+                continue
+            candidate = content[marker_idx + len(marker):]
+            if candidate.startswith('/') or re.match(r'^[A-Za-z]:[\\/]', candidate):
+                path_start = marker_idx + len(marker)
+                break
+
+        if path_start is None:
+            home_idx = content.find(home)
+            if home_idx >= 0:
+                path_start = home_idx
+
+        if path_start is not None:
+            candidate = content[path_start:]
+            line = (
+                line[:path_start] +
+                display_path(candidate) +
+                line[line_end:]
+                )
+        lines.append(line)
+    text = ''.join(lines)
+
+    path_pattern = re.compile(r'(?<![\w.…])/(?:[^\s|,;:()]+/)*[^\s|,;:()]+')
+    return path_pattern.sub(lambda match: display_path(match.group(0)), text)
+
+
+class ElidedLabel(QLabel):
+    def __init__(self, text='', mode=Qt.ElideMiddle):
+        super().__init__()
+        self._full_text = ''
+        self._elide_mode = mode
+        self.setMinimumWidth(0)
+        self.setText(text)
+
+    def text(self):
+        return self._full_text
+
+    def setText(self, text):
+        self._full_text = str(text)
+        self.setToolTip(self._full_text)
+        self._update_elision()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_elision()
+
+    def _update_elision(self):
+        shown = self.fontMetrics().elidedText(
+            self._full_text,
+            self._elide_mode,
+            max(0, self.width()),
+            )
+        QLabel.setText(self, shown)
+
+
+class PathLineEdit(QLineEdit):
+    def __init__(self, text=''):
+        super().__init__()
+        self._overlay = QLabel(self)
+        self._overlay.setObjectName('pathOverlay')
+        self._overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._overlay.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.textChanged.connect(self._update_path_display)
+        self.setText(text)
+
+    def focusInEvent(self, event):
+        self._overlay.hide()
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self._update_path_display()
+        self._overlay.show()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_overlay()
+        self._update_path_display()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._position_overlay()
+        self._update_path_display()
+        if not self.hasFocus():
+            self._overlay.show()
+
+    def _position_overlay(self):
+        frame = self.style().pixelMetric(self.style().PM_DefaultFrameWidth, None, self)
+        self._overlay.setGeometry(
+            frame + 5,
+            frame,
+            max(0, self.width() - 2 * frame - 10),
+            max(0, self.height() - 2 * frame),
+            )
+
+    def _update_path_display(self, _text=None):
+        text = self.text()
+        self.setToolTip(text)
+        shown = display_path(text) if text else ''
+        metrics = self._overlay.fontMetrics()
+        self._overlay.setText(elide_path(shown, metrics, self._overlay.width()))
 
 
 #%% main window
 class FibreSightWorkbench(QMainWindow):
     def __init__(self):
-        super().__init__()
         app = QApplication.instance()
         if app is not None:
-            app.setFont(load_gui_font())
+            app.setStyle('Fusion')
+        gui_font = load_gui_font() if app is not None else None
+        super().__init__()
+        if app is not None and gui_font is not None:
+            app.setFont(gui_font)
         self.setWindowTitle('fibre-sight')
         self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1280, 820)
@@ -124,8 +406,16 @@ class FibreSightWorkbench(QMainWindow):
         self.current_process_name = None
         self.pending_checkpoint_path = None
         self.last_saved_model_path = None
-        self.loaded_device_choice = None
-        self.dark_mode = False
+        self.dark_mode = True
+        self.display_black = DISPLAY_BLACK_DEFAULT
+        self.display_white = DISPLAY_WHITE_DEFAULT
+        self.display_mode = 'image'
+        self._syncing_roi_table = False
+        self._process_stdout_buffer = ''
+        self._process_stderr_buffer = ''
+        self._process_was_stopped = False
+        self._controls_split_positions = {}
+        self._sizing_controls_splitter = False
 
         self._build_widgets()
         self._build_layout()
@@ -133,6 +423,12 @@ class FibreSightWorkbench(QMainWindow):
         self._connect_shortcuts()
         self.plot_image()
         self.refresh_status()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.schedule_curation_layout()
+        if hasattr(self, 'controls_split_timer'):
+            self.controls_split_timer.start(0)
 
     #%% setup
     def _build_widgets(self):
@@ -146,21 +442,39 @@ class FibreSightWorkbench(QMainWindow):
         self.canvas.setFocusPolicy(Qt.StrongFocus)
         self.canvas.setAccessibleName('ROI image canvas')
         self.canvas.setAccessibleDescription(
-            'channel-2 image and editable ROI overlay; '
-            'click an ROI to select; Shift-click adds; right-drag pans; scroll zooms'
+            'click ROI to select · drag to pan · scroll or ± to zoom · '
+            'Shift-click to add an ROI to the selection'
             )
-        self.canvas.mpl_connect('button_press_event', self.on_click)
+        self.canvas.setToolTip('')
+        self.canvas.mpl_connect('button_release_event', self.on_click)
 
-        self.state_label = QLabel('image: not loaded')
+        self.state_label = ElidedLabel('image: not loaded')
         self.state_label.setObjectName('stateSummary')
+        self.state_label.setFont(load_gui_font(bold=True))
+        self.state_label.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Preferred,
+            )
         self.roi_label = QLabel('0 ROIs | 0 selected | 0 fixed')
         self.roi_label.setObjectName('panelValue')
-        self.model_label = QLabel('model: not loaded')
+        self.model_separator = QLabel('·')
+        self.model_separator.setObjectName('panelValue')
+        self.model_label = ElidedLabel('model: not selected')
         self.model_label.setObjectName('panelValue')
+        self.model_label.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Preferred,
+            )
 
         self.tabs = QTabWidget()
         self.predict_tab, self.predict_tab_content = self._make_scroll_tab()
-        self.mser_tab, self.mser_tab_content = self._make_scroll_tab()
+        (
+            self.mser_tab,
+            self.mser_scroll,
+            self.mser_tab_content,
+            self.mser_action_bar,
+            self.mser_action_layout,
+            ) = self._make_label_tab()
         self.training_tab, self.training_tab_content = self._make_scroll_tab()
         self.tabs.addTab(self.predict_tab, 'Predict')
         self.tabs.addTab(self.mser_tab, 'Label')
@@ -168,17 +482,19 @@ class FibreSightWorkbench(QMainWindow):
         self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.tabs.tabBar().setExpanding(False)
         self.tabs.tabBar().setUsesScrollButtons(True)
-        self.tabs.currentChanged.connect(lambda _: self.refresh_status())
+        self.tabs.currentChanged.connect(self.controls_tab_changed)
         self._build_training_widgets()
         self._build_prediction_widgets()
         self._build_segment_widgets()
         self._build_editing_widgets()
+        self._build_persistent_widgets()
         self.output_box = self.make_log_box()
 
         self.roi_overlay_check = QCheckBox('ROI on')
         self.roi_overlay_check.setChecked(True)
         self.roi_overlay_check.stateChanged.connect(self.set_roi_overlay_visible)
         self.dark_mode_check = QCheckBox('dark mode')
+        self.dark_mode_check.setChecked(True)
         self.dark_mode_check.stateChanged.connect(self.set_dark_mode)
 
     def _make_scroll_tab(self):
@@ -191,10 +507,28 @@ class FibreSightWorkbench(QMainWindow):
         scroll.setWidget(content)
         return scroll, content
 
+    def _make_label_tab(self):
+        tab = QWidget()
+        tab.setObjectName('labelTab')
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        scroll, content = self._make_scroll_tab()
+        action_bar = QFrame()
+        action_bar.setObjectName('labelActionBar')
+        action_layout = QHBoxLayout(action_bar)
+        action_layout.setContentsMargins(10, 8, 10, 8)
+        action_layout.setSpacing(6)
+
+        layout.addWidget(scroll, 1)
+        layout.addWidget(action_bar)
+        return tab, scroll, content, action_bar, action_layout
+
     def _build_training_widgets(self):
-        self.source_root_line = QLineEdit(str(default_source_root()))
-        self.manifest_line = QLineEdit(str(WORKSPACE_ROOT / 'manifests' / 'ch2_manifest.csv'))
-        self.config_line = QLineEdit(
+        self.source_root_line = PathLineEdit(str(default_source_root()))
+        self.manifest_line = PathLineEdit(str(WORKSPACE_ROOT / 'manifests' / 'ch2_manifest.csv'))
+        self.config_line = PathLineEdit(
             str(package_path('configs', 'ch2_unet.yaml'))
             )
         self.run_name_line = QLineEdit('ch2_unet')
@@ -222,42 +556,21 @@ class FibreSightWorkbench(QMainWindow):
         self.epochs_spin.setValue(80)
         self.prepare_value_control(self.epochs_spin)
 
-        self.device_combo = QComboBox()
-        self.device_combo.addItem('automatic', 'auto')
-        self.device_combo.addItem('Apple GPU (MPS)', 'mps')
-        self.device_combo.addItem('NVIDIA GPU (CUDA)', 'cuda')
-        self.device_combo.addItem('CPU', 'cpu')
-        self.device_combo.setToolTip(
-            'automatic uses CUDA when available, then Apple MPS, then CPU; '
-            'the same setting applies to prediction and scoring'
-            )
-        self.device_combo.currentIndexChanged.connect(self.compute_device_changed)
-
         self.build_manifest_button = QPushButton('scan labelled sessions')
-        self.train_model_button = QPushButton('train model')
+        self.train_model_button = QPushButton('TRAIN MODEL')
         self.evaluate_model_button = QPushButton('score model')
         self.stop_process_button = QPushButton('stop process')
         self.inspect_manifest_button = QPushButton('dataset summary')
-        self.preview_training_button = QPushButton('preview labels')
-        self.preview_predictions_button = QPushButton('preview predictions')
-        self.training_diagnostics_button = QPushButton('diagnostics')
-        self.training_diagnostics_popup = None
-        self.training_advanced_button = QPushButton('advanced options')
-        self.training_advanced_popup = None
+        self.preview_training_button = QPushButton('save label preview')
+        self.preview_predictions_button = QPushButton('save prediction preview')
         self.set_button_role(self.train_model_button, 'primary')
         self.set_button_role(self.stop_process_button, 'danger')
-        self.set_button_role(self.training_diagnostics_button, 'quiet')
-        self.set_button_role(self.training_advanced_button, 'quiet')
         self.set_button_role(self.inspect_manifest_button, 'quiet')
         self.set_button_role(self.evaluate_model_button, 'quiet')
         self.set_button_role(self.preview_training_button, 'quiet')
         self.set_button_role(self.preview_predictions_button, 'quiet')
         self.evaluate_model_button.setToolTip('score the current trained model on held-out labelled sessions')
         self.preview_predictions_button.setToolTip('save example overlays comparing model ROIs with held-out labels')
-        self.training_diagnostics_button.setToolTip('open model scoring and preview tools')
-        self.training_advanced_button.setToolTip(
-            'open the dataset table, training recipe, split fractions, and device setting'
-            )
         self.stop_process_button.hide()
 
         self.build_manifest_button.clicked.connect(self.build_manifest)
@@ -266,14 +579,13 @@ class FibreSightWorkbench(QMainWindow):
         self.inspect_manifest_button.clicked.connect(self.inspect_manifest)
         self.preview_training_button.clicked.connect(self.preview_training_labels)
         self.preview_predictions_button.clicked.connect(self.preview_model_predictions)
-        self.training_diagnostics_button.clicked.connect(self.show_training_diagnostics_popup)
-        self.training_advanced_button.clicked.connect(self.show_training_advanced_popup)
         self.stop_process_button.clicked.connect(self.stop_process)
 
     def _build_prediction_widgets(self):
-        self.image_line = QLineEdit()
-        self.checkpoint_line = QLineEdit(str(get_default_checkpoint()))
+        self.image_line = PathLineEdit()
+        self.checkpoint_line = PathLineEdit(str(get_default_checkpoint()))
         self.image_line.textChanged.connect(self.prediction_inputs_changed)
+        self.image_line.editingFinished.connect(self.load_edited_channel_image)
         self.checkpoint_line.textChanged.connect(self.prediction_inputs_changed)
 
         model_entry = get_model_entry()
@@ -290,28 +602,27 @@ class FibreSightWorkbench(QMainWindow):
         self.min_size_spin.setValue(int(model_entry['min_size']))
         self.prepare_value_control(self.min_size_spin)
 
-        self.show_probability_check = QCheckBox('show model confidence')
-        self.show_probability_check.stateChanged.connect(lambda _: self.plot_image(preserve_view=True))
-
-        self.predict_button = QPushButton('run prediction')
-        self.apply_settings_button = QPushButton('apply settings')
+        self.predict_button = QPushButton('predict')
+        self.rebuild_rois_button = QPushButton('rebuild ROIs')
         self.set_button_role(self.predict_button, 'primary')
-        self.set_button_role(self.apply_settings_button, 'secondary')
+        self.set_button_role(self.rebuild_rois_button, 'secondary')
         self.predict_button.setToolTip(
             'load the selected image and model, then predict ROIs'
             )
-        self.apply_settings_button.setToolTip(
-            'rebuild ROIs from the retained confidence map; '
-            'Undo restores the previous ROI state'
+        self.rebuild_rois_button.setToolTip(
+            'rebuild all ROIs from the cached confidence map using the '
+            'threshold and minimum area; prediction does not run again; '
+            'this replaces the current ROIs; Undo restores them'
             )
-        self.apply_settings_button.hide()
-        self.show_probability_check.hide()
+        self.rebuild_rois_button.hide()
 
         self.threshold_spin.setToolTip('higher values keep only stronger model detections')
         self.min_size_spin.setToolTip('smallest ROI size to keep')
 
         self.predict_button.clicked.connect(self.predict_rois)
-        self.apply_settings_button.clicked.connect(self.apply_probability_threshold)
+        self.rebuild_rois_button.clicked.connect(
+            self.rebuild_rois_from_probability
+            )
 
 
     def _build_segment_widgets(self):
@@ -319,40 +630,30 @@ class FibreSightWorkbench(QMainWindow):
         for spec in PARAMETER_SPECS:
             self.segment_param_widgets[spec['name']] = self._make_segment_param_widget(spec)
 
-        self.segment_button = QPushButton('segment')
+        self.segment_button = QPushButton('SEGMENT')
         self.reset_segment_button = QPushButton('reset params')
-        self.advanced_segment_button = QPushButton('more parameters')
-        self.fix_selected_button = QPushButton('fix selected')
-        self.unfix_selected_button = QPushButton('unfix selected')
+        self.fix_selected_button = QPushButton('fix')
         self.clear_fixed_button = QPushButton('clear fixed')
         self.clear_unfixed_button = QPushButton('clear unfixed')
-        self.segment_load_image_button = QPushButton('open image')
-        self.segment_load_roi_button = QPushButton('load ROI dict')
-        self.segment_advanced_popup = None
+        self.segment_load_roi_button = QPushButton('import ROIs')
 
         self.set_button_role(self.segment_button, 'primary')
-        self.set_button_role(self.segment_load_image_button, 'secondary')
         self.set_button_role(self.segment_load_roi_button, 'secondary')
         self.set_button_role(self.reset_segment_button, 'quiet')
-        self.set_button_role(self.advanced_segment_button, 'quiet')
-        self.set_button_role(self.fix_selected_button, 'secondary')
-        self.set_button_role(self.unfix_selected_button, 'secondary')
+        self.set_button_role(self.fix_selected_button, 'quiet')
         self.set_button_role(self.clear_fixed_button, 'quiet')
         self.set_button_role(self.clear_unfixed_button, 'dangerQuiet')
 
+        self.fix_selected_button.setMinimumWidth(55)
         self.fix_selected_button.setToolTip('keep selected ROIs when segmentation is run again')
-        self.unfix_selected_button.setToolTip('allow selected ROIs to change during segmentation')
         self.clear_fixed_button.setToolTip('remove all fixed marks without deleting ROIs')
         self.clear_unfixed_button.setToolTip('remove all ROIs except fixed ROIs')
 
         self.segment_button.clicked.connect(self.segment_rois)
         self.reset_segment_button.clicked.connect(self.reset_segment_parameters)
-        self.fix_selected_button.clicked.connect(self.fix_selected)
-        self.unfix_selected_button.clicked.connect(self.unfix_selected)
+        self.fix_selected_button.clicked.connect(self.toggle_selected_fixed)
         self.clear_fixed_button.clicked.connect(self.clear_fixed)
         self.clear_unfixed_button.clicked.connect(self.clear_unfixed)
-        self.advanced_segment_button.clicked.connect(self.show_segment_advanced_popup)
-        self.segment_load_image_button.clicked.connect(self.choose_channel_image)
         self.segment_load_roi_button.clicked.connect(self.load_roi_file)
 
     def _build_editing_widgets(self):
@@ -361,53 +662,162 @@ class FibreSightWorkbench(QMainWindow):
             'delete': QPushButton('delete'),
             'merge': QPushButton('merge'),
             'undo': QPushButton('undo'),
-            'reset_view': QPushButton('reset view'),
-            'save_roi': QPushButton('save ROI dict'),
+            'zoom_out': QPushButton('−'),
+            'fit_view': QPushButton('fit'),
+            'zoom_in': QPushButton('+'),
+            'save_roi': QPushButton('export ROIs'),
         }
-        self.set_button_role(self.curate_buttons['delete'], 'danger')
+        self.set_button_role(self.curate_buttons['delete'], 'dangerQuiet')
         self.set_button_role(self.curate_buttons['select_all'], 'quiet')
         self.set_button_role(self.curate_buttons['merge'], 'quiet')
         self.set_button_role(self.curate_buttons['undo'], 'quiet')
-        self.set_button_role(self.curate_buttons['reset_view'], 'quiet')
-        self.set_button_role(self.curate_buttons['save_roi'], 'primary')
+        self.set_button_role(self.curate_buttons['zoom_out'], 'quiet')
+        self.set_button_role(self.curate_buttons['fit_view'], 'quiet')
+        self.set_button_role(self.curate_buttons['zoom_in'], 'quiet')
+        self.set_button_role(self.curate_buttons['save_roi'], 'secondary')
 
         self.curate_buttons['select_all'].clicked.connect(self.select_all)
         self.curate_buttons['delete'].clicked.connect(self.delete_selected)
         self.curate_buttons['merge'].clicked.connect(self.merge_selected)
         self.curate_buttons['undo'].clicked.connect(self.undo)
-        self.curate_buttons['reset_view'].clicked.connect(self.reset_view)
+        self.curate_buttons['zoom_out'].clicked.connect(self.zoom_out)
+        self.curate_buttons['fit_view'].clicked.connect(self.reset_view)
+        self.curate_buttons['zoom_in'].clicked.connect(self.zoom_in)
         self.curate_buttons['save_roi'].clicked.connect(self.save_roi_file)
+        self.update_export_tooltip()
+
+    def _build_persistent_widgets(self):
+        self.image_view_button = QPushButton('image')
+        self.confidence_view_button = QPushButton('confidence')
+        for button in (self.image_view_button, self.confidence_view_button):
+            button.setCheckable(True)
+            self.set_button_role(button, 'viewMode')
+        self.image_view_button.setChecked(True)
+        self.confidence_view_button.setEnabled(False)
+        self.confidence_view_button.setToolTip(
+            'available after prediction produces a confidence map'
+            )
+
+        self.display_mode_group = QButtonGroup(self)
+        self.display_mode_group.setExclusive(True)
+        self.display_mode_group.addButton(self.image_view_button)
+        self.display_mode_group.addButton(self.confidence_view_button)
+        self.image_view_button.clicked.connect(lambda: self.set_display_mode('image'))
+        self.confidence_view_button.clicked.connect(lambda: self.set_display_mode('confidence'))
+
+        self.black_slider = QSlider(Qt.Horizontal)
+        self.white_slider = QSlider(Qt.Horizontal)
+        self.black_value = QDoubleSpinBox()
+        self.white_value = QDoubleSpinBox()
+        for slider in (self.black_slider, self.white_slider):
+            slider.setRange(0, 1000)
+            slider.setSingleStep(1)
+            slider.setPageStep(10)
+        for spin in (self.black_value, self.white_value):
+            spin.setRange(0, 100)
+            spin.setDecimals(1)
+            spin.setSingleStep(0.1)
+            spin.setSuffix('%')
+            spin.setKeyboardTracking(False)
+            spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+            spin.setMaximumWidth(70)
+
+        self.black_slider.setValue(int(round(DISPLAY_BLACK_DEFAULT * 10)))
+        self.white_slider.setValue(int(round(DISPLAY_WHITE_DEFAULT * 10)))
+        self.black_value.setValue(DISPLAY_BLACK_DEFAULT)
+        self.white_value.setValue(DISPLAY_WHITE_DEFAULT)
+        self.black_slider.valueChanged.connect(self.display_slider_changed)
+        self.white_slider.valueChanged.connect(self.display_slider_changed)
+        self.black_value.valueChanged.connect(self.display_spin_changed)
+        self.white_value.valueChanged.connect(self.display_spin_changed)
+
+        self.display_redraw_timer = QTimer(self)
+        self.display_redraw_timer.setSingleShot(True)
+        self.display_redraw_timer.setInterval(DISPLAY_REDRAW_MS)
+        self.display_redraw_timer.timeout.connect(
+            lambda: self.plot_image(preserve_view=True)
+            )
+
+        self.reset_display_button = QPushButton('reset')
+        self.set_button_role(self.reset_display_button, 'quiet')
+        self.reset_display_button.setAccessibleName('reset display')
+        self.reset_display_button.setToolTip(
+            'restore the default black and white points'
+            )
+        self.reset_display_button.clicked.connect(self.reset_display_range)
+
+        self.roi_table = QTableWidget(0, 4)
+        self.roi_table.setObjectName('roiTable')
+        self.roi_table.setHorizontalHeaderLabels(['colour', 'ID', 'pixels', 'fixed'])
+        self.roi_table.horizontalHeaderItem(2).setTextAlignment(
+            Qt.AlignRight | Qt.AlignVCenter
+            )
+        self.roi_table.verticalHeader().hide()
+        self.roi_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.roi_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.roi_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.roi_table.setSortingEnabled(False)
+        self.roi_table.setShowGrid(False)
+        self.roi_table.setMinimumHeight(140)
+        self.roi_table.setAccessibleName('ROI table')
+        self.roi_table.setAccessibleDescription(
+            'select rows to select ROIs; double-click a row to centre it'
+            )
+        header = self.roi_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.roi_table.itemSelectionChanged.connect(self.roi_table_selection_changed)
+        self.roi_table.cellDoubleClicked.connect(self.centre_roi_from_table)
+
+        self.roi_empty_label = QLabel('no ROIs')
+        self.roi_empty_label.setObjectName('emptyState')
+        self.roi_empty_label.setAlignment(Qt.AlignCenter)
 
     def _build_layout(self):
         canvas_layout = QVBoxLayout()
-        canvas_layout.setContentsMargins(8, 8, 8, 8)
+        canvas_layout.setContentsMargins(3, 3, 3, 3)
         canvas_layout.addWidget(self.canvas)
         canvas_frame = QFrame()
         canvas_frame.setObjectName('canvasFrame')
         canvas_frame.setLayout(canvas_layout)
 
-        curation_bar = QFrame()
-        curation_bar.setObjectName('curationBar')
-        curation_layout = QVBoxLayout(curation_bar)
-        curation_layout.setContentsMargins(8, 6, 8, 6)
+        self.curation_bar = QFrame()
+        self.curation_bar.setObjectName('curationBar')
+        self.curation_layout = QVBoxLayout(self.curation_bar)
+        self.curation_layout.setContentsMargins(7, 5, 7, 5)
+        self.curation_layout.setSpacing(3)
 
-        curation_buttons = QHBoxLayout()
-        curation_buttons.setSpacing(4)
-        curation_buttons.addWidget(self.curate_buttons['select_all'])
-        curation_buttons.addWidget(self.curate_buttons['merge'])
-        curation_buttons.addWidget(self.curate_buttons['delete'])
-        curation_buttons.addWidget(self.curate_buttons['undo'])
-        curation_buttons.addStretch(1)
-        curation_buttons.addWidget(self.curate_buttons['reset_view'])
-        curation_buttons.addWidget(self.curate_buttons['save_roi'])
-        curation_layout.addLayout(curation_buttons)
+        self.curation_primary_row = QHBoxLayout()
+        self.curation_primary_row.setSpacing(3)
+        self.curation_history_divider = QFrame()
+        self.curation_history_divider.setObjectName('curationHistoryDivider')
+        self.curation_history_divider.setFixedWidth(1)
+        self.curation_history_divider.setFixedHeight(20)
+        self.curation_navigation_row = QHBoxLayout()
+        self.curation_navigation_row.setSpacing(3)
+        self.canvas_hint = ElidedLabel('Shift-click to add', mode=Qt.ElideRight)
+        self.canvas_hint.setObjectName('canvasHint')
+        self.canvas_hint.setToolTip('')
+        self.canvas_hint.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Preferred,
+            )
+        self.curation_layout.addLayout(self.curation_primary_row)
+        self.curation_layout.addLayout(self.curation_navigation_row)
+        self._curation_layout_is_wide = None
+        self.curation_layout_timer = QTimer(self)
+        self.curation_layout_timer.setSingleShot(True)
+        self.curation_layout_timer.timeout.connect(self.update_curation_layout)
+        self.update_curation_layout()
 
         canvas_stage = QWidget()
         canvas_stage.setObjectName('canvasStage')
         canvas_stage_layout = QVBoxLayout(canvas_stage)
         canvas_stage_layout.setContentsMargins(0, 0, 0, 0)
         canvas_stage_layout.setSpacing(8)
-        canvas_stage_layout.addWidget(curation_bar)
+        canvas_stage_layout.addWidget(self.curation_bar)
         canvas_stage_layout.addWidget(canvas_frame, 1)
 
         activity_frame = QFrame()
@@ -438,16 +848,95 @@ class FibreSightWorkbench(QMainWindow):
         self._layout_mser_tab()
         self._layout_training_tab()
 
+        self.resources_panel = QWidget()
+        self.resources_panel.setObjectName('resourcesPanel')
+        resources_layout = QVBoxLayout(self.resources_panel)
+        resources_layout.setContentsMargins(9, 9, 9, 7)
+        resources_layout.setSpacing(5)
+        resources_layout.addWidget(self.make_section_label('resources'))
+        resources_form = QFormLayout()
+        resources_form.setHorizontalSpacing(8)
+        resources_form.setVerticalSpacing(5)
+        resources_form.addRow(
+            self.make_form_label(
+                'channel-2 image',
+                'channel-2 reference image used across prediction and labelling',
+                self.image_line,
+                ),
+            self._path_row(self.image_line, self.choose_channel_image),
+            )
+        resources_form.addRow(
+            self.make_form_label(
+                'trained model',
+                'selected model used for prediction and scoring',
+                self.checkpoint_line,
+                ),
+            self._path_row(self.checkpoint_line, self.browse_checkpoint),
+            )
+        resources_layout.addLayout(resources_form)
+
+        self.upper_controls = QWidget()
+        self.upper_controls.setObjectName('upperControls')
+        self.upper_controls_layout = QVBoxLayout(self.upper_controls)
+        self.upper_controls_layout.setContentsMargins(0, 0, 0, 0)
+        self.upper_controls_layout.setSpacing(6)
+        self.upper_controls_layout.addWidget(self.resources_panel)
+        self.upper_controls_layout.addWidget(self.tabs, 1)
+
+        self.persistent_panel = QWidget()
+        self.persistent_panel.setObjectName('persistentPanel')
+        persistent_layout = QVBoxLayout(self.persistent_panel)
+        persistent_layout.setContentsMargins(9, 5, 9, 5)
+        persistent_layout.setSpacing(3)
+        display_header = QHBoxLayout()
+        display_header.addWidget(self.make_section_label('display'))
+        display_header.addStretch(1)
+        display_header.addWidget(self.reset_display_button)
+        display_header.addWidget(self.image_view_button)
+        display_header.addWidget(self.confidence_view_button)
+        persistent_layout.addLayout(display_header)
+
+        black_row = QHBoxLayout()
+        black_row.addWidget(QLabel('black point'))
+        black_row.addWidget(self.black_slider, 1)
+        black_row.addWidget(self.black_value)
+        persistent_layout.addLayout(black_row)
+        white_row = QHBoxLayout()
+        white_row.addWidget(QLabel('white point'))
+        white_row.addWidget(self.white_slider, 1)
+        white_row.addWidget(self.white_value)
+        persistent_layout.addLayout(white_row)
+        persistent_layout.addWidget(self.make_section_label('ROIs'))
+        persistent_layout.addWidget(self.roi_table, 1)
+        persistent_layout.addWidget(self.roi_empty_label)
+
+        self.controls_splitter = QSplitter(Qt.Vertical)
+        self.controls_splitter.setObjectName('controlsSplitter')
+        self.controls_splitter.addWidget(self.upper_controls)
+        self.controls_splitter.addWidget(self.persistent_panel)
+        self.controls_splitter.setChildrenCollapsible(False)
+        self.controls_splitter.setStretchFactor(0, 3)
+        self.controls_splitter.setStretchFactor(1, 2)
+        self.controls_splitter.setSizes([430, 240])
+        self.controls_splitter.splitterMoved.connect(
+            self.remember_controls_split_position
+            )
+        self.controls_split_timer = QTimer(self)
+        self.controls_split_timer.setSingleShot(True)
+        self.controls_split_timer.timeout.connect(
+            self.size_controls_for_current_tab
+            )
+
         controls_layout = QVBoxLayout()
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(0)
-        controls_layout.addWidget(self.tabs, 1)
+        controls_layout.addWidget(self.controls_splitter, 1)
 
         controls_widget = QWidget()
         controls_widget.setObjectName('controlsPanel')
         controls_widget.setLayout(controls_layout)
-        controls_widget.setMinimumWidth(380)
-        controls_widget.setMaximumWidth(450)
+        controls_widget.setMinimumWidth(400)
+        controls_widget.setMaximumWidth(520)
 
         self.main_splitter = QSplitter(Qt.Horizontal)
         self.main_splitter.setObjectName('mainSplitter')
@@ -456,24 +945,26 @@ class FibreSightWorkbench(QMainWindow):
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setChildrenCollapsible(False)
-        self.main_splitter.setSizes([400, 860])
+        self.main_splitter.setSizes([420, 840])
+        self.main_splitter.splitterMoved.connect(self.schedule_curation_layout)
 
         stage_header = QFrame()
         stage_header.setObjectName('stageHeader')
         stage_layout = QHBoxLayout(stage_header)
-        stage_layout.setContentsMargins(12, 8, 12, 8)
-        stage_layout.setSpacing(14)
+        stage_layout.setContentsMargins(6, 7, 6, 7)
+        stage_layout.setSpacing(4)
 
         stage_layout.addWidget(self.state_label, 1)
         stage_layout.addWidget(self.roi_label)
-        stage_layout.addWidget(self.model_label)
+        stage_layout.addWidget(self.model_separator)
+        stage_layout.addWidget(self.model_label, 1)
         stage_layout.addSpacing(8)
         stage_layout.addWidget(self.roi_overlay_check)
         stage_layout.addWidget(self.dark_mode_check)
 
         main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(14, 14, 14, 14)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(7)
         main_layout.addWidget(stage_header)
         main_layout.addWidget(self.main_splitter, 1)
 
@@ -481,69 +972,217 @@ class FibreSightWorkbench(QMainWindow):
         container.setObjectName('centralWidget')
         container.setLayout(main_layout)
         self.setCentralWidget(container)
+        self.controls_split_timer.start(0)
+
+    def controls_tab_changed(self, _index):
+        self.refresh_status()
+        if hasattr(self, 'controls_split_timer'):
+            self.controls_split_timer.start(0)
+
+    def schedule_curation_layout(self, *_args):
+        if hasattr(self, 'curation_layout_timer'):
+            self.curation_layout_timer.start(0)
+
+    @staticmethod
+    def _clear_layout(layout):
+        while layout.count():
+            layout.takeAt(0)
+
+    def update_curation_layout(self):
+        wide = self.curation_bar.width() >= CURATION_WIDE_MIN_WIDTH
+        if wide == self._curation_layout_is_wide:
+            return
+
+        self._clear_layout(self.curation_primary_row)
+        self._clear_layout(self.curation_navigation_row)
+
+        for button in (
+            self.curate_buttons['select_all'],
+            self.fix_selected_button,
+            self.curate_buttons['merge'],
+            self.curate_buttons['delete'],
+            ):
+            self.curation_primary_row.addWidget(button)
+        self.curation_primary_row.addSpacing(2)
+        self.curation_primary_row.addWidget(self.curation_history_divider)
+        self.curation_primary_row.addSpacing(2)
+        self.curation_primary_row.addWidget(self.curate_buttons['undo'])
+
+        if wide:
+            self.curation_primary_row.addStretch(1)
+            self.curation_primary_row.addWidget(self.segment_load_roi_button)
+            self.curation_primary_row.addWidget(self.curate_buttons['save_roi'])
+        else:
+            self.curation_primary_row.addStretch(1)
+
+        self.curation_navigation_row.addWidget(self.canvas_hint, 1)
+        if not wide:
+            self.curation_navigation_row.addWidget(self.segment_load_roi_button)
+            self.curation_navigation_row.addWidget(self.curate_buttons['save_roi'])
+        self.curation_navigation_row.addWidget(self.curate_buttons['zoom_out'])
+        self.curation_navigation_row.addWidget(self.curate_buttons['fit_view'])
+        self.curation_navigation_row.addWidget(self.curate_buttons['zoom_in'])
+        self._curation_layout_is_wide = wide
+        self.curation_layout.invalidate()
+        self.curation_bar.updateGeometry()
+        if hasattr(self, 'activity_splitter'):
+            self.activity_splitter.updateGeometry()
+        if hasattr(self, 'main_splitter'):
+            self.main_splitter.updateGeometry()
+        if self.centralWidget() is not None:
+            self.centralWidget().updateGeometry()
+
+    def remember_controls_split_position(self, _position, _index):
+        if self._sizing_controls_splitter:
+            return
+        sizes = self.controls_splitter.sizes()
+        if sizes:
+            self._controls_split_positions[self.tabs.currentIndex()] = sizes[0]
+
+    def size_controls_for_current_tab(self):
+        sizes = self.controls_splitter.sizes()
+        if len(sizes) != 2:
+            return
+
+        total = sum(sizes)
+        if total <= 0:
+            return
+
+        tab_index = self.tabs.currentIndex()
+        stored_height = self._controls_split_positions.get(tab_index)
+        if stored_height is None:
+            current_scroll = (
+                self.mser_scroll
+                if self.tabs.currentWidget() is self.mser_tab else
+                self.tabs.currentWidget()
+                )
+            tab_chrome = max(
+                0,
+                self.tabs.height() - current_scroll.viewport().height(),
+                )
+            stored_height = (
+                self.resources_panel.sizeHint().height() +
+                self.upper_controls_layout.spacing() +
+                tab_chrome +
+                max(
+                    current_scroll.widget().sizeHint().height(),
+                    current_scroll.widget().minimumSizeHint().height(),
+                    )
+                )
+
+        min_upper = self.upper_controls.minimumSizeHint().height()
+        max_upper = total - self.persistent_panel.minimumSizeHint().height()
+        target = int(np.clip(stored_height, min_upper, max_upper))
+        self._sizing_controls_splitter = True
+        self.controls_splitter.setSizes([target, total - target])
+        self._sizing_controls_splitter = False
 
     def _layout_mser_tab(self):
         layout = QVBoxLayout(self.mser_tab_content)
-        layout.setSpacing(10)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+        layout.setContentsMargins(10, 10, 10, 10)
         self._layout_mser_section(layout)
-        layout.addStretch(1)
+        self.mser_action_layout.addWidget(self.segment_button, 1)
+        self.mser_action_layout.addWidget(self.reset_segment_button)
 
     def _layout_prediction_tab(self):
         layout = QVBoxLayout(self.predict_tab_content)
-        layout.setSpacing(10)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 10, 10, 10)
         self._layout_prediction_section(layout)
         layout.addStretch(1)
 
     def _layout_training_tab(self):
         layout = QVBoxLayout(self.training_tab_content)
-        layout.setSpacing(10)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 10, 10, 10)
         self._layout_training_section(layout)
         layout.addStretch(1)
 
     def _layout_mser_section(self, layout):
-        io_buttons = QGridLayout()
-        io_buttons.setHorizontalSpacing(6)
-        io_buttons.setVerticalSpacing(6)
-        io_buttons.addWidget(self.segment_load_image_button, 0, 0)
-        io_buttons.addWidget(self.segment_load_roi_button, 0, 1)
-        layout.addLayout(io_buttons)
-
         specs_by_name = {spec['name']: spec for spec in PARAMETER_SPECS}
-        main_specs = [specs_by_name[name] for name in CORE_SEGMENT_PARAMETERS]
-        param_form = QFormLayout()
-        param_form.setHorizontalSpacing(12)
-        param_form.setVerticalSpacing(6)
-        for spec in main_specs:
-            tooltip = PARAMETER_TOOLTIPS.get(spec['name'], '')
-            widget = self.segment_param_widgets[spec['name']]
-            widget.setToolTip(tooltip)
-            param_form.addRow(self.make_form_label(spec['name'], tooltip, widget), widget)
-        layout.addLayout(param_form)
+        for group_index, (group_name, entries) in enumerate(SEGMENT_GROUPS):
+            if group_index:
+                layout.addSpacing(10)
+            layout.addWidget(self.make_section_label(group_name))
+            param_form = QFormLayout()
+            param_form.setHorizontalSpacing(12)
+            param_form.setVerticalSpacing(10)
+            for internal_name, display_name in entries:
+                spec = specs_by_name[internal_name]
+                tooltip = PARAMETER_TOOLTIPS.get(spec['name'], '')
+                widget = self.segment_param_widgets[spec['name']]
+                widget.setToolTip(tooltip)
+                field = QWidget()
+                field_layout = QHBoxLayout(field)
+                field_layout.setContentsMargins(0, 0, 0, 0)
+                field_layout.addStretch(1)
+                field_layout.addWidget(widget)
+                param_form.addRow(
+                    self.make_form_label(display_name, tooltip, widget),
+                    field,
+                    )
+            layout.addLayout(param_form)
+            if group_index < len(SEGMENT_GROUPS) - 1:
+                layout.addStretch(1)
 
         buttons = QGridLayout()
         buttons.setHorizontalSpacing(6)
         buttons.setVerticalSpacing(6)
-        buttons.addWidget(self.segment_button, 0, 0)
-        buttons.addWidget(self.reset_segment_button, 0, 1)
-        buttons.addWidget(self.advanced_segment_button, 1, 0, 1, 2)
-        buttons.addWidget(self.fix_selected_button, 2, 0)
-        buttons.addWidget(self.unfix_selected_button, 2, 1)
-        buttons.addWidget(self.clear_fixed_button, 3, 0)
-        buttons.addWidget(self.clear_unfixed_button, 3, 1)
+        buttons.addWidget(self.clear_fixed_button, 0, 0)
+        buttons.addWidget(self.clear_unfixed_button, 0, 1)
         layout.addLayout(buttons)
 
     def _layout_training_section(self, layout):
+        layout.addWidget(self.make_section_label('data'))
         layout.addWidget(self.make_form_label(
             'labelled sessions',
             'folder containing processed sessions for training',
             self.source_root_line,
             ))
         layout.addWidget(self._path_row(self.source_root_line, self.browse_source_root))
+        layout.addWidget(self.make_form_label(
+            'dataset table',
+            'CSV index of labelled images and ROI dicts',
+            self.manifest_line,
+            ))
+        layout.addWidget(self._path_row(self.manifest_line, self.browse_manifest_out))
+        split_form = QFormLayout()
+        split_form.setVerticalSpacing(5)
+        split_form.addRow(
+            self.make_form_label(
+                'validation split',
+                'fraction used for tuning during training',
+                self.val_fraction_spin,
+                ),
+            self.val_fraction_spin,
+            )
+        split_form.addRow(
+            self.make_form_label(
+                'test split',
+                'held-out fraction used for scoring',
+                self.test_fraction_spin,
+                ),
+            self.test_fraction_spin,
+            )
+        layout.addLayout(split_form)
+        data_actions = QGridLayout()
+        data_actions.setHorizontalSpacing(6)
+        data_actions.setVerticalSpacing(6)
+        data_actions.addWidget(self.build_manifest_button, 0, 0)
+        data_actions.addWidget(self.inspect_manifest_button, 0, 1)
+        data_actions.addWidget(self.preview_training_button, 1, 0, 1, 2)
+        layout.addLayout(data_actions)
+
+        layout.addWidget(self.make_section_label('training'))
+        layout.addWidget(self.make_form_label(
+            'training recipe',
+            'YAML settings used for model training',
+            self.config_line,
+            ))
+        layout.addWidget(self._path_row(self.config_line, self.browse_config))
         form = QFormLayout()
-        form.setVerticalSpacing(8)
+        form.setVerticalSpacing(5)
         form.addRow(
             self.make_form_label(
                 'run name',
@@ -562,43 +1201,35 @@ class FibreSightWorkbench(QMainWindow):
             )
         layout.addLayout(form)
 
-        buttons = QGridLayout()
-        buttons.setHorizontalSpacing(6)
-        buttons.setVerticalSpacing(6)
-        buttons.addWidget(self.build_manifest_button, 0, 0)
-        buttons.addWidget(self.train_model_button, 0, 1)
-        buttons.addWidget(self.training_diagnostics_button, 1, 0)
-        buttons.addWidget(self.training_advanced_button, 1, 1)
-        buttons.addWidget(self.stop_process_button, 2, 0, 1, 2)
-        layout.addLayout(buttons)
+        training_actions = QHBoxLayout()
+        training_actions.setSpacing(6)
+        training_actions.addWidget(self.train_model_button, 1)
+        training_actions.addWidget(self.stop_process_button)
+        layout.addLayout(training_actions)
+
+        layout.addWidget(self.make_section_label('evaluation'))
+        evaluation_actions = QGridLayout()
+        evaluation_actions.setHorizontalSpacing(6)
+        evaluation_actions.setVerticalSpacing(6)
+        evaluation_actions.addWidget(self.evaluate_model_button, 0, 0)
+        evaluation_actions.addWidget(self.preview_predictions_button, 0, 1)
+        layout.addLayout(evaluation_actions)
 
     def _layout_prediction_section(self, layout):
-        layout.addWidget(self.make_form_label(
-            'channel-2 image',
-            'channel-2 reference image used for ROI prediction',
-            self.image_line,
-            ))
-        layout.addWidget(self._path_row(self.image_line, self.browse_image))
-        layout.addWidget(self.make_form_label(
-            'trained model',
-            'saved trained model file',
-            self.checkpoint_line,
-            ))
-        layout.addWidget(self._path_row(self.checkpoint_line, self.browse_checkpoint))
         form = QFormLayout()
-        form.setVerticalSpacing(8)
+        form.setVerticalSpacing(5)
         form.addRow(
             self.make_form_label(
-                'strictness',
-                'higher values keep only stronger model detections',
+                'prediction threshold',
+                'higher values retain fewer, more confident ROIs',
                 self.threshold_spin,
                 ),
             self.threshold_spin,
             )
         form.addRow(
             self.make_form_label(
-                'minimum ROI size',
-                'smallest ROI size to keep',
+                'minimum ROI area (pixels)',
+                'discard connected components below this area',
                 self.min_size_spin,
                 ),
             self.min_size_spin,
@@ -608,107 +1239,8 @@ class FibreSightWorkbench(QMainWindow):
         buttons = QHBoxLayout()
         buttons.setSpacing(6)
         buttons.addWidget(self.predict_button, 1)
-        buttons.addWidget(self.apply_settings_button)
+        buttons.addWidget(self.rebuild_rois_button)
         layout.addLayout(buttons)
-
-        options = QHBoxLayout()
-        options.addWidget(self.show_probability_check)
-        options.addStretch(1)
-        layout.addLayout(options)
-
-
-    def show_segment_advanced_popup(self):
-        if self.segment_advanced_popup is None:
-            self.segment_advanced_popup = QFrame(self, Qt.Popup)
-            self.segment_advanced_popup.setObjectName('advancedPopup')
-            layout = QFormLayout(self.segment_advanced_popup)
-            layout.setContentsMargins(12, 10, 12, 10)
-            layout.setHorizontalSpacing(10)
-            layout.setVerticalSpacing(7)
-            for spec in PARAMETER_SPECS:
-                if spec['name'] in CORE_SEGMENT_PARAMETERS:
-                    continue
-                tooltip = PARAMETER_TOOLTIPS.get(spec['name'], '')
-                widget = self.segment_param_widgets[spec['name']]
-                widget.setToolTip(tooltip)
-                layout.addRow(self.make_form_label(spec['name'], tooltip, widget), widget)
-
-        pos = self.advanced_segment_button.mapToGlobal(self.advanced_segment_button.rect().bottomLeft())
-        self.segment_advanced_popup.move(pos)
-        self.segment_advanced_popup.show()
-        self.segment_advanced_popup.raise_()
-
-    def show_training_diagnostics_popup(self):
-        if self.training_diagnostics_popup is None:
-            self.training_diagnostics_popup = QFrame(self, Qt.Popup)
-            self.training_diagnostics_popup.setObjectName('advancedPopup')
-            layout = QGridLayout(self.training_diagnostics_popup)
-            layout.setContentsMargins(12, 10, 12, 10)
-            layout.setHorizontalSpacing(6)
-            layout.setVerticalSpacing(6)
-            layout.addWidget(self.inspect_manifest_button, 0, 0)
-            layout.addWidget(self.evaluate_model_button, 0, 1)
-            layout.addWidget(self.preview_training_button, 1, 0)
-            layout.addWidget(self.preview_predictions_button, 1, 1)
-
-        pos = self.training_diagnostics_button.mapToGlobal(self.training_diagnostics_button.rect().bottomLeft())
-        self.training_diagnostics_popup.move(pos)
-        self.training_diagnostics_popup.show()
-        self.training_diagnostics_popup.raise_()
-
-    def show_training_advanced_popup(self):
-        if self.training_advanced_popup is None:
-            self.training_advanced_popup = QFrame(self, Qt.Popup)
-            self.training_advanced_popup.setObjectName('advancedPopup')
-            layout = QFormLayout(self.training_advanced_popup)
-            layout.setContentsMargins(12, 10, 12, 10)
-            layout.setHorizontalSpacing(10)
-            layout.setVerticalSpacing(7)
-            layout.addRow(
-                self.make_form_label(
-                    'dataset table',
-                    'CSV index of labelled images and ROI dicts',
-                    self.manifest_line,
-                    ),
-                self._path_row(self.manifest_line, self.browse_manifest_out),
-                )
-            layout.addRow(
-                self.make_form_label(
-                    'training recipe',
-                    'YAML settings used for model training',
-                    self.config_line,
-                    ),
-                self._path_row(self.config_line, self.browse_config),
-                )
-            layout.addRow(
-                self.make_form_label(
-                    'validation split',
-                    'fraction used for tuning during training',
-                    self.val_fraction_spin,
-                    ),
-                self.val_fraction_spin,
-                )
-            layout.addRow(
-                self.make_form_label(
-                    'test split',
-                    'held-out fraction used for scoring',
-                    self.test_fraction_spin,
-                    ),
-                self.test_fraction_spin,
-                )
-            layout.addRow(
-                self.make_form_label(
-                    'compute device',
-                    'this setting also applies to prediction and scoring',
-                    self.device_combo,
-                    ),
-                self.device_combo,
-                )
-
-        pos = self.training_advanced_button.mapToGlobal(self.training_advanced_button.rect().bottomLeft())
-        self.training_advanced_popup.move(pos)
-        self.training_advanced_popup.show()
-        self.training_advanced_popup.raise_()
 
     def _path_row(self, line_edit, browse_slot):
         row = QWidget()
@@ -750,6 +1282,13 @@ class FibreSightWorkbench(QMainWindow):
         return label
 
     @staticmethod
+    def make_section_label(text):
+        label = QLabel(text)
+        label.setObjectName('sectionHeading')
+        label.setFont(load_gui_font(bold=True))
+        return label
+
+    @staticmethod
     def set_button_role(button, role):
         if button.property('role') == role:
             return
@@ -787,7 +1326,7 @@ class FibreSightWorkbench(QMainWindow):
             ('Ctrl+P', self.predict_rois),
             ('Ctrl+S', self.save_roi_file),
             ('Ctrl+R', self.segment_rois),
-            ('Ctrl+F', self.fix_selected),
+            ('Ctrl+F', self.toggle_selected_fixed),
             ('Ctrl+Shift+F', self.clear_fixed),
             ('Ctrl+A', self.select_all),
             ('Ctrl+I', self.invert_selection),
@@ -795,6 +1334,9 @@ class FibreSightWorkbench(QMainWindow):
             ('Delete', self.delete_selected),
             ('Ctrl+Z', self.undo),
             ('Backspace', self.undo),
+            ('-', self.zoom_out),
+            ('0', self.reset_view),
+            ('+', self.zoom_in),
             ]
         for sequence, slot in shortcuts:
             shortcut = QShortcut(QKeySequence(sequence), self)
@@ -803,45 +1345,43 @@ class FibreSightWorkbench(QMainWindow):
     def _theme(self):
         if self.dark_mode:
             return {
-                'window': '#151b17',
-                'surface': '#1e2721',
-                'surface_alt': '#242f28',
-                'surface_strong': '#34433a',
-                'surface_hover': '#2c3931',
-                'border': '#3c4b42',
-                'border_strong': '#66786d',
-                'text': '#edf3ef',
-                'muted': '#b7c4bb',
-                'primary': '#79b28b',
-                'primary_hover': '#92c5a1',
-                'primary_text': '#102017',
-                'danger_bg': '#3b2528',
-                'danger_hover': '#503034',
-                'danger_border': '#83545b',
-                'danger_text': '#f0c6cb',
-                'selection': '#365c42',
-                'canvas': '#182019',
+                'window': '#1d1d1f',
+                'surface': '#232326',
+                'surface_alt': '#2b2b2f',
+                'surface_strong': '#343439',
+                'surface_hover': '#303034',
+                'border': '#3a3a3f',
+                'border_strong': '#6a6864',
+                'text': '#e8e6e0',
+                'muted': '#aaa7a0',
+                'disabled': '#8c8982',
+                'primary': '#e8e6e0',
+                'primary_hover': '#f4f2ec',
+                'primary_text': '#232326',
+                'danger': '#8f4b42',
+                'danger_text': '#faf9f6',
+                'selection': '#4a494e',
+                'canvas': '#1a1a1c',
                 }
 
         return {
-            'window': '#f3f6f4',
-            'surface': '#ffffff',
-            'surface_alt': '#f7faf8',
-            'surface_strong': '#dbe7df',
-            'surface_hover': '#edf5f0',
-            'border': '#cbd8d0',
-            'border_strong': '#8aa093',
-            'text': '#17211b',
-            'muted': '#516157',
-            'primary': '#2f6f4e',
-            'primary_hover': '#25593f',
-            'primary_text': '#ffffff',
-            'danger_bg': '#f6e9eb',
-            'danger_hover': '#efd8dc',
-            'danger_border': '#c88e98',
-            'danger_text': '#8f3544',
-            'selection': '#c9ead2',
-            'canvas': '#f7f9f8',
+            'window': '#f0eee9',
+            'surface': '#faf9f6',
+            'surface_alt': '#f0eee9',
+            'surface_strong': '#e2dfd8',
+            'surface_hover': '#eae7e0',
+            'border': '#cbc7bf',
+            'border_strong': '#77736d',
+            'text': '#292826',
+            'muted': '#6d6963',
+            'disabled': '#827e77',
+            'primary': '#2b2b2f',
+            'primary_hover': '#1f1f22',
+            'primary_text': '#faf9f6',
+            'danger': '#8f4b42',
+            'danger_text': '#faf9f6',
+            'selection': '#d9d5cd',
+            'canvas': '#1a1a1c',
             }
 
     def _apply_palette_and_style(self):
@@ -854,6 +1394,12 @@ class FibreSightWorkbench(QMainWindow):
         palette.setColor(QPalette.ButtonText, QColor(theme['text']))
         palette.setColor(QPalette.Text, QColor(theme['text']))
         palette.setColor(QPalette.WindowText, QColor(theme['text']))
+        palette.setColor(QPalette.Highlight, QColor(theme['selection']))
+        palette.setColor(QPalette.HighlightedText, QColor(theme['text']))
+        palette.setColor(QPalette.Disabled, QPalette.Button, QColor(theme['surface_alt']))
+        palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(theme['disabled']))
+        palette.setColor(QPalette.Disabled, QPalette.Text, QColor(theme['disabled']))
+        palette.setColor(QPalette.Disabled, QPalette.WindowText, QColor(theme['disabled']))
         self.setPalette(palette)
 
         self.setStyleSheet(
@@ -863,121 +1409,143 @@ class FibreSightWorkbench(QMainWindow):
             }}
             QFrame#canvasFrame {{
                 border: 1px solid {theme['border']};
-                border-radius: 7px;
+                border-radius: 2px;
                 background: {theme['canvas']};
             }}
-            QFrame#curationBar, QFrame#activityFrame, QFrame#advancedPopup {{
+            QFrame#curationBar, QFrame#activityFrame {{
                 border: 1px solid {theme['border']};
-                border-radius: 7px;
+                border-radius: 3px;
                 background: {theme['surface']};
+            }}
+            QFrame#curationHistoryDivider {{
+                border: none;
+                background: {theme['border']};
             }}
             QFrame#stageHeader {{
                 border: none;
                 background: transparent;
             }}
-
             QSplitter::handle {{
                 background: transparent;
             }}
             QSplitter::handle:hover {{
                 background: {theme['surface_hover']};
-                border-radius: 4px;
+                border-radius: 2px;
             }}
             QSplitter::handle:horizontal {{
-                width: 8px;
+                width: 7px;
             }}
             QSplitter::handle:vertical {{
-                height: 8px;
+                height: 7px;
             }}
             QWidget#controlsPanel, QWidget#mainPane, QWidget#canvasStage {{
                 background: transparent;
             }}
-            QScrollArea, QWidget#tabContent {{
+            QWidget#resourcesPanel, QWidget#persistentPanel {{
+                border: 1px solid {theme['border']};
+                border-radius: 3px;
+                background: {theme['surface']};
+            }}
+            QScrollArea, QWidget#tabContent, QWidget#labelTab {{
                 border: none;
+                background: {theme['surface']};
+            }}
+            QFrame#labelActionBar {{
+                border: none;
+                border-top: 1px solid {theme['border']};
                 background: {theme['surface']};
             }}
             QTabWidget::pane {{
                 border: 1px solid {theme['border']};
-                border-radius: 7px;
+                border-radius: 3px;
                 background: {theme['surface']};
             }}
             QTabBar::tab {{
                 background: {theme['surface_alt']};
                 border: 1px solid {theme['border']};
                 border-bottom: none;
-                padding: 6px 9px;
-                margin-right: 3px;
-                border-top-left-radius: 7px;
-                border-top-right-radius: 7px;
+                padding: 5px 9px;
+                margin-right: 2px;
+                border-top-left-radius: 3px;
+                border-top-right-radius: 3px;
                 color: {theme['muted']};
-                font-weight: 600;
                 min-width: 58px;
             }}
             QTabBar::tab:hover {{
                 background: {theme['surface_hover']};
                 color: {theme['text']};
-                border-color: {theme['border_strong']};
             }}
             QTabBar::tab:selected {{
                 background: {theme['surface']};
-                color: {theme['primary']};
                 border-color: {theme['border_strong']};
-                border-top: 2px solid {theme['primary']};
+                color: {theme['text']};
             }}
             QLabel {{
                 color: {theme['text']};
             }}
             QLabel#stateSummary {{
                 color: {theme['text']};
-                font-weight: 700;
-                font-size: 10pt;
                 padding: 0;
             }}
-            QLabel#panelValue {{
+            QLabel#panelValue, QLabel#canvasHint, QLabel#emptyState {{
                 color: {theme['muted']};
-                font-weight: 600;
-                font-family: 'mononoki', Consolas, 'Courier New', monospace;
                 padding: 0;
             }}
-            QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {{
+            QLabel#sectionHeading {{
+                color: {theme['text']};
+                border-left: 2px solid {theme['border_strong']};
+                border-bottom: 1px solid {theme['border']};
+                padding: 3px 0 4px 6px;
+            }}
+            QWidget#labelTab QLabel#sectionHeading {{
+                background: {theme['surface_alt']};
+            }}
+            QLabel#pathOverlay {{
+                background: {theme['surface_alt']};
+                color: {theme['text']};
+            }}
+            QLineEdit, QDoubleSpinBox, QSpinBox {{
                 border: 1px solid {theme['border']};
-                border-radius: 5px;
-                padding: 4px 7px;
+                border-radius: 2px;
+                padding: 3px 6px;
                 background: {theme['surface_alt']};
                 color: {theme['text']};
                 selection-background-color: {theme['selection']};
-                min-height: 24px;
+                min-height: 23px;
             }}
-            QLineEdit[field='path'], QDoubleSpinBox, QSpinBox {{
-                font-family: 'mononoki', Consolas, 'Courier New', monospace;
-            }}
-            QLineEdit:hover, QDoubleSpinBox:hover, QSpinBox:hover, QComboBox:hover {{
+            QLineEdit:hover, QDoubleSpinBox:hover, QSpinBox:hover {{
                 border-color: {theme['border_strong']};
                 background: {theme['surface']};
             }}
-            QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {{
-                border-color: {theme['primary']};
+            QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus {{
+                border-color: {theme['text']};
                 background: {theme['surface']};
+            }}
+            QLineEdit:disabled, QDoubleSpinBox:disabled, QSpinBox:disabled {{
+                border-color: {theme['border']};
+                background: {theme['surface_alt']};
+                color: {theme['disabled']};
             }}
             QCheckBox {{
                 spacing: 6px;
                 color: {theme['text']};
-                font-weight: 500;
             }}
             QCheckBox:hover {{
-                color: {theme['primary']};
+                color: {theme['text']};
             }}
             QCheckBox:focus {{
-                color: {theme['primary']};
+                color: {theme['text']};
+            }}
+            QCheckBox:disabled {{
+                color: {theme['disabled']};
             }}
             QPushButton {{
                 border: 1px solid {theme['border']};
-                border-radius: 5px;
-                padding: 4px 8px;
+                border-radius: 2px;
+                padding: 3px 6px;
                 background: {theme['surface']};
                 color: {theme['text']};
-                min-height: 24px;
-                font-weight: 600;
+                min-height: 23px;
             }}
             QPushButton:hover {{
                 background: {theme['surface_hover']};
@@ -987,8 +1555,8 @@ class FibreSightWorkbench(QMainWindow):
                 background: {theme['surface_strong']};
             }}
             QPushButton:focus {{
-                border: 2px solid {theme['primary']};
-                padding: 3px 8px;
+                border: 2px solid {theme['text']};
+                padding: 2px 5px;
             }}
             QPushButton[role='primary'] {{
                 background: {theme['primary']};
@@ -999,23 +1567,23 @@ class FibreSightWorkbench(QMainWindow):
                 background: {theme['primary_hover']};
                 border-color: {theme['primary_hover']};
             }}
-            QPushButton[role='danger'] {{
-                background: {theme['danger_bg']};
-                border-color: {theme['danger_border']};
-                color: {theme['danger_text']};
+            QPushButton[role='primary']:disabled {{
+                background: {theme['surface_alt']};
+                border-color: {theme['border']};
+                color: {theme['disabled']};
             }}
-            QPushButton[role='danger']:hover {{
-                background: {theme['danger_hover']};
-                border-color: {theme['danger_text']};
+            QPushButton[role='danger']:hover,
+            QPushButton[role='danger']:focus,
+            QPushButton[role='dangerQuiet']:hover,
+            QPushButton[role='dangerQuiet']:focus {{
+                background: {theme['danger']};
+                border-color: {theme['danger']};
+                color: {theme['danger_text']};
             }}
             QPushButton[role='dangerQuiet'] {{
                 background: transparent;
                 border-color: transparent;
-                color: {theme['danger_text']};
-            }}
-            QPushButton[role='dangerQuiet']:hover {{
-                background: {theme['danger_bg']};
-                border-color: {theme['danger_border']};
+                color: {theme['muted']};
             }}
             QPushButton[role='secondary'] {{
                 background: {theme['surface']};
@@ -1041,25 +1609,70 @@ class FibreSightWorkbench(QMainWindow):
                 padding: 2px 7px;
                 color: {theme['muted']};
             }}
+            QPushButton[role='viewMode'] {{
+                min-height: 20px;
+                padding: 2px 7px;
+                background: transparent;
+                color: {theme['muted']};
+            }}
+            QPushButton[role='viewMode']:checked {{
+                background: {theme['surface_strong']};
+                border-color: {theme['border_strong']};
+                color: {theme['text']};
+            }}
             QPushButton:disabled {{
                 background: {theme['surface_alt']};
                 border-color: {theme['border']};
+                color: {theme['disabled']};
+            }}
+            QSlider::groove:horizontal {{
+                height: 3px;
+                border: none;
+                background: {theme['border']};
+            }}
+            QSlider::handle:horizontal {{
+                width: 11px;
+                margin: -5px 0;
+                border: 1px solid {theme['border_strong']};
+                border-radius: 2px;
+                background: {theme['text']};
+            }}
+            QSlider::groove:horizontal:disabled,
+            QSlider::handle:horizontal:disabled {{
+                background: {theme['surface_strong']};
+                border-color: {theme['border']};
+            }}
+            QTableWidget#roiTable {{
+                border: 1px solid {theme['border']};
+                border-radius: 2px;
+                background: {theme['surface_alt']};
+                color: {theme['text']};
+                selection-background-color: {theme['selection']};
+                selection-color: {theme['text']};
+            }}
+            QTableWidget#roiTable::item {{
+                border: none;
+                padding: 3px 5px;
+            }}
+            QHeaderView::section {{
+                border: none;
+                border-bottom: 1px solid {theme['border']};
+                padding: 3px 5px;
+                background: {theme['surface']};
                 color: {theme['muted']};
             }}
             QPlainTextEdit#logBox {{
                 border: none;
-                border-radius: 4px;
+                border-radius: 2px;
                 background: {theme['surface_alt']};
                 color: {theme['text']};
-                font-family: 'mononoki', Consolas, 'Courier New', monospace;
-                font-size: 9pt;
-                padding: 7px;
+                padding: 6px;
                 selection-background-color: {theme['selection']};
             }}
             QToolTip {{
                 border: 1px solid {theme['border_strong']};
-                border-radius: 6px;
-                padding: 5px 7px;
+                border-radius: 2px;
+                padding: 4px 6px;
                 background: {theme['surface']};
                 color: {theme['text']};
             }}
@@ -1081,28 +1694,306 @@ class FibreSightWorkbench(QMainWindow):
         self._apply_palette_and_style()
         self.plot_image(preserve_view=True)
 
-    def selected_device(self):
-        return self.device_combo.currentData()
-
-    def compute_device_changed(self):
-        device_name = self.selected_device()
-        if self.predictor is not None and device_name != self.loaded_device_choice:
-            self.predictor = None
-            self.loaded_device_choice = None
-            self.model_label.setText('model: not loaded (compute device changed)')
-        self.invalidate_probability()
-        self.refresh_status('compute device changed')
+    @staticmethod
+    def selected_device():
+        return 'auto'
 
     def prediction_inputs_changed(self, _text=None):
         self.invalidate_probability()
         self.refresh_status()
 
-    def invalidate_probability(self):
-        if self.probability is None:
-            return
+    def invalidate_probability(self, redraw=True):
+        needs_redraw = self.probability is not None or self.display_mode == 'confidence'
         self.probability = None
-        if self.show_probability_check.isChecked():
+        self.display_mode = 'image'
+        if hasattr(self, 'image_view_button'):
+            blockers = [
+                QSignalBlocker(self.image_view_button),
+                QSignalBlocker(self.confidence_view_button),
+                ]
+            self.image_view_button.setChecked(True)
+            self.confidence_view_button.setChecked(False)
+            self.confidence_view_button.setEnabled(False)
+            self.confidence_view_button.setToolTip(
+                'available after prediction produces a confidence map'
+                )
+            del blockers
+            self.update_display_control_state()
+        if redraw and needs_redraw:
             self.plot_image(preserve_view=True)
+
+    def set_display_mode(self, mode):
+        if mode == 'confidence' and self.probability is None:
+            mode = 'image'
+        if mode not in {'image', 'confidence'}:
+            raise ValueError(f'unknown display mode: {mode}')
+
+        self.display_mode = mode
+        blockers = [
+            QSignalBlocker(self.image_view_button),
+            QSignalBlocker(self.confidence_view_button),
+            ]
+        self.image_view_button.setChecked(mode == 'image')
+        self.confidence_view_button.setChecked(mode == 'confidence')
+        del blockers
+        self.update_display_control_state()
+        self.plot_image(preserve_view=True)
+
+    def update_display_control_state(self):
+        image_controls_enabled = (
+            self.ref_image is not None and
+            self.display_mode == 'image'
+            )
+        for widget in (
+            self.black_slider,
+            self.white_slider,
+            self.black_value,
+            self.white_value,
+            self.reset_display_button,
+        ):
+            widget.setEnabled(image_controls_enabled)
+
+    def display_slider_changed(self, _value=None):
+        sender = self.sender()
+        if sender is self.black_slider:
+            self.set_display_range(
+                self.black_slider.value() / 10,
+                self.display_white,
+                changed='black',
+                )
+        elif sender is self.white_slider:
+            self.set_display_range(
+                self.display_black,
+                self.white_slider.value() / 10,
+                changed='white',
+                )
+
+    def display_spin_changed(self, _value=None):
+        sender = self.sender()
+        if sender is self.black_value:
+            self.set_display_range(
+                self.black_value.value(),
+                self.display_white,
+                changed='black',
+                )
+        elif sender is self.white_value:
+            self.set_display_range(
+                self.display_black,
+                self.white_value.value(),
+                changed='white',
+                )
+
+    def set_display_range(
+            self,
+            black_percentile,
+            white_percentile,
+            changed=None,
+            schedule_redraw=True,
+            ):
+        black_percentile = float(np.clip(black_percentile, 0, 100))
+        white_percentile = float(np.clip(white_percentile, 0, 100))
+        if changed == 'black':
+            black_percentile = min(
+                black_percentile,
+                white_percentile - DISPLAY_MIN_GAP,
+                )
+        elif changed == 'white':
+            white_percentile = max(
+                white_percentile,
+                black_percentile + DISPLAY_MIN_GAP,
+                )
+        else:
+            black_percentile = min(
+                black_percentile,
+                100 - DISPLAY_MIN_GAP,
+                )
+            white_percentile = max(
+                white_percentile,
+                black_percentile + DISPLAY_MIN_GAP,
+                )
+
+        black_percentile = float(np.clip(
+            black_percentile,
+            0,
+            100 - DISPLAY_MIN_GAP,
+            ))
+        white_percentile = float(np.clip(
+            white_percentile,
+            DISPLAY_MIN_GAP,
+            100,
+            ))
+        if white_percentile - black_percentile < DISPLAY_MIN_GAP:
+            if changed == 'black':
+                black_percentile = max(
+                    0,
+                    white_percentile - DISPLAY_MIN_GAP,
+                    )
+            else:
+                white_percentile = min(
+                    100,
+                    black_percentile + DISPLAY_MIN_GAP,
+                    )
+                black_percentile = min(
+                    black_percentile,
+                    white_percentile - DISPLAY_MIN_GAP,
+                    )
+
+        self.display_black = round(black_percentile, 1)
+        self.display_white = round(white_percentile, 1)
+        blockers = [
+            QSignalBlocker(self.black_slider),
+            QSignalBlocker(self.white_slider),
+            QSignalBlocker(self.black_value),
+            QSignalBlocker(self.white_value),
+            ]
+        self.black_slider.setValue(int(round(self.display_black * 10)))
+        self.white_slider.setValue(int(round(self.display_white * 10)))
+        self.black_value.setValue(self.display_black)
+        self.white_value.setValue(self.display_white)
+        del blockers
+
+        if schedule_redraw and self.ref_image is not None:
+            self.display_redraw_timer.start(DISPLAY_REDRAW_MS)
+
+    def reset_display_range(self, redraw=True):
+        self.display_redraw_timer.stop()
+        self.set_display_range(
+            DISPLAY_BLACK_DEFAULT,
+            DISPLAY_WHITE_DEFAULT,
+            schedule_redraw=False,
+            )
+        if redraw and self.ref_image is not None:
+            self.plot_image(preserve_view=True)
+
+    def roi_colour_map(self):
+        roi_ids = sorted(int(roi_id) for roi_id in self.roi_dict)
+        colours = generate_distinct_colours(len(roi_ids))
+        return dict(zip(roi_ids, colours))
+
+    def refresh_roi_table(self):
+        if not hasattr(self, 'roi_table'):
+            return
+
+        self._syncing_roi_table = True
+        blocker = QSignalBlocker(self.roi_table)
+        roi_ids = sorted(int(roi_id) for roi_id in self.roi_dict)
+        colour_map = self.roi_colour_map()
+        current_ids = [
+            (
+                int(self.roi_table.item(row, 1).data(Qt.UserRole))
+                if self.roi_table.item(row, 1) is not None else None
+                )
+            for row in range(self.roi_table.rowCount())
+            ]
+        current_row = self.roi_table.currentRow()
+        current_id = (
+            current_ids[current_row]
+            if 0 <= current_row < len(current_ids) else None
+            )
+        rebuild = current_ids != roi_ids
+        if rebuild:
+            self.roi_table.setRowCount(len(roi_ids))
+
+        for row, roi_id in enumerate(roi_ids):
+            roi = self.roi_dict[roi_id]
+            colour = QColor.fromRgbF(*colour_map[roi_id])
+            if rebuild:
+                colour_item = QTableWidgetItem()
+                id_item = QTableWidgetItem(str(roi_id))
+                pixel_item = QTableWidgetItem()
+                fixed_item = QTableWidgetItem()
+                self.roi_table.setItem(row, 0, colour_item)
+                self.roi_table.setItem(row, 1, id_item)
+                self.roi_table.setItem(row, 2, pixel_item)
+                self.roi_table.setItem(row, 3, fixed_item)
+                swatch = QLabel('■')
+                swatch.setObjectName('roiColourSwatch')
+                swatch.setAlignment(Qt.AlignCenter)
+                swatch.setAttribute(Qt.WA_TransparentForMouseEvents)
+                self.roi_table.setCellWidget(row, 0, swatch)
+            else:
+                colour_item = self.roi_table.item(row, 0)
+                id_item = self.roi_table.item(row, 1)
+                pixel_item = self.roi_table.item(row, 2)
+                fixed_item = self.roi_table.item(row, 3)
+                swatch = self.roi_table.cellWidget(row, 0)
+
+            colour_item.setBackground(QBrush(colour))
+            colour_item.setForeground(QBrush(colour))
+            colour_item.setToolTip(f'ROI {roi_id} colour')
+            swatch.setStyleSheet(
+                f'color: {colour.name()}; background: transparent; border: none;'
+                )
+            swatch.setToolTip(f'ROI {roi_id} colour')
+            id_item.setText(str(roi_id))
+            id_item.setData(Qt.UserRole, roi_id)
+            id_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            pixel_item.setText(str(len(np.asarray(roi['xpix']).ravel())))
+            pixel_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            fixed_item.setText('yes' if roi_id in self.fixed_ids else '')
+            fixed_item.setTextAlignment(Qt.AlignCenter)
+
+        self.selected.intersection_update(roi_ids)
+        table_selected = {
+            int(item.data(Qt.UserRole))
+            for item in self.roi_table.selectedItems()
+            if item.column() == 1 and item.data(Qt.UserRole) is not None
+            }
+        if rebuild or table_selected != self.selected:
+            # Qt keeps a private Shift-selection anchor beyond the current index
+            self.roi_table.setCurrentItem(None)
+            self.roi_table.clearSelection()
+            for row, roi_id in enumerate(roi_ids):
+                if roi_id not in self.selected:
+                    continue
+                for column in range(self.roi_table.columnCount()):
+                    self.roi_table.item(row, column).setSelected(True)
+            if self.selected:
+                anchor_id = (
+                    current_id
+                    if current_id in self.selected else
+                    min(self.selected)
+                    )
+                anchor_row = roi_ids.index(anchor_id)
+                self.roi_table.setCurrentCell(
+                    anchor_row,
+                    1,
+                    QItemSelectionModel.NoUpdate,
+                    )
+            else:
+                self.roi_table.setCurrentItem(None)
+
+        self.roi_empty_label.setVisible(not roi_ids)
+        del blocker
+        self._syncing_roi_table = False
+
+    def roi_table_selection_changed(self):
+        if self._syncing_roi_table:
+            return
+        selected = {
+            int(item.data(Qt.UserRole))
+            for item in self.roi_table.selectedItems()
+            if item.column() == 1 and item.data(Qt.UserRole) is not None
+            }
+        self.selected = selected
+        self.plot_image(preserve_view=True)
+        self.refresh_status()
+
+    def centre_roi_from_table(self, row, _column):
+        item = self.roi_table.item(row, 1)
+        if item is None:
+            return
+        roi_id = int(item.data(Qt.UserRole))
+        roi = self.roi_dict.get(roi_id)
+        if roi is None:
+            return
+
+        xpix = np.asarray(roi['xpix'])
+        ypix = np.asarray(roi['ypix'])
+        if xpix.size == 0 or ypix.size == 0:
+            return
+        self.canvas.centre_on(float(np.mean(xpix)), float(np.mean(ypix)))
+        self.refresh_status(f'centred ROI {roi_id}')
 
 
     #%% browse
@@ -1194,9 +2085,10 @@ class FibreSightWorkbench(QMainWindow):
             return
 
         run_name = self.run_name_line.text().strip()
-        self.pending_checkpoint_path = default_output_root() / 'runs' / run_name / 'best.pt'
+        checkpoint_path = default_output_root() / 'runs' / run_name / 'best.pt'
         args = ['--config', str(config_path)]
-        self.start_process('train', 'train_unet', args)
+        if self.start_process('train', 'train_unet', args):
+            self.pending_checkpoint_path = checkpoint_path
 
     def evaluate_model(self):
         model_path = self.current_model_path()
@@ -1314,7 +2206,7 @@ class FibreSightWorkbench(QMainWindow):
         if not run_name:
             raise ValueError('run name cannot be empty')
 
-        # Leave the baseline YAML alone while trying controls here; save this recipe beside the run.
+        # leave the baseline YAML alone whilst trying controls here; save this recipe beside the run
         config.setdefault('data', {})
         config.setdefault('train', {})
         config.setdefault('postprocess', {})
@@ -1334,57 +2226,92 @@ class FibreSightWorkbench(QMainWindow):
     def start_process(self, process_name, module_name, args):
         if self.process is not None and self.process.state() != QProcess.NotRunning:
             self.print_log('another process is already running')
-            return
+            return False
 
         self.current_process_name = process_name
+        self._process_stdout_buffer = ''
+        self._process_stderr_buffer = ''
+        self._process_was_stopped = False
         self.process = QProcess(self)
         WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
         self.process.setWorkingDirectory(str(WORKSPACE_ROOT))
         self.process.setProgram(sys.executable)
-        command_args = ['-m', f'fibre_sight.{module_name}'] + args
+        command_args = ['-u', '-m', f'fibre_sight.{module_name}'] + args
         self.process.setArguments(command_args)
         self.process.readyReadStandardOutput.connect(self.read_process_stdout)
         self.process.readyReadStandardError.connect(self.read_process_stderr)
         self.process.finished.connect(self.process_finished)
 
-        command_text = ' '.join([sys.executable] + command_args)
+        command_text = shlex.join(['python'] + command_args)
         self.print_log(f'\n$ {command_text}')
         self.process.start()
-        # The log keeps the command and output; the status bar only confirms that it started.
+        # the log keeps the command and output; the status bar only confirms that it started
         self.refresh_status(f'{process_name} started')
+        return True
 
     def stop_process(self):
         if self.process is None or self.process.state() == QProcess.NotRunning:
             self.print_log('no process is running')
             return
 
+        self._process_was_stopped = True
         self.process.kill()
         self.print_log('process stopped')
 
     def read_process_stdout(self):
+        if self.process is None:
+            return
         text = bytes(self.process.readAllStandardOutput()).decode(errors='replace')
-        self.print_log(text, end='')
+        self.buffer_process_text('_process_stdout_buffer', text)
 
     def read_process_stderr(self):
+        if self.process is None:
+            return
         text = bytes(self.process.readAllStandardError()).decode(errors='replace')
-        self.print_log(text, end='')
+        self.buffer_process_text('_process_stderr_buffer', text)
+
+    def buffer_process_text(self, buffer_name, text):
+        buffered = getattr(self, buffer_name) + text
+        lines = buffered.split('\n')
+        setattr(self, buffer_name, lines.pop())
+        for line in lines:
+            self.print_log(line[:-1] if line.endswith('\r') else line)
+
+    def flush_process_buffers(self):
+        for buffer_name in (
+                '_process_stdout_buffer',
+                '_process_stderr_buffer',
+                ):
+            text = getattr(self, buffer_name)
+            if text:
+                self.print_log(text)
+            setattr(self, buffer_name, '')
 
     def process_finished(self, exit_code, exit_status):
+        self.read_process_stdout()
+        self.read_process_stderr()
+        self.flush_process_buffers()
         process_name = self.current_process_name or 'process'
-        self.print_log(f'\n{process_name} finished: exit code {exit_code}')
-        if (
+        outcome = 'stopped' if self._process_was_stopped else f'exit code {exit_code}'
+        self.print_log(f'\n{process_name} finished: {outcome}')
+        training_succeeded = (
             self.current_process_name == 'train' and
+            not self._process_was_stopped and
             exit_code == 0 and
             exit_status == QProcess.NormalExit and
             self.pending_checkpoint_path is not None and
             self.pending_checkpoint_path.exists()
-        ):
+            )
+        if training_succeeded:
             self.checkpoint_line.setText(str(self.pending_checkpoint_path))
             self.last_saved_model_path = self.pending_checkpoint_path
+            self.predictor = None
+            self.invalidate_probability()
             self.print_log(f'trained model ready: {self.pending_checkpoint_path}')
 
         self.current_process_name = None
         self.pending_checkpoint_path = None
+        self._process_was_stopped = False
         self.process = None
         self.refresh_status(f'{process_name} finished')
 
@@ -1393,10 +2320,19 @@ class FibreSightWorkbench(QMainWindow):
         if self.browse_image():
             self.load_channel_image()
 
+    def load_edited_channel_image(self):
+        image_text = self.image_line.text().strip()
+        if image_text and not self.image_matches(image_text):
+            self.load_channel_image()
+
     def image_matches(self, path):
         if self.ref_image is None or self.image_path is None:
             return False
         return self.image_path.resolve() == Path(path).resolve()
+
+    def image_selection_matches_loaded(self):
+        image_text = self.image_line.text().strip()
+        return bool(image_text) and self.image_matches(image_text)
 
     def load_channel_image(self):
         path = self.image_line.text().strip()
@@ -1420,12 +2356,14 @@ class FibreSightWorkbench(QMainWindow):
         self.selected.clear()
         self.fixed_ids.clear()
         self.undo_stack.clear()
-        self.probability = None
+        self.invalidate_probability(redraw=False)
+        self.reset_display_range(redraw=False)
 
         default_roi = self.default_roi_path()
         if default_roi.exists():
             self.print_log(f'found existing ROI dict: {default_roi}')
-            self.print_log('load an ROI dict to review or continue from it')
+            self.print_log('import ROIs to review or continue from them')
+        self.update_export_tooltip()
         self.plot_image()
         self.canvas.reset_view()
         self.refresh_status('channel-2 image loaded')
@@ -1441,17 +2379,13 @@ class FibreSightWorkbench(QMainWindow):
         except Exception as exc:
             self.print_log(f'failed to load model: {exc}')
             self.predictor = None
-            self.loaded_device_choice = None
             self.refresh_status('model load failed')
             return
         finally:
             QApplication.restoreOverrideCursor()
 
-        self.loaded_device_choice = self.selected_device()
-        self.model_label.setText(
-            f'model: {self.predictor.checkpoint_path.name} | {self.predictor.device}'
-            )
         self.last_saved_model_path = self.predictor.checkpoint_path
+        self.invalidate_probability()
         self.print_log(f'model loaded from {self.predictor.checkpoint_path}')
         self.refresh_status('model loaded')
 
@@ -1480,8 +2414,7 @@ class FibreSightWorkbench(QMainWindow):
         predictor_matches = (
             predictor_path is not None and
             checkpoint_path is not None and
-            predictor_path.resolve() == checkpoint_path.resolve() and
-            self.loaded_device_choice == self.selected_device()
+            predictor_path.resolve() == checkpoint_path.resolve()
             )
         if not predictor_matches:
             self.load_model()
@@ -1512,20 +2445,22 @@ class FibreSightWorkbench(QMainWindow):
         self.selected.clear()
         self.fixed_ids.clear()
 
-        self.plot_image()
+        self.set_display_mode('image')
         self.canvas.reset_view()
         self.print_log(
             f'predicted {len(self.roi_dict)} ROIs '
-            f'(strictness {prediction.threshold:.2f}, min size {prediction.min_size})'
+            f'(threshold {prediction.threshold:.2f}, '
+            f'min area {prediction.min_size} px)'
             )
-        self.refresh_status('prediction complete')
+        self.refresh_status()
+        self.statusBar().clearMessage()
 
-    def apply_probability_threshold(self):
+    def rebuild_rois_from_probability(self):
         if self.probability is None:
             return
 
-        # reuse the confidence map here; changing strictness should not rerun
-        # the model while I am deciding which faint fibres to keep
+        # reuse the confidence map here; changing the threshold should not rerun
+        # the model whilst I am deciding which faint fibres to keep
         self.push_undo_state()
         self.roi_dict, self.labelled = probability_to_roi_dict(
             self.probability,
@@ -1536,7 +2471,7 @@ class FibreSightWorkbench(QMainWindow):
         self.fixed_ids.clear()
         self.plot_image(preserve_view=True)
         self.print_log(f'rebuilt {len(self.roi_dict)} ROIs from the confidence map')
-        self.refresh_status('prediction settings applied')
+        self.refresh_status('ROIs rebuilt from the confidence map')
 
     def make_predictor(self):
         checkpoint = self.checkpoint_line.text().strip()
@@ -1550,24 +2485,17 @@ class FibreSightWorkbench(QMainWindow):
             )
 
     def current_model_path(self):
-        checkpoint = self.checkpoint_line.text().strip()
-        if checkpoint:
-            return checkpoint
-        if self.predictor is not None:
-            return str(self.predictor.checkpoint_path)
-        if self.last_saved_model_path is not None:
-            return str(self.last_saved_model_path)
-        return ''
+        return self.checkpoint_line.text().strip()
 
     #%% roi io
     def load_roi_file(self):
-        if self.ref_image is None:
-            self.print_log('please load a channel-2 image first')
+        if not self.image_selection_matches_loaded():
+            self.print_log('please load the selected channel-2 image first')
             return
 
         path, _ = QFileDialog.getOpenFileName(
             self,
-            'load ROI dict',
+            'import ROIs',
             str(self.image_path.parent if self.image_path else WORKSPACE_ROOT),
             'NumPy dict (*.npy)',
             )
@@ -1578,7 +2506,7 @@ class FibreSightWorkbench(QMainWindow):
             roi_dict = load_roi_dict(path)
             labelled, _, _ = roi_dict_to_label(roi_dict, self.ref_image.shape)
         except Exception as exc:
-            self.print_log(f'failed to load ROI dict: {exc}')
+            self.print_log(f'failed to import ROIs: {exc}')
             return
 
         self.push_undo_state()
@@ -1586,20 +2514,22 @@ class FibreSightWorkbench(QMainWindow):
         self.labelled = labelled
         self.selected.clear()
         self.fixed_ids.clear()
-        self.probability = None
+        self.invalidate_probability(redraw=False)
         self.plot_image()
-        self.refresh_status('ROI dict loaded')
+        self.print_log(f'imported ROIs from {path}')
+        self.refresh_status('ROIs imported')
 
     def save_roi_file(self):
-        if self.ref_image is None:
-            self.print_log('please load a channel-2 image first')
+        if not self.image_selection_matches_loaded():
+            self.print_log('please load the selected channel-2 image first')
             return
 
         self.update_roi_dict()
         out_path = self.default_roi_path()
         save_roi_dict(self.roi_dict, out_path)
-        self.print_log(f'saved ROI dict to {out_path}')
-        self.refresh_status('ROI dict saved')
+        self.print_log(f'exported ROIs to {out_path}')
+        self.update_export_tooltip()
+        self.refresh_status('ROIs exported')
 
     def default_roi_path(self):
         if self.image_path is None:
@@ -1614,6 +2544,13 @@ class FibreSightWorkbench(QMainWindow):
             return default_output_root() / 'demo_predicted_ROI_dict.npy'
 
         return self.image_path.parent / f'{self.recname}_ROI_dict.npy'
+
+    def update_export_tooltip(self):
+        if not hasattr(self, 'curate_buttons'):
+            return
+        self.curate_buttons['save_roi'].setToolTip(
+            f'export immediately to {self.default_roi_path()}'
+            )
 
 
     #%% mser segmentation
@@ -1642,14 +2579,14 @@ class FibreSightWorkbench(QMainWindow):
         }
 
     def segment_rois(self):
-        if self.ref_image is None:
-            self.print_log('please load a channel-2 image first')
+        if not self.image_selection_matches_loaded():
+            self.print_log('please load the selected channel-2 image first')
             return
 
         if self.labelled is not None:
             self.push_undo_state()
 
-        # MSER still helps before a model exists and on images that need hand repair
+        # the MSER route still helps before a model exists and on images that need hand repair
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self.statusBar().showMessage('running MSER segmentation')
         QApplication.processEvents()
@@ -1670,7 +2607,7 @@ class FibreSightWorkbench(QMainWindow):
         self.labelled = labelled
         self.fixed_ids = fixed_ids
         self.selected.clear()
-        self.probability = None
+        self.invalidate_probability(redraw=False)
         self.plot_image()
         self.canvas.reset_view()
         mser_regions = stats['MSER regions']
@@ -1679,8 +2616,17 @@ class FibreSightWorkbench(QMainWindow):
         self.print_log(
             f'MSER regions: {mser_regions} | kept ROIs: {kept_rois} '
             f'(fixed {fixed_rois})'
-            )
+        )
         self.refresh_status('segmentation complete')
+
+    def toggle_selected_fixed(self):
+        selected_ids = self.selected.intersection(self.roi_dict)
+        if not selected_ids:
+            return
+        if selected_ids.issubset(self.fixed_ids):
+            self.unfix_selected()
+        else:
+            self.fix_selected()
 
     def fix_selected(self):
         if not self.selected:
@@ -1720,6 +2666,10 @@ class FibreSightWorkbench(QMainWindow):
 
     #%% selection and pruning
     def on_click(self, event):
+        if event.button != 1:
+            return
+        if self.canvas.consume_dragged_release():
+            return
         if self.ref_image is None:
             if event.inaxes == self.ax:
                 self.load_channel_image()
@@ -1742,7 +2692,9 @@ class FibreSightWorkbench(QMainWindow):
         if getattr(event, 'guiEvent', None) is not None:
             modifiers = event.guiEvent.modifiers()
 
-        if modifiers & (Qt.ControlModifier | Qt.ShiftModifier):
+        if modifiers & Qt.ShiftModifier:
+            self.selected.add(roi_id)
+        elif modifiers & (Qt.ControlModifier | Qt.MetaModifier):
             if roi_id in self.selected:
                 self.selected.remove(roi_id)
             else:
@@ -1824,14 +2776,17 @@ class FibreSightWorkbench(QMainWindow):
     def plot_image(self, preserve_view=False):
         xlim, ylim = self.get_current_view()
         theme = self._theme()
+        self.refresh_roi_table()
+        self.update_display_control_state()
         self.fig.set_facecolor(theme['canvas'])
         self.ax.clear()
         self.ax.set_facecolor(theme['canvas'])
         self.ax.axis('off')
 
         if self.ref_image is None:
+            gui_size = load_gui_font().pointSizeF()
             self.canvas.setCursor(Qt.PointingHandCursor)
-            self.canvas.setToolTip('click to open a channel-2 image')
+            self.canvas.setToolTip('')
             self.ax.text(
                 0.5,
                 0.53,
@@ -1840,9 +2795,9 @@ class FibreSightWorkbench(QMainWindow):
                 ha='center',
                 va='center',
                 color=theme['muted'],
-                fontsize=13,
-                fontweight='bold',
-                fontfamily=MONONOKI_FONT_FAMILY,
+                fontsize=gui_size + 2,
+                fontweight='normal',
+                fontfamily=_GUI_FONT_FAMILY,
                 )
             self.ax.text(
                 0.5,
@@ -1852,22 +2807,31 @@ class FibreSightWorkbench(QMainWindow):
                 ha='center',
                 va='center',
                 color=theme['muted'],
-                fontsize=9,
+                fontsize=gui_size,
                 alpha=0.8,
-                fontfamily=MONONOKI_FONT_FAMILY,
+                fontfamily=_GUI_FONT_FAMILY,
                 )
             self.canvas.draw_idle()
             return
 
         self.canvas.setCursor(Qt.CrossCursor)
-        self.canvas.setToolTip(
-            'click an ROI to select; Shift-click adds; right-drag pans; scroll zooms'
-            )
-        base = normalise_for_display(self.ref_image)
-        self.ax.imshow(base, cmap='gray', interpolation='nearest')
-
-        if self.show_probability_check.isChecked() and self.probability is not None:
+        self.canvas.setToolTip('')
+        if self.display_mode == 'confidence' and self.probability is not None:
             self.plot_probability()
+        else:
+            self.display_mode = 'image'
+            base = normalise_for_display(
+                self.ref_image,
+                black_percentile=self.display_black,
+                white_percentile=self.display_white,
+                )
+            self.ax.imshow(
+                base,
+                cmap='gray',
+                vmin=0,
+                vmax=1,
+                interpolation='nearest',
+                )
         if self.roi_overlay_check.isChecked():
             self.plot_roi_overlay()
 
@@ -1880,9 +2844,13 @@ class FibreSightWorkbench(QMainWindow):
 
     def plot_probability(self):
         probability = np.asarray(self.probability, dtype=np.float32)
-        rgba = matplotlib.colormaps['magma'](np.clip(probability, 0, 1))
-        rgba[..., 3] = np.clip(probability, 0, 1) * 0.35
-        self.ax.imshow(rgba, interpolation='nearest')
+        self.ax.imshow(
+            probability,
+            cmap='gray',
+            vmin=0,
+            vmax=1,
+            interpolation='nearest',
+            )
 
     def plot_roi_overlay(self):
         if self.labelled is None:
@@ -1892,11 +2860,32 @@ class FibreSightWorkbench(QMainWindow):
         if not ids:
             return
 
+        colour_map = self.roi_colour_map()
+        if set(ids) != set(colour_map):
+            colours = generate_distinct_colours(len(ids))
+            colour_map = dict(zip(ids, colours))
+
+        if self.display_mode == 'confidence':
+            for roi_id in ids:
+                mask = self.labelled == roi_id
+                linewidth = 1.0
+                linestyle = 'solid'
+                if roi_id in self.fixed_ids and roi_id not in self.selected:
+                    linewidth = 1.8
+                    linestyle = 'dashed'
+                self.plot_mask_outline(
+                    mask,
+                    colour_map[roi_id],
+                    linewidth=linewidth,
+                    linestyle=linestyle,
+                    )
+            self.plot_selection_halo(colour_map)
+            return
+
         overlay = np.zeros((*self.labelled.shape, 4), dtype=np.float32)
-        colours = generate_distinct_colours(len(ids))
-        for colour, roi_id in zip(colours, ids):
+        for roi_id in ids:
             mask = self.labelled == roi_id
-            overlay[mask, :3] = colour
+            overlay[mask, :3] = colour_map[roi_id]
             if roi_id in self.selected:
                 overlay[mask, 3] = 0.82
             elif roi_id in self.fixed_ids:
@@ -1907,22 +2896,58 @@ class FibreSightWorkbench(QMainWindow):
         self.ax.imshow(overlay, interpolation='nearest')
         selected_mask = np.isin(self.labelled, list(self.selected))
         fixed_mask = np.isin(self.labelled, list(self.fixed_ids - self.selected))
-        if np.any(selected_mask) and np.any(~selected_mask):
-            self.ax.contour(
-                selected_mask,
-                levels=[0.5],
-                colors=['#79ddff'],
-                linewidths=1.5,
-                linestyles='solid',
-                )
-        if np.any(fixed_mask) and np.any(~fixed_mask):
-            self.ax.contour(
+        if np.any(fixed_mask):
+            self.plot_mask_outline(
                 fixed_mask,
-                levels=[0.5],
-                colors=['#ffd166'],
-                linewidths=1.4,
-                linestyles='dashed',
+                '#ffd166',
+                linewidth=1.4,
+                linestyle='dashed',
                 )
+        if np.any(selected_mask):
+            self.plot_selection_halo(colour_map)
+
+    def plot_selection_halo(self, colour_map):
+        selected_ids = [
+            roi_id
+            for roi_id in colour_map
+            if roi_id in self.selected
+            ]
+        if not selected_ids:
+            return
+
+        selected_mask = np.isin(self.labelled, selected_ids)
+        self.plot_mask_outline(
+            selected_mask,
+            SELECTION_OUTER_COLOUR,
+            linewidth=SELECTION_OUTER_WIDTH,
+            linestyle='solid',
+            )
+        self.plot_mask_outline(
+            selected_mask,
+            SELECTION_INNER_COLOUR,
+            linewidth=SELECTION_INNER_WIDTH,
+            linestyle='solid',
+            )
+        for roi_id in selected_ids:
+            self.plot_mask_outline(
+                self.labelled == roi_id,
+                colour_map[roi_id],
+                linewidth=SELECTION_COLOUR_WIDTH,
+                linestyle='solid',
+                )
+
+    def plot_mask_outline(self, mask, colour, linewidth, linestyle):
+        padded = np.pad(np.asarray(mask, dtype=np.uint8), 1)
+        height, width = mask.shape
+        self.ax.contour(
+            np.arange(-1, width + 1),
+            np.arange(-1, height + 1),
+            padded,
+            levels=[0.5],
+            colors=[colour],
+            linewidths=linewidth,
+            linestyles=linestyle,
+            )
 
     def get_current_view(self):
         if not self.ax.images:
@@ -1931,16 +2956,26 @@ class FibreSightWorkbench(QMainWindow):
 
     def reset_view(self):
         self.canvas.reset_view()
-        self.refresh_status('view reset')
+        self.refresh_status('view fitted')
+
+    def zoom_in(self):
+        if self.canvas.zoom_in():
+            self.refresh_status('view enlarged')
+
+    def zoom_out(self):
+        if self.canvas.zoom_out():
+            self.refresh_status('view reduced')
 
     #%% state helpers
     def update_roi_dict(self):
         if self.labelled is None:
             self.roi_dict = {}
             self.fixed_ids.clear()
+            self.refresh_roi_table()
             return
         self.roi_dict = labels_to_roi_dict(self.labelled)
         self.fixed_ids = {roi_id for roi_id in self.fixed_ids if roi_id in self.roi_dict}
+        self.refresh_roi_table()
 
     def compact_labels(self):
         if self.labelled is None:
@@ -1969,19 +3004,55 @@ class FibreSightWorkbench(QMainWindow):
         roi_count = len(self.roi_dict)
         selected_count = len(self.selected)
         fixed_count = len(self.fixed_ids)
-        self.state_label.setText(f'image: {image_name}')
+        self.state_label.setText(
+            image_name if self.image_path else 'image: not loaded'
+            )
+        self.state_label.setToolTip(
+            str(self.image_path) if self.image_path else 'no channel-2 image loaded'
+            )
         self.roi_label.setText(
             f'{roi_count} ROIs | {selected_count} selected | {fixed_count} fixed'
             )
+        self.model_label.setText(self.model_status_text())
+        self.update_export_tooltip()
         self.update_workflow_state()
         if message:
-            # Keep routine confirmation off the canvas while I am selecting and fixing ROIs.
+            # keep routine confirmation off the canvas whilst I am selecting and fixing ROIs
             self.statusBar().showMessage(message, 4000)
 
+    def model_status_text(self):
+        checkpoint = self.checkpoint_line.text().strip()
+        if not checkpoint:
+            return 'model: not selected'
+
+        checkpoint_path = Path(checkpoint)
+        name = checkpoint_path.name
+        if not checkpoint_path.exists():
+            return f'model: {name} · checkpoint missing'
+
+        next_step = (
+            'ready to predict'
+            if self.image_selection_matches_loaded()
+            else 'awaiting image'
+            )
+        if self.predictor is None:
+            return f'model: {name} · {next_step}'
+
+        try:
+            matches = (
+                Path(self.predictor.checkpoint_path).resolve() ==
+                Path(checkpoint).resolve()
+                )
+        except (OSError, ValueError):
+            matches = False
+        if not matches:
+            return f'model: {name} · {next_step}'
+        return f'model: {name} · {self.predictor.device}'
+
     def update_workflow_state(self):
-        image_ready = self.ref_image is not None
         image_text = self.image_line.text().strip()
         image_path_ready = bool(image_text) and Path(image_text).exists()
+        image_ready = self.image_selection_matches_loaded()
         checkpoint_text = self.checkpoint_line.text().strip()
         checkpoint_ready = bool(checkpoint_text) and Path(checkpoint_text).exists()
         model_ready = bool(self.current_model_path()) and Path(self.current_model_path()).exists()
@@ -1993,34 +3064,54 @@ class FibreSightWorkbench(QMainWindow):
         source_ready = bool(source_text) and Path(source_text).exists()
         has_rois = self.labelled is not None and bool(np.any(self.labelled > 0))
         process_running = self.process is not None and self.process.state() != QProcess.NotRunning
-        selected_fixed = bool(self.selected.intersection(self.fixed_ids))
-        selected_unfixed = bool(self.selected.difference(self.fixed_ids))
+        selected_ids = self.selected.intersection(self.roi_dict)
+        selected_are_fixed = (
+            bool(selected_ids) and
+            selected_ids.issubset(self.fixed_ids)
+            )
         has_fixed = bool(self.fixed_ids)
 
         self.build_manifest_button.setEnabled(source_ready and not process_running)
         self.inspect_manifest_button.setEnabled(manifest_ready and not process_running)
-        self.train_model_button.setEnabled(source_ready and config_ready and bool(self.run_name_line.text().strip()) and not process_running)
+        self.train_model_button.setEnabled(
+            source_ready
+            and config_ready
+            and bool(self.run_name_line.text().strip())
+            and not process_running
+            )
         self.evaluate_model_button.setEnabled(manifest_ready and model_ready and not process_running)
         self.preview_training_button.setEnabled(manifest_ready and not process_running)
         self.preview_predictions_button.setEnabled(manifest_ready and model_ready and not process_running)
         self.stop_process_button.setEnabled(process_running)
         self.stop_process_button.setVisible(process_running)
-        self.device_combo.setEnabled(not process_running)
 
         self.predict_button.setEnabled(
             image_path_ready and checkpoint_ready and not process_running
             )
         probability_ready = self.probability is not None
-        self.apply_settings_button.setEnabled(probability_ready and not process_running)
-        self.apply_settings_button.setVisible(probability_ready)
-        self.show_probability_check.setVisible(probability_ready)
+        self.rebuild_rois_button.setEnabled(
+            probability_ready and not process_running
+            )
+        self.rebuild_rois_button.setVisible(probability_ready)
+        self.confidence_view_button.setEnabled(probability_ready)
+        self.confidence_view_button.setToolTip(
+            'show per-pixel model confidence from 0 to 1'
+            if probability_ready else
+            'available after prediction produces a confidence map'
+            )
+        self.update_display_control_state()
 
         self.segment_button.setEnabled(image_ready)
         self.segment_load_roi_button.setEnabled(image_ready)
-        self.fix_selected_button.setEnabled(selected_unfixed)
-        self.fix_selected_button.setVisible(selected_unfixed)
-        self.unfix_selected_button.setEnabled(selected_fixed)
-        self.unfix_selected_button.setVisible(selected_fixed)
+        self.fix_selected_button.setText(
+            'unfix' if selected_are_fixed else 'fix'
+            )
+        self.fix_selected_button.setToolTip(
+            'allow selected ROIs to change during segmentation'
+            if selected_are_fixed else
+            'keep selected ROIs when segmentation is run again'
+            )
+        self.fix_selected_button.setEnabled(bool(selected_ids))
         self.clear_fixed_button.setEnabled(has_fixed)
         self.clear_fixed_button.setVisible(has_fixed)
         self.clear_unfixed_button.setEnabled(has_rois and has_fixed)
@@ -2030,10 +3121,15 @@ class FibreSightWorkbench(QMainWindow):
         self.curate_buttons['delete'].setEnabled(bool(self.selected))
         self.curate_buttons['merge'].setEnabled(len(self.selected) >= 2)
         self.curate_buttons['undo'].setEnabled(bool(self.undo_stack))
-        self.curate_buttons['reset_view'].setEnabled(image_ready)
+        self.curate_buttons['zoom_out'].setEnabled(image_ready)
+        self.curate_buttons['fit_view'].setEnabled(image_ready)
+        self.curate_buttons['zoom_in'].setEnabled(image_ready)
         self.curate_buttons['save_roi'].setEnabled(image_ready and has_rois)
+        if hasattr(self, 'controls_split_timer'):
+            self.controls_split_timer.start(0)
 
     def print_log(self, text, end='\n'):
+        text = format_log_text(text)
         if end:
             text = f'{text}{end}'
         self.output_box.moveCursor(QTextCursor.End)
@@ -2064,6 +3160,8 @@ class FibreSightWorkbench(QMainWindow):
 def main():
     app = QApplication.instance()
     if app is None:
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
         app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setFont(load_gui_font())
