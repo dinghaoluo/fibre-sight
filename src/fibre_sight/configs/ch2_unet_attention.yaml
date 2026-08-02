@@ -1,5 +1,5 @@
-# Created on 9 April 2026
-# baseline 256-pixel crop recipe
+# Created on 2 August 2026
+# attention-gated skip connections with the working 256-pixel recipe
 data:
   manifest: manifests/ch2_manifest.csv
   train_split: train
@@ -10,7 +10,7 @@ data:
   foreground_fraction: 0.75
   normalise_percentiles: [1, 99.7]
   cache_images: true
-  # 1 August 2026: keep lossless rotations and modest noise as the working baseline.
+  # 1 August 2026: preserve the augmentation used by the released checkpoint.
   augmentation:
     rotation_90: true
     noise_sd: 0.02
@@ -20,15 +20,16 @@ model:
   out_channels: 1
   base_channels: 24
   depth: 4
+  attention_gates: true
 
-# BCE keeps false foreground costly; Dice stops the sparse fibre mask being treated as background.
+# 2 August 2026: change the skip paths only; keep the working loss fixed.
 loss:
   mode: bce_dice
   bce_weight: 1.0
   seg_weight: 1.0
 
 train:
-  run_name: ch2_unet
+  run_name: ch2_unet_attention
   out_dir: output/runs
   epochs: 80
   batch_size: 8
@@ -44,4 +45,3 @@ postprocess:
   threshold: 0.5
   min_size: 30
   max_size:
-

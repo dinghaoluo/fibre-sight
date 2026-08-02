@@ -2,6 +2,7 @@
 Created on 8 April 2026
 
 Modified on 23 July 2026 to repair the Dataset import and keep target construction here
+Modified on 1 August 2026 to pass augmentation choices from the training recipe
 sample channel-2 image patches and their curated ROI masks
 
 @author: Dinghao Luo
@@ -51,6 +52,8 @@ class AxonROIDataset(Dataset):
             foreground_fraction=0.75,
             normalise_percentiles=(1, 99.7),
             augment=True,
+            rotation_90=True,
+            noise_sd=0.02,
             cache_images=False,
             target_mode='foreground',
             support_radius=3,
@@ -69,6 +72,9 @@ class AxonROIDataset(Dataset):
         self.foreground_fraction = float(foreground_fraction)
         self.normalise_percentiles = tuple(normalise_percentiles)
         self.augment = bool(augment)
+        # 1 August 2026: keep these choices in the recipe so ablations do not require code edits.
+        self.rotation_90 = bool(rotation_90)
+        self.noise_sd = float(noise_sd)
         self.cache_images = bool(cache_images)
         self.target_mode = target_mode
         self.support_radius = int(support_radius)
@@ -97,7 +103,13 @@ class AxonROIDataset(Dataset):
         image, mask = crop_pair(image, mask, bounds)
 
         if self.augment:
-            image, mask = augment_pair(image, mask, rng)
+            image, mask = augment_pair(
+                image,
+                mask,
+                rng,
+                rotation_90=self.rotation_90,
+                noise_sd=self.noise_sd,
+                )
 
         target = make_target(
             mask,

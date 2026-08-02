@@ -5,6 +5,7 @@ Modified on 19 May 2026
 Modified on 23 June 2026
 Modified on 23 July 2026 to keep the loss experiments beside the training loop
 Modified on 24 July 2026 to use packaged recipes and local run directories
+Modified on 1 August 2026 to seed comparable runs and expose augmentation choices
 train the small U-Net and keep its run record
 
 @author: Dinghao Luo
@@ -128,6 +129,12 @@ def get_device(device_name):
     return resolve_device(device_name)
 
 
+def set_random_seed(seed):
+    seed = int(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
 def use_pinned_memory(config, device):
     train_cfg = get_section(config, 'train')
     return bool(train_cfg.get('pin_memory', True) and device.type == 'cuda')
@@ -143,6 +150,7 @@ def make_dataloaders(config, device=None):
 
     manifest_path = resolve_path(data_cfg['manifest'], WORKSPACE_ROOT)
     normalise_percentiles = data_cfg.get('normalise_percentiles', [1, 99.7])
+    augmentation_cfg = data_cfg.get('augmentation', {})
 
     train_dataset = AxonROIDataset(
         manifest_path,
@@ -152,6 +160,8 @@ def make_dataloaders(config, device=None):
         foreground_fraction=data_cfg.get('foreground_fraction', 0.75),
         normalise_percentiles=normalise_percentiles,
         augment=True,
+        rotation_90=augmentation_cfg.get('rotation_90', True),
+        noise_sd=augmentation_cfg.get('noise_sd', 0.02),
         cache_images=data_cfg.get('cache_images', False),
         target_mode=data_cfg.get('target_mode', 'foreground'),
         support_radius=data_cfg.get('support_radius', 3),
@@ -357,6 +367,8 @@ def main():
     args = parse_args()
     config = load_config(args.config)
     train_cfg = get_section(config, 'train')
+    # 1 August 2026: seed model initialisation and loader shuffling for cleaner comparisons.
+    set_random_seed(train_cfg.get('seed', 7))
     device = get_device(train_cfg.get('device', 'auto'))
     run_dir = prepare_run_dir(config)
     figure_run_dir = prepare_figure_run_dir(run_dir.name)

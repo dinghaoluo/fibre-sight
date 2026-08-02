@@ -1,6 +1,8 @@
 '''
 Created on 5 April 2026
 
+Modified on 1 August 2026 to expose the lossless rotation decision
+
 normalisation, crop sampling, and augmentation for channel-2 images
 
 @author: Dinghao Luo
@@ -66,7 +68,14 @@ def crop_pair(image, mask, bounds):
 
 
 #%% augmentation
-def augment_pair(image, mask, rng, intensity_jitter=0.15, noise_sd=0.02):
+def augment_pair(
+        image,
+        mask,
+        rng,
+        rotation_90=True,
+        intensity_jitter=0.15,
+        noise_sd=0.02,
+        ):
     if rng.random() < 0.5:
         image = np.flip(image, axis=0)
         mask = np.flip(mask, axis=0)
@@ -75,10 +84,12 @@ def augment_pair(image, mask, rng, intensity_jitter=0.15, noise_sd=0.02):
         image = np.flip(image, axis=1)
         mask = np.flip(mask, axis=1)
 
-    k = int(rng.integers(0, 4))
-    if k:
-        image = np.rot90(image, k)
-        mask = np.rot90(mask, k)
+    # 1 August 2026: keep rotations lossless here; thin masks do not need interpolation.
+    if rotation_90:
+        k = int(rng.integers(0, 4))
+        if k:
+            image = np.rot90(image, k)
+            mask = np.rot90(mask, k)
 
     if intensity_jitter > 0:
         scale = 1 + rng.uniform(-intensity_jitter, intensity_jitter)

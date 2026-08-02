@@ -10,6 +10,10 @@ data:
   foreground_fraction: 0.75
   normalise_percentiles: [1, 99.7]
   cache_images: true
+  # 1 August 2026: match the baseline augmentation before changing crop size and width.
+  augmentation:
+    rotation_90: true
+    noise_sd: 0.02
 
 model:
   in_channels: 1
@@ -19,8 +23,9 @@ model:
 
 # This trial changed crop size and model width, so the baseline loss remains unchanged.
 loss:
+  mode: bce_dice
   bce_weight: 1.0
-  dice_weight: 1.0
+  seg_weight: 1.0
 
 train:
   run_name: ch2_unet_512
