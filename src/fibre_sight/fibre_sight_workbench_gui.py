@@ -387,7 +387,7 @@ class FibreSightWorkbench(QMainWindow):
         super().__init__()
         if app is not None and gui_font is not None:
             app.setFont(gui_font)
-        self.setWindowTitle('fibre-sight')
+        self.setWindowTitle('FibreSight')
         self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1280, 820)
         self.setMinimumSize(1000, 680)

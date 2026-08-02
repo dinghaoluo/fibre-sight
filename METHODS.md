@@ -56,7 +56,7 @@ The split was made at session level. All four animals appeared in each split, so
 
 Each full reference image was clipped and scaled between its 1st and 99.7th intensity percentiles. The training loader then drew 24 patches of 256 × 256 pixels per session during each epoch; 75% of crop centres were sampled from foreground pixels, whilst the remainder were placed randomly so that background-only patches remained part of the task. Validation used eight patches per session without augmentation.
 
-Training augmentation used independent horizontal and vertical flips, rotations in 90-degree steps, intensity scaling of up to 15%, a small intensity offset, and Gaussian noise with a standard deviation of `0.02` after normalisation. The random crop and augmentation sequence changed with the epoch and remained reproducible from seed `7`.
+Training augmentation used independent horizontal and vertical flips, lossless rotations in 90-degree steps, intensity scaling of up to 15%, a small intensity offset, and Gaussian noise with a standard deviation of `0.02` after normalisation. These choices are now exposed in the recipe YAML under `data.augmentation` (`rotation_90`, `noise_sd`) so that ablations do not require code edits; the released checkpoint used both rotations and noise at the values above. The random crop and augmentation sequence changed with the epoch and remained reproducible from seed `7`.
 
 ## network and optimisation
 
@@ -102,8 +102,16 @@ The released setting predicted a mean of 38.2 connected components per test sess
 
 ## retained experiments
 
-Two later recipes remain beside the selected baseline. `ch2_unet_aux_recall.yaml` added a dilated support target and Tversky loss; `ch2_unet_512.yaml` used 512-pixel crops and a wider network. The 256-pixel baseline remained the released model. The comparison stopped with these working trials whilst the labelling and curation loop was still changing.
+Three alternative recipes remain beside the selected baseline. Each changed one dimension of the training setup whilst holding the rest fixed; the training pipeline seeds numpy and torch from the recipe's `train.seed` value before model initialisation, so single-variable comparisons are reproducible.
+
+**`ch2_unet_aux_recall.yaml`** added a dilated support target (binary dilation with radius 3 around each foreground mask) and replaced soft Dice with Tversky loss (`alpha=0.15, beta=0.85`), penalising false negatives far more than false positives. The model widened to base channels 32, output two channels (foreground + support), and trained for 100 epochs at a higher foreground crop fraction (0.85). This was the recall-heavy extreme; the released postprocessing already favours recall through a low confidence threshold, so the additional recall from a modified loss did not justify the added complexity.
+
+**`ch2_unet_512.yaml`** doubled the crop size to 512 pixels and widened the base channels to 32, giving the network more spatial context per patch. This was a sanity check that the 256-pixel baseline was not leaving performance on the table; the smaller model remained the released checkpoint.
+
+**`ch2_unet_attention.yaml`** added attention gates to the skip connections of the standard `SmallUNet` whilst keeping the 256-pixel crop, base width 24, BCE + Dice loss, and seed 7 unchanged. The gate projects skip features and the upsampled decoder features into a shared low-dimensional space (half the minimum of skip and gate channels), applies ReLU then a 1×1 convolution to a single-channel sigmoid score, and multiplies that score back onto the skip path before concatenation. The decoder path itself is unmodified; only the skip contribution is gated. In our tests the attention-gated variant performed comparably to the standard U-Net on the same data. The recipe is included for cases where the training data contains more heterogeneous backgrounds and the skip connections might benefit from learned suppression of irrelevant features.
+
+The 256-pixel ungated baseline remained the released model. The comparison stopped with these working trials whilst the labelling and curation loop was still changing. The full [training guide](TRAINING.md) describes each recipe and how to write a new one.
 
 ## scope
 
-The checkpoint was trained and tested within one dLight acquisition source. Percentile normalisation handles simple changes in signal scale. A new indicator, microscope point-spread function, field size, background texture or labelling convention changes the spatial problem and remains outside that correction. Images from another domain need hand-labelled checks; repeated misses in the confidence map are evidence for retraining, whilst below-threshold responses can be explored with the prediction controls at the top of this file.
+The checkpoint was trained and tested within one dLight acquisition source. Percentile normalisation handles simple changes in signal scale. A new indicator, microscope point-spread function, field size, background texture, or labelling convention changes the spatial problem and remains outside that correction. Images from another domain need hand-labelled checks; repeated misses in the confidence map are evidence for retraining, whilst below-threshold responses can be explored with the prediction controls at the top of this file.
