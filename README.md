@@ -15,7 +15,7 @@ From the cloned repository root:
 ```powershell
 conda env create -f environment.yml
 conda activate fibre-sight
-python -m fibre_sight
+python -m fibre_sight  # note that it is an underscore, not a hyphen
 ```
 
 `run_fibre_sight.bat` starts the same workbench on Windows after the environment has been activated; `sh run_fibre_sight.sh` does the same on macOS and Linux. An editable pip installation is also sufficient:
