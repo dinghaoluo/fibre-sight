@@ -1,5 +1,7 @@
 # FibreSight
 
+[![tests](https://github.com/dinghaoluo/fibre-sight/actions/workflows/tests.yml/badge.svg)](https://github.com/dinghaoluo/fibre-sight/actions/workflows/tests.yml)
+
 FibreSight predicts axonal ROIs from two-dimensional channel-2 reference images (`ref_mat_ch2.npy`). The workbench runs either the bundled U-Net checkpoint or the older MSER proposal route; the resulting ROIs can then be inspected, merged, deleted, and exported.
 
 ![FibreSight workbench with predicted ROI outlines and curation controls](docs/images/fibre-sight-workbench.png)
@@ -144,6 +146,16 @@ Run the standalone tests from the repository root:
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## cite FibreSight
+
+If FibreSight contributes to published work, please cite the software version used:
+
+```text
+Luo, D. (2026). FibreSight (Version 0.1.3) [Computer software]. https://github.com/dinghaoluo/fibre-sight
+```
+
+GitHub's `Cite this repository` menu generates other citation formats from [`CITATION.cff`](CITATION.cff).
 
 ## repository scope
 
