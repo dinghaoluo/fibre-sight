@@ -103,13 +103,19 @@ def layout(window):
     from PyQt5.QtCore import QPoint, Qt
     from PyQt5.QtGui import QColor, QFont, QFontInfo, QPalette
     from PyQt5.QtWidgets import (
+        QAbstractButton,
         QApplication,
         QLabel,
         QProgressBar,
         QScrollArea,
         QSizePolicy,
+        QToolTip,
         QWidget,
         )
+
+    from fibre_sight.fibre_sight_workbench_gui import GUI_FONT_SIZE
+
+    assert GUI_FONT_SIZE == (12.0 if sys.platform == 'darwin' else 9.0)
 
     def relative_luminance(colour):
         channels = [channel / 255 for channel in colour.getRgb()[:3]]
@@ -146,7 +152,7 @@ def layout(window):
     assert isinstance(window.training_tab, QScrollArea)
 
     ordinary_widgets = [
-        window.tabs,
+        window.tabs.tabBar(),
         window.image_line,
         window.checkpoint_line,
         window.predict_button,
@@ -154,6 +160,7 @@ def layout(window):
         window.train_model_button,
         window.dark_mode_check,
         window.roi_table,
+        window.roi_table.horizontalHeader(),
         window.output_box,
         ]
     for widget in ordinary_widgets:
@@ -163,16 +170,17 @@ def layout(window):
         assert info.weight() == QFont.Normal
         assert info.styleName().casefold() == 'regular'
 
-    assert window.font().pointSizeF() == 9.0
+    assert window.font().pointSizeF() == GUI_FONT_SIZE
     assert all(
-        widget.font().pointSizeF() == 9.0
+        widget.font().pointSizeF() == GUI_FONT_SIZE
         for widget in ordinary_widgets
         )
     assert window.ax.texts
     assert min(
         text.get_fontsize()
         for text in window.ax.texts
-        ) == 9.0
+        ) == GUI_FONT_SIZE
+    assert QToolTip.font().pointSizeF() == GUI_FONT_SIZE
 
     headings = [
         window.state_label,
@@ -221,6 +229,35 @@ def layout(window):
     assert QColor(theme['border_strong']) != QColor(theme['surface'])
     assert 'QPushButton:focus' in window.styleSheet()
     assert 'QCheckBox:disabled' in window.styleSheet()
+
+    assert window.interface_font_button.text() == 'Aa'
+    assert window.interface_font_button.accessibleName() == 'interface text size'
+    assert [
+        action.text()
+        for action in window.interface_font_menu.actions()
+        ] == ['9 pt', '10 pt', '11 pt', '12 pt', '13 pt']
+    assert window.interface_font_actions[GUI_FONT_SIZE].isChecked()
+    window.interface_font_actions[11].trigger()
+    QApplication.instance().processEvents()
+    assert all(
+        button.font().pointSizeF() == 11.0
+        for button in window.findChildren(QAbstractButton)
+        )
+    assert all(widget.font().pointSizeF() == 11.0 for widget in ordinary_widgets)
+    assert all(heading.font().pointSizeF() == 11.0 for heading in headings)
+    assert QToolTip.font().pointSizeF() == 11.0
+    assert all(
+        action.font().pointSizeF() == 11.0
+        for action in window.interface_font_menu.actions()
+        )
+    assert all(
+        window.roi_table.horizontalHeaderItem(column).font().pointSizeF() == 11.0
+        for column in range(window.roi_table.columnCount())
+        )
+    assert min(text.get_fontsize() for text in window.ax.texts) == 11.0
+    assert window.interface_font_actions[11].isChecked()
+    window.interface_font_actions[GUI_FONT_SIZE].trigger()
+    QApplication.instance().processEvents()
 
     assert window.activity_splitter.orientation() == Qt.Vertical
     assert window.activity_splitter.isCollapsible(1)
