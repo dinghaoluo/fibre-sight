@@ -1788,6 +1788,7 @@ class FibreSightWorkbench(QMainWindow):
         self.settings.setValue('interface/font_size', point_size)
         self.settings.sync()
         self.plot_image(preserve_view=True)
+        self._controls_split_positions.clear()
         self.controls_split_timer.start(0)
         self.schedule_curation_layout()
 
