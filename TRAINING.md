@@ -4,7 +4,7 @@ The bundled checkpoint covers only our lab's data. It has worked for multiple se
 
 ## label sessions
 
-Select a session's `channel-2 image` in the workbench, then open `label` to hand-label it after running `SEGMENT`. Delete, merge, or fix proposals made by the MSER algorithm, then click `export ROIs`.
+Select a session's `channel-2 image` in the workbench, then open `label` and run `SEGMENT` to generate MSER proposals. Delete, merge, or fix those proposals, then click `export ROIs`. The current workbench cannot draw a missed fibre from scratch; add any missing ROIs in an external editor and import the resulting dictionary before export.
 
 Arrange the results so each session directory holds both files:
 
@@ -45,7 +45,7 @@ Paths inside the config resolve against the workspace root, so `data.manifest` o
 
 A recipe is a single YAML with four sections:
 
-**`data`** controls what the training loader sees. For a new dataset, adjust `patch_size` and `patches_per_image` to the field size, `foreground_fraction` to the mask density, and `normalise_percentiles` to the useful intensity range. The `augmentation` sub-section exposes the lossless rotation and Gaussian noise choices so that ablations do not require code edits:
+**`data`** controls what the training loader sees. For a new dataset, adjust `patch_size` and `patches_per_image` to the field size, `foreground_fraction` to the mask density, and `normalise_percentiles` to the useful intensity range. Every training patch can receive independent horizontal and vertical flips, a lossless quarter-turn rotation, intensity scaling within ±15%, an intensity offset within ±0.0375, and Gaussian noise. The `augmentation` sub-section exposes the rotation and noise choices so that those ablations do not require code edits:
 
 ```yaml
 data:
@@ -54,13 +54,13 @@ data:
     noise_sd: 0.02       # Gaussian noise after normalisation
 ```
 
-Setting `rotation_90: false` disables the 90-degree rotations whilst keeping the horizontal and vertical flips, which are always applied. Setting `noise_sd: 0` disables additive noise entirely.
+Setting `rotation_90: false` disables the quarter-turn rotations. Horizontal and vertical flips are separate fixed loader operations, each applied with probability `0.5`; the intensity jitter is also fixed loader behaviour. Setting `noise_sd: 0` disables additive noise entirely. Validation patches are not augmented.
 
 **`model`** sets the architecture. `base_channels` and `depth` control the network width and resolution levels; `attention_gates: true` activates the attention-gated skip connections (see [alternative architectures](#alternative-architectures) below).
 
 **`loss`** configures the segmentation loss. The default `bce_dice` mode combines binary cross-entropy with soft Dice; `bce_tversky` replaces soft Dice with Tversky loss for recall-heavy training. `channel_weights` and `pos_weight` allow per-channel weighting when multi-channel targets are used.
 
-**`train`** sets the run name, output directory, learning rate, batch size, epoch count, device, and random seed. The seed controls model initialisation, loader shuffling, and crop sampling so that parallel runs with different recipes remain directly comparable.
+**`train`** sets the run name, output directory, learning rate, batch size, epoch count, device, and random seed. The seed controls model initialisation, loader shuffling, crop sampling, and augmentation draws, which supports direct comparisons between recipes on the same software and hardware stack.
 
 ### device selection
 
@@ -153,6 +153,6 @@ All four recipes use the same manifest path and workspace layout. The comparison
 
 ## reproducibility
 
-Training runs are seeded by `train.seed` in the recipe. The seed controls `numpy` and `torch` random state before model initialisation, so two runs with the same recipe and the same seed produce the same initial weights and the same crop sequences. This makes single-variable comparisons (attention gates on vs. off, different loss modes) straightforward: change one thing in the YAML, keep the seed fixed, and the only source of variation is the change itself.
+Training runs are seeded by `train.seed` in the recipe. The seed controls `numpy` and `torch` random state before model initialisation, so two runs with the same recipe and seed begin with the same initial weights and use the same indexed crop and augmentation sequence. This supports single-variable comparisons (attention gates on vs. off, different loss modes): change one thing in the YAML and keep the seed fixed. Accelerator kernels and differences between software or hardware stacks can still introduce numerical variation.
 
-The augmentation parameters (`rotation_90`, `noise_sd`) are also recorded in the recipe, not hardcoded, so the exact augmentation applied to any run can be read from its saved `config.yaml`.
+The saved recipe records `rotation_90` and `noise_sd`. The two flip probabilities and the intensity jitter are fixed in the loader rather than exposed in YAML, so reconstructing the complete augmentation policy also requires the corresponding FibreSight source version.

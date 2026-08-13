@@ -1,12 +1,12 @@
 # FibreSight
 
-With tens of sessions and hundreds of neurite ROIs, manual curation can take days of effort, and the resulting segmentation also varies between experimenters. FibreSight reads two-dimensional channel-2 reference arrays (`ref_mat_ch2.npy`) and predicts candidate ROIs; the workbench combines a bundled U-Net checkpoint, the older MSER proposal route, and manual curation tools to accelerate segmentation of neural fibres (axons, dendrites, and potentially dendritic spines should the appropriate model be trained).
+FibreSight predicts axonal ROIs from two-dimensional channel-2 reference images (`ref_mat_ch2.npy`). The workbench runs either the bundled U-Net checkpoint or the older MSER proposal route; the resulting ROIs can then be inspected, merged, deleted, and exported.
 
 ![FibreSight workbench with predicted ROI outlines and curation controls](docs/images/fibre-sight-workbench.png)
 
-This repository comes with a `fibre_sight_ch2_v1.pt` checkpoint ([model card](MODEL_CARD.md); [methods and training record](METHODS.md)) trained on 53 hand-labelled channel-2 two-photon images from our lab; the data are not included, but 3 example sessions (cropped) are bundled as demos. The checkpoint reaches 0.93 recall on nine held-out test sessions, and its default operating point favours over-proposal: a confidence threshold of `0.25`, a minimum component size of `45` pixels, and four-view flip test-time augmentation. 
+The checkpoint was developed from 53 hand-labelled two-photon sessions containing 1,296 curated ROIs. It reached 0.926 foreground-pixel recall on nine session-held-out images from the same four animals and acquisition source; the released operating point deliberately favours over-proposal. See the [model card](MODEL_CARD.md) and [methods record](METHODS.md) for the full evaluation.
 
-In addition to the plug-and-play prediction pipeline, the training workflow and all loss experiments are included, so that for a different indicator, microscope, or labelling convention, one can label sessions with the built-in MSER and curation tools, build a manifest, and train a new checkpoint on one's own data; see [How to Train Your Model™](TRAINING.md) for a guide to labelling, manifest building, and training.
+For another indicator, microscope, or labelling convention, the repository includes the full training and evaluation workflow; see [How to Train Your Model™](TRAINING.md).
 
 ## quick start
 
@@ -38,7 +38,7 @@ fibre-sight
 
 Training and inference both default to automatic device selection: PyTorch uses CUDA when it is available, then Apple's MPS backend on Apple silicon, then CPU.
 
-On macOS, FibreSight uses a native arm64 Python interpreter; `python -c "import platform; print(platform.machine())"` should print `arm64`. MPS acceleration requires macOS 12.3 or later.
+For MPS acceleration on Apple silicon, use a native arm64 Python interpreter; `python -c "import platform; print(platform.machine())"` should print `arm64`. MPS requires macOS 12.3 or later. Other macOS installations fall back to CPU.
 
 ## quick demo
 
@@ -63,9 +63,11 @@ The command uses the bundled checkpoint, chooses the available compute device, p
 
 Higher `prediction threshold` values retain fewer, more confident ROIs. `minimum ROI area (pixels)` removes small connected components after thresholding. The `confidence` view shows the probability map beneath the ROI outlines; `ROI on / ROI off` hides those outlines without changing the current view. The [methods](METHODS.md#prediction-controls) record gives the defaults and the direction of every prediction and MSER control.
 
+Canvas and ROI-table selections remain linked. The workbench supports multiselection, ROI import and export, deletion, merging, undo, pan and zoom, adjustable display black and white points, dark and light modes, and adjustable interface text size. In the `Label` tab, fixed proposals survive another MSER pass; the `Train` tab scans labelled sessions, previews the dataset, starts or stops training, scores a checkpoint, and saves diagnostic figures.
+
 ## model performance
 
-The released checkpoint reached its best validation Dice of `0.7822` at epoch 37 of 80. On nine held-out test sessions, the released operating point (`0.25` threshold, `45` minimum pixels, four-view TTA) gives the following foreground-pixel scores:
+The released checkpoint reached its best validation Dice of `0.7822` at epoch 37 of 80. On nine session-held-out test sessions from the same four animals and acquisition source, the released operating point (`0.25` threshold, `45` minimum pixels, four-view TTA) gives the following foreground-pixel scores:
 
 | metric | mean |
 | --- | ---: |
@@ -74,7 +76,7 @@ The released checkpoint reached its best validation Dice of `0.7822` at epoch 37
 | precision | 0.5958 |
 | F2 | 0.8312 |
 
-The operating point favours recall over precision. This is because a false positive only costs us one click to remove, whilst a missed axon costs the full manual labour of adding it into the dict.
+The operating point favours recall over precision. A false-positive proposal can be selected and deleted in the workbench; a missed axon must currently be drawn outside the workbench and imported.
 
 ![Training and validation loss with validation Dice across 80 epochs](docs/images/training-history.png)
 
@@ -85,6 +87,10 @@ Full metrics, the threshold sweep, and the training record are kept in the [meth
 ### Will the bundled checkpoint work on images from another setup?
 
 The checkpoint was trained on channel-2 references acquired and processed within one dLight dataset. Percentile normalisation absorbs simple changes in intensity scale, although a different indicator, microscope, field size, background texture, or axon morphology can still change what the network recognises. New image domains should be checked against hand labels and may require retraining.
+
+### Can FibreSight start from a TIFF movie?
+
+Not yet. The current workbench begins with a precomputed two-dimensional `.npy` reference image and ends with an ROI dictionary. It does not yet register TIFF movies, generate reference images from a stack, or extract activity traces.
 
 ## workspace
 
@@ -108,7 +114,7 @@ The manifest builder expects two files in each labelled session:
 <session>/processed_data/*_ROI_dict.npy
 ```
 
-`scan labelled sessions` writes a CSV containing the image and ROI paths, summaries, inclusion state, and the train, validation, or test split.
+ROI dictionaries use a legacy pickled NumPy format. `scan labelled sessions` writes a CSV containing the image and ROI paths, summaries, inclusion state, and the train, validation, or test split. The scanner currently infers the animal or subject group from the part of the session folder name before the first hyphen; inspect the `animal` and `split` columns before training, particularly when using another experimenter's folder convention.
 
 ## command-line tools
 
