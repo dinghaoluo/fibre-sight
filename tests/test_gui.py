@@ -370,7 +370,11 @@ def layout(window):
         assert window.roi_table.height() >= 140
         assert window.black_slider.visibleRegion().boundingRect().width() > 0
         assert window.white_slider.visibleRegion().boundingRect().width() > 0
-        assert window.predict_tab.verticalScrollBar().maximum() == 0
+        predict_overflow = window.predict_tab.verticalScrollBar().maximum()
+        assert predict_overflow == 0, (
+            f'{point_size} pt Predict overflowed by {predict_overflow} px; '
+            f'controls splitter: {window.controls_splitter.sizes()}'
+            )
         for widget in [
             window.interface_font_button,
             window.roi_overlay_check,
