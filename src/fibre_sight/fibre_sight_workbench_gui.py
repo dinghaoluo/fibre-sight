@@ -30,6 +30,7 @@ from PyQt5.QtCore import (
     QByteArray,
     QItemSelectionModel,
     QProcess,
+    QSettings,
     QSignalBlocker,
     QTimer,
     Qt,
@@ -45,8 +46,11 @@ from PyQt5.QtGui import (
     QTextCursor,
     )
 from PyQt5.QtWidgets import (
+    QAbstractButton,
     QAbstractItemView,
     QAbstractSpinBox,
+    QAction,
+    QActionGroup,
     QApplication,
     QButtonGroup,
     QCheckBox,
@@ -60,6 +64,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QPushButton,
     QPlainTextEdit,
     QShortcut,
@@ -68,9 +73,14 @@ from PyQt5.QtWidgets import (
     QSlider,
     QSplitter,
     QSpinBox,
+    QStatusBar,
+    QTabBar,
     QTableWidget,
     QTableWidgetItem,
+    QTableView,
     QTabWidget,
+    QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
     )
@@ -102,6 +112,8 @@ WORKSPACE_ROOT = get_workspace_root()
 APP_ICON_PATH = package_path('assets', 'fibresight_icon.ico')
 MONONOKI_FONT_DIR = package_path('assets', 'fonts', 'mononoki')
 MONONOKI_FONT_FAMILY = 'mononoki'
+GUI_FONT_SIZE = 12.0 if sys.platform == 'darwin' else 9.0
+GUI_FONT_SIZES = range(9, 14)
 DISPLAY_BLACK_DEFAULT = 1.0
 DISPLAY_WHITE_DEFAULT = 99.7
 DISPLAY_MIN_GAP = 1.0
@@ -150,17 +162,6 @@ _GUI_FONT_FAMILY = None
 
 
 #%% helpers
-def _system_gui_font_size():
-    font = QFontDatabase.systemFont(QFontDatabase.GeneralFont)
-    point_size = font.pointSizeF()
-    if point_size > 0:
-        return point_size
-    app = QApplication.instance()
-    if app is not None and app.font().pointSizeF() > 0:
-        return app.font().pointSizeF()
-    return 10.0
-
-
 def load_gui_font(size=None, bold=False):
     global _GUI_FONT, _GUI_BOLD_FONT, _GUI_FONT_FAMILY
     if _GUI_FONT is None:
@@ -186,12 +187,11 @@ def load_gui_font(size=None, bold=False):
             family = fallback.family()
 
         _GUI_FONT_FAMILY = family
-        base_size = _system_gui_font_size()
         _GUI_FONT = QFont(family)
-        _GUI_FONT.setPointSizeF(base_size)
+        _GUI_FONT.setPointSizeF(GUI_FONT_SIZE)
         _GUI_FONT.setWeight(QFont.Normal)
         _GUI_BOLD_FONT = QFont(family)
-        _GUI_BOLD_FONT.setPointSizeF(base_size)
+        _GUI_BOLD_FONT.setPointSizeF(GUI_FONT_SIZE)
         _GUI_BOLD_FONT.setWeight(QFont.Bold)
         for font in (_GUI_FONT, _GUI_BOLD_FONT):
             font.setStyleStrategy(QFont.PreferAntialias)
@@ -209,9 +209,7 @@ def load_gui_font(size=None, bold=False):
 
     source = _GUI_BOLD_FONT if bold else _GUI_FONT
     font = QFont(source)
-    font.setPointSizeF(
-        _system_gui_font_size() if size is None else float(size)
-        )
+    font.setPointSizeF(GUI_FONT_SIZE if size is None else float(size))
     return font
 
 
@@ -379,14 +377,27 @@ class PathLineEdit(QLineEdit):
 
 #%% main window
 class FibreSightWorkbench(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings=None):
         app = QApplication.instance()
         if app is not None:
             app.setStyle('Fusion')
-        gui_font = load_gui_font() if app is not None else None
-        super().__init__()
+        if settings is None:
+            settings = QSettings('FibreSight', 'FibreSight')
+        interface_font_size = settings.value(
+            'interface/font_size',
+            GUI_FONT_SIZE,
+            type=float,
+            )
+        gui_font = (
+            load_gui_font(size=interface_font_size)
+            if app is not None else
+            None
+            )
         if app is not None and gui_font is not None:
             app.setFont(gui_font)
+            QToolTip.setFont(gui_font)
+        super().__init__()
+        self.settings = settings
         self.setWindowTitle('FibreSight')
         self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1280, 820)
@@ -410,6 +421,7 @@ class FibreSightWorkbench(QMainWindow):
         self.display_black = DISPLAY_BLACK_DEFAULT
         self.display_white = DISPLAY_WHITE_DEFAULT
         self.display_mode = 'image'
+        self.interface_font_size = interface_font_size
         self._syncing_roi_table = False
         self._process_stdout_buffer = ''
         self._process_stderr_buffer = ''
@@ -468,6 +480,8 @@ class FibreSightWorkbench(QMainWindow):
 
         self.tabs = QTabWidget()
         self.predict_tab, self.predict_tab_content = self._make_scroll_tab()
+        # Predict is short enough to fit; Qt style rounding should not add a scrollbar
+        self.predict_tab.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         (
             self.mser_tab,
             self.mser_scroll,
@@ -496,6 +510,28 @@ class FibreSightWorkbench(QMainWindow):
         self.dark_mode_check = QCheckBox('dark mode')
         self.dark_mode_check.setChecked(True)
         self.dark_mode_check.stateChanged.connect(self.set_dark_mode)
+
+        self.interface_font_button = QToolButton()
+        self.interface_font_button.setText('Aa')
+        self.interface_font_button.setAccessibleName('interface text size')
+        self.interface_font_button.setToolTip('interface text size')
+        self.interface_font_button.setPopupMode(QToolButton.InstantPopup)
+        self.interface_font_menu = QMenu(self.interface_font_button)
+        self.interface_font_group = QActionGroup(self)
+        self.interface_font_group.setExclusive(True)
+        self.interface_font_actions = {}
+        for size in GUI_FONT_SIZES:
+            action = QAction(f'{size} pt', self.interface_font_group)
+            action.setCheckable(True)
+            action.setChecked(size == self.interface_font_size)
+            action.triggered.connect(
+                lambda _checked, point_size=size: self.set_interface_font_size(
+                    point_size
+                    )
+                )
+            self.interface_font_menu.addAction(action)
+            self.interface_font_actions[size] = action
+        self.interface_font_button.setMenu(self.interface_font_menu)
 
     def _make_scroll_tab(self):
         scroll = QScrollArea()
@@ -961,10 +997,11 @@ class FibreSightWorkbench(QMainWindow):
         stage_layout.addSpacing(8)
         stage_layout.addWidget(self.roi_overlay_check)
         stage_layout.addWidget(self.dark_mode_check)
+        stage_layout.addWidget(self.interface_font_button)
 
         main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(7)
+        main_layout.setContentsMargins(10, 8, 10, 8)
+        main_layout.setSpacing(6)
         main_layout.addWidget(stage_header)
         main_layout.addWidget(self.main_splitter, 1)
 
@@ -1539,6 +1576,32 @@ class FibreSightWorkbench(QMainWindow):
             QCheckBox:disabled {{
                 color: {theme['disabled']};
             }}
+            QToolButton {{
+                border: 1px solid transparent;
+                border-radius: 2px;
+                padding: 2px 5px;
+                background: transparent;
+                color: {theme['muted']};
+            }}
+            QToolButton:hover, QToolButton:focus {{
+                border-color: {theme['border']};
+                background: {theme['surface_hover']};
+                color: {theme['text']};
+            }}
+            QToolButton::menu-indicator {{
+                image: none;
+            }}
+            QMenu {{
+                border: 1px solid {theme['border_strong']};
+                background: {theme['surface']};
+                color: {theme['text']};
+            }}
+            QMenu::item {{
+                padding: 4px 18px 4px 8px;
+            }}
+            QMenu::item:selected {{
+                background: {theme['surface_hover']};
+            }}
             QPushButton {{
                 border: 1px solid {theme['border']};
                 border-radius: 2px;
@@ -1693,6 +1756,43 @@ class FibreSightWorkbench(QMainWindow):
         self.dark_mode = bool(state)
         self._apply_palette_and_style()
         self.plot_image(preserve_view=True)
+
+    def set_interface_font_size(self, point_size):
+        if point_size not in GUI_FONT_SIZES:
+            raise ValueError(f'unsupported interface font size: {point_size}')
+
+        text_widget_types = (
+            QAbstractButton,
+            QAbstractSpinBox,
+            QHeaderView,
+            QLabel,
+            QLineEdit,
+            QMenu,
+            QPlainTextEdit,
+            QStatusBar,
+            QTabBar,
+            QTableView,
+            )
+        for widget in self.findChildren(QWidget):
+            if not isinstance(widget, text_widget_types):
+                continue
+            bold = widget.font().weight() == QFont.Bold
+            widget.setFont(load_gui_font(size=point_size, bold=bold))
+        QToolTip.setFont(load_gui_font(size=point_size))
+        for action in self.interface_font_menu.actions():
+            action.setFont(load_gui_font(size=point_size))
+        for column in range(self.roi_table.columnCount()):
+            self.roi_table.horizontalHeaderItem(column).setFont(
+                load_gui_font(size=point_size)
+                )
+        self.interface_font_size = point_size
+        self.interface_font_actions[point_size].setChecked(True)
+        self.settings.setValue('interface/font_size', point_size)
+        self.settings.sync()
+        self.plot_image(preserve_view=True)
+        self._controls_split_positions.clear()
+        self.controls_split_timer.start(0)
+        self.schedule_curation_layout()
 
     @staticmethod
     def selected_device():
@@ -2784,7 +2884,7 @@ class FibreSightWorkbench(QMainWindow):
         self.ax.axis('off')
 
         if self.ref_image is None:
-            gui_size = load_gui_font().pointSizeF()
+            gui_size = self.interface_font_size
             self.canvas.setCursor(Qt.PointingHandCursor)
             self.canvas.setToolTip('')
             self.ax.text(
@@ -3018,7 +3118,9 @@ class FibreSightWorkbench(QMainWindow):
         self.update_workflow_state()
         if message:
             # keep routine confirmation off the canvas whilst I am selecting and fixing ROIs
-            self.statusBar().showMessage(message, 4000)
+            status_bar = self.statusBar()
+            status_bar.setFont(load_gui_font(size=self.interface_font_size))
+            status_bar.showMessage(message, 4000)
 
     def model_status_text(self):
         checkpoint = self.checkpoint_line.text().strip()

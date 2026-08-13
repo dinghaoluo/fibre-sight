@@ -101,15 +101,24 @@ def _data_point(window, xdata, ydata):
 #%% probes
 def layout(window):
     from PyQt5.QtCore import QPoint, Qt
-    from PyQt5.QtGui import QColor, QFont, QFontDatabase, QFontInfo, QPalette
+    from PyQt5.QtGui import QColor, QFont, QFontInfo, QPalette
     from PyQt5.QtWidgets import (
+        QAbstractButton,
         QApplication,
         QLabel,
         QProgressBar,
         QScrollArea,
         QSizePolicy,
+        QToolTip,
         QWidget,
         )
+
+    from fibre_sight.fibre_sight_workbench_gui import (
+        GUI_FONT_SIZE,
+        GUI_FONT_SIZES,
+        )
+
+    assert GUI_FONT_SIZE == (12.0 if sys.platform == 'darwin' else 9.0)
 
     def relative_luminance(colour):
         channels = [channel / 255 for channel in colour.getRgb()[:3]]
@@ -146,7 +155,7 @@ def layout(window):
     assert isinstance(window.training_tab, QScrollArea)
 
     ordinary_widgets = [
-        window.tabs,
+        window.tabs.tabBar(),
         window.image_line,
         window.checkpoint_line,
         window.predict_button,
@@ -154,6 +163,7 @@ def layout(window):
         window.train_model_button,
         window.dark_mode_check,
         window.roi_table,
+        window.roi_table.horizontalHeader(),
         window.output_box,
         ]
     for widget in ordinary_widgets:
@@ -163,20 +173,17 @@ def layout(window):
         assert info.weight() == QFont.Normal
         assert info.styleName().casefold() == 'regular'
 
-    system_size = QFontDatabase.systemFont(
-        QFontDatabase.GeneralFont
-        ).pointSizeF()
-    assert system_size > 0
-    assert window.font().pointSizeF() >= system_size
+    assert window.font().pointSizeF() == GUI_FONT_SIZE
     assert all(
-        widget.font().pointSizeF() >= system_size
+        widget.font().pointSizeF() == GUI_FONT_SIZE
         for widget in ordinary_widgets
         )
     assert window.ax.texts
     assert min(
         text.get_fontsize()
         for text in window.ax.texts
-        ) >= system_size
+        ) == GUI_FONT_SIZE
+    assert QToolTip.font().pointSizeF() == GUI_FONT_SIZE
 
     headings = [
         window.state_label,
@@ -225,6 +232,35 @@ def layout(window):
     assert QColor(theme['border_strong']) != QColor(theme['surface'])
     assert 'QPushButton:focus' in window.styleSheet()
     assert 'QCheckBox:disabled' in window.styleSheet()
+
+    assert window.interface_font_button.text() == 'Aa'
+    assert window.interface_font_button.accessibleName() == 'interface text size'
+    assert [
+        action.text()
+        for action in window.interface_font_menu.actions()
+        ] == ['9 pt', '10 pt', '11 pt', '12 pt', '13 pt']
+    assert window.interface_font_actions[GUI_FONT_SIZE].isChecked()
+    window.interface_font_actions[11].trigger()
+    QApplication.instance().processEvents()
+    assert all(
+        button.font().pointSizeF() == 11.0
+        for button in window.findChildren(QAbstractButton)
+        )
+    assert all(widget.font().pointSizeF() == 11.0 for widget in ordinary_widgets)
+    assert all(heading.font().pointSizeF() == 11.0 for heading in headings)
+    assert QToolTip.font().pointSizeF() == 11.0
+    assert all(
+        action.font().pointSizeF() == 11.0
+        for action in window.interface_font_menu.actions()
+        )
+    assert all(
+        window.roi_table.horizontalHeaderItem(column).font().pointSizeF() == 11.0
+        for column in range(window.roi_table.columnCount())
+        )
+    assert min(text.get_fontsize() for text in window.ax.texts) == 11.0
+    assert window.interface_font_actions[11].isChecked()
+    window.interface_font_actions[GUI_FONT_SIZE].trigger()
+    QApplication.instance().processEvents()
 
     assert window.activity_splitter.orientation() == Qt.Vertical
     assert window.activity_splitter.isCollapsible(1)
@@ -278,7 +314,7 @@ def layout(window):
         QApplication.instance().processEvents()
     predict_upper = window.controls_splitter.sizes()[0]
     predict_table_height = window.roi_table.height()
-    assert window.predict_tab.verticalScrollBar().maximum() == 0
+    assert window.predict_tab.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
 
     window.tabs.setCurrentIndex(1)
     for _ in range(2):
@@ -318,20 +354,61 @@ def layout(window):
     assert window.training_tab.verticalScrollBar().maximum() > 0
     assert window.roi_table.height() >= 140
 
-    window.resize(1000, 680)
+    # test fontsize with resizing, 13 Aug 2026
+    for point_size in GUI_FONT_SIZES:
+        window.interface_font_actions[point_size].trigger()
+        window.resize(1000, 680)
+        window.tabs.setCurrentIndex(0)
+        for _ in range(3):
+            QApplication.instance().processEvents()
+
+        assert window.size().width() == 1000
+        assert window.size().height() == 680
+        assert window.minimumSizeHint().width() <= 1000
+        assert window.minimumSizeHint().height() <= 680
+        assert window.roi_table.isVisible()
+        assert window.roi_table.height() >= 140
+        assert window.black_slider.visibleRegion().boundingRect().width() > 0
+        assert window.white_slider.visibleRegion().boundingRect().width() > 0
+        assert window.predict_tab.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+        for widget in [
+            window.threshold_spin,
+            window.min_size_spin,
+            window.predict_button,
+            ]:
+            assert widget.visibleRegion().contains(widget.rect())
+        for widget in [
+            window.interface_font_button,
+            window.roi_overlay_check,
+            window.dark_mode_check,
+            ]:
+            assert widget.visibleRegion().boundingRect().width() == widget.width()
+            assert widget.width() >= widget.sizeHint().width()
+
+        for button in [
+            window.fix_selected_button,
+            window.segment_load_roi_button,
+            *window.curate_buttons.values(),
+            ]:
+            assert button.width() >= button.sizeHint().width()
+
+        window.tabs.setCurrentIndex(1)
+        for _ in range(2):
+            QApplication.instance().processEvents()
+        assert window.mser_scroll.verticalScrollBar().maximum() > 0
+        assert window.roi_table.height() >= 140
+
+        window.tabs.setCurrentIndex(2)
+        for _ in range(2):
+            QApplication.instance().processEvents()
+        assert window.training_tab.verticalScrollBar().maximum() > 0
+        assert window.roi_table.height() >= 140
+
+    window.interface_font_actions[GUI_FONT_SIZE].trigger()
     window.tabs.setCurrentIndex(0)
     for _ in range(3):
         QApplication.instance().processEvents()
 
-    assert window.size().width() == 1000
-    assert window.size().height() == 680
-    assert window.minimumSizeHint().width() <= 1000
-    assert window.minimumSizeHint().height() <= 680
-    assert window.roi_table.isVisible()
-    assert window.roi_table.height() >= 140
-    assert window.black_slider.visibleRegion().boundingRect().width() > 0
-    assert window.white_slider.visibleRegion().boundingRect().width() > 0
-    assert window.predict_tab.verticalScrollBar().maximum() == 0
     assert window.state_label.sizePolicy().horizontalPolicy() == QSizePolicy.Ignored
     assert window.model_label.sizePolicy().horizontalPolicy() == QSizePolicy.Ignored
 
@@ -422,6 +499,27 @@ def layout(window):
     assert light_theme['window'] == '#f0eee9'
     assert light_theme['surface'] == '#faf9f6'
     assert light_theme['canvas'] == '#1a1a1c'
+
+
+def interface_font_persistence(window):
+    from PyQt5.QtWidgets import QApplication, QToolTip
+
+    from fibre_sight.fibre_sight_workbench_gui import FibreSightWorkbench
+
+    window.interface_font_actions[10].trigger()
+    QApplication.instance().processEvents()
+    assert window.settings.value('interface/font_size', type=float) == 10.0
+
+    restored = FibreSightWorkbench(settings=window.settings)
+    assert restored.interface_font_size == 10.0
+    assert restored.interface_font_actions[10].isChecked()
+    assert restored.predict_button.font().pointSizeF() == 10.0
+    assert QToolTip.font().pointSizeF() == 10.0
+    assert all(
+        restored.roi_table.horizontalHeaderItem(column).font().pointSizeF() == 10.0
+        for column in range(restored.roi_table.columnCount())
+        )
+    restored.close()
 
 
 def image_loading(window):
@@ -1322,6 +1420,7 @@ def roi_io_paths(window):
 
 PROBES = {
     'layout': layout,
+    'interface_font_persistence': interface_font_persistence,
     'image_loading': image_loading,
     'global_resources': global_resources,
     'probability_invalidation': probability_invalidation,
@@ -1364,6 +1463,9 @@ class GUIProbeTests(unittest.TestCase):
             with self.subTest(scale_factor=scale_factor):
                 self.run_probe('layout', scale_factor)
 
+    def test_interface_font_size_persists(self):
+        self.run_probe('interface_font_persistence')
+
     def test_loading_an_image_tracks_the_global_path(self):
         self.run_probe('image_loading')
 
@@ -1401,7 +1503,7 @@ class GUIProbeTests(unittest.TestCase):
 #%% entry point
 if __name__ == '__main__':
     if len(sys.argv) == 2 and sys.argv[1] in PROBES:
-        from PyQt5.QtCore import Qt
+        from PyQt5.QtCore import QSettings, Qt
         from PyQt5.QtWidgets import QApplication
 
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
@@ -1411,9 +1513,14 @@ if __name__ == '__main__':
 
         from fibre_sight.fibre_sight_workbench_gui import FibreSightWorkbench
 
-        window = FibreSightWorkbench()
-        PROBES[sys.argv[1]](window)
-        window.close()
+        with tempfile.TemporaryDirectory(prefix='fibre sight settings ') as temp_dir:
+            settings = QSettings(
+                str(Path(temp_dir) / 'settings.ini'),
+                QSettings.IniFormat,
+                )
+            window = FibreSightWorkbench(settings=settings)
+            PROBES[sys.argv[1]](window)
+            window.close()
         app.quit()
     else:
         unittest.main()
