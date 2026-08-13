@@ -102,6 +102,7 @@ WORKSPACE_ROOT = get_workspace_root()
 APP_ICON_PATH = package_path('assets', 'fibresight_icon.ico')
 MONONOKI_FONT_DIR = package_path('assets', 'fonts', 'mononoki')
 MONONOKI_FONT_FAMILY = 'mononoki'
+GUI_FONT_SIZE = 9.0
 DISPLAY_BLACK_DEFAULT = 1.0
 DISPLAY_WHITE_DEFAULT = 99.7
 DISPLAY_MIN_GAP = 1.0
@@ -150,17 +151,6 @@ _GUI_FONT_FAMILY = None
 
 
 #%% helpers
-def _system_gui_font_size():
-    font = QFontDatabase.systemFont(QFontDatabase.GeneralFont)
-    point_size = font.pointSizeF()
-    if point_size > 0:
-        return point_size
-    app = QApplication.instance()
-    if app is not None and app.font().pointSizeF() > 0:
-        return app.font().pointSizeF()
-    return 10.0
-
-
 def load_gui_font(size=None, bold=False):
     global _GUI_FONT, _GUI_BOLD_FONT, _GUI_FONT_FAMILY
     if _GUI_FONT is None:
@@ -186,12 +176,11 @@ def load_gui_font(size=None, bold=False):
             family = fallback.family()
 
         _GUI_FONT_FAMILY = family
-        base_size = _system_gui_font_size()
         _GUI_FONT = QFont(family)
-        _GUI_FONT.setPointSizeF(base_size)
+        _GUI_FONT.setPointSizeF(GUI_FONT_SIZE)
         _GUI_FONT.setWeight(QFont.Normal)
         _GUI_BOLD_FONT = QFont(family)
-        _GUI_BOLD_FONT.setPointSizeF(base_size)
+        _GUI_BOLD_FONT.setPointSizeF(GUI_FONT_SIZE)
         _GUI_BOLD_FONT.setWeight(QFont.Bold)
         for font in (_GUI_FONT, _GUI_BOLD_FONT):
             font.setStyleStrategy(QFont.PreferAntialias)
@@ -209,9 +198,7 @@ def load_gui_font(size=None, bold=False):
 
     source = _GUI_BOLD_FONT if bold else _GUI_FONT
     font = QFont(source)
-    font.setPointSizeF(
-        _system_gui_font_size() if size is None else float(size)
-        )
+    font.setPointSizeF(GUI_FONT_SIZE if size is None else float(size))
     return font
 
 

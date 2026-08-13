@@ -101,7 +101,7 @@ def _data_point(window, xdata, ydata):
 #%% probes
 def layout(window):
     from PyQt5.QtCore import QPoint, Qt
-    from PyQt5.QtGui import QColor, QFont, QFontDatabase, QFontInfo, QPalette
+    from PyQt5.QtGui import QColor, QFont, QFontInfo, QPalette
     from PyQt5.QtWidgets import (
         QApplication,
         QLabel,
@@ -163,20 +163,16 @@ def layout(window):
         assert info.weight() == QFont.Normal
         assert info.styleName().casefold() == 'regular'
 
-    system_size = QFontDatabase.systemFont(
-        QFontDatabase.GeneralFont
-        ).pointSizeF()
-    assert system_size > 0
-    assert window.font().pointSizeF() >= system_size
+    assert window.font().pointSizeF() == 9.0
     assert all(
-        widget.font().pointSizeF() >= system_size
+        widget.font().pointSizeF() == 9.0
         for widget in ordinary_widgets
         )
     assert window.ax.texts
     assert min(
         text.get_fontsize()
         for text in window.ax.texts
-        ) >= system_size
+        ) == 9.0
 
     headings = [
         window.state_label,
