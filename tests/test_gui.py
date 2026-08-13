@@ -314,7 +314,7 @@ def layout(window):
         QApplication.instance().processEvents()
     predict_upper = window.controls_splitter.sizes()[0]
     predict_table_height = window.roi_table.height()
-    assert window.predict_tab.verticalScrollBar().maximum() == 0
+    assert window.predict_tab.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
 
     window.tabs.setCurrentIndex(1)
     for _ in range(2):
@@ -370,11 +370,13 @@ def layout(window):
         assert window.roi_table.height() >= 140
         assert window.black_slider.visibleRegion().boundingRect().width() > 0
         assert window.white_slider.visibleRegion().boundingRect().width() > 0
-        predict_overflow = window.predict_tab.verticalScrollBar().maximum()
-        assert predict_overflow == 0, (
-            f'{point_size} pt Predict overflowed by {predict_overflow} px; '
-            f'controls splitter: {window.controls_splitter.sizes()}'
-            )
+        assert window.predict_tab.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+        for widget in [
+            window.threshold_spin,
+            window.min_size_spin,
+            window.predict_button,
+            ]:
+            assert widget.visibleRegion().contains(widget.rect())
         for widget in [
             window.interface_font_button,
             window.roi_overlay_check,

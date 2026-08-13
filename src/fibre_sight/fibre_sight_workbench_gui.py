@@ -480,6 +480,8 @@ class FibreSightWorkbench(QMainWindow):
 
         self.tabs = QTabWidget()
         self.predict_tab, self.predict_tab_content = self._make_scroll_tab()
+        # Predict is short enough to fit; Qt style rounding should not add a scrollbar
+        self.predict_tab.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         (
             self.mser_tab,
             self.mser_scroll,
@@ -920,8 +922,8 @@ class FibreSightWorkbench(QMainWindow):
         self.persistent_panel = QWidget()
         self.persistent_panel.setObjectName('persistentPanel')
         persistent_layout = QVBoxLayout(self.persistent_panel)
-        persistent_layout.setContentsMargins(9, 3, 9, 3)
-        persistent_layout.setSpacing(2)
+        persistent_layout.setContentsMargins(9, 5, 9, 5)
+        persistent_layout.setSpacing(3)
         display_header = QHBoxLayout()
         display_header.addWidget(self.make_section_label('display'))
         display_header.addStretch(1)
