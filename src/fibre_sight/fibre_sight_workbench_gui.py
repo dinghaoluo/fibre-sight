@@ -30,6 +30,7 @@ from PyQt5.QtCore import (
     QByteArray,
     QItemSelectionModel,
     QProcess,
+    QSettings,
     QSignalBlocker,
     QTimer,
     Qt,
@@ -376,15 +377,27 @@ class PathLineEdit(QLineEdit):
 
 #%% main window
 class FibreSightWorkbench(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings=None):
         app = QApplication.instance()
         if app is not None:
             app.setStyle('Fusion')
-        gui_font = load_gui_font() if app is not None else None
-        super().__init__()
+        if settings is None:
+            settings = QSettings('FibreSight', 'FibreSight')
+        interface_font_size = settings.value(
+            'interface/font_size',
+            GUI_FONT_SIZE,
+            type=float,
+            )
+        gui_font = (
+            load_gui_font(size=interface_font_size)
+            if app is not None else
+            None
+            )
         if app is not None and gui_font is not None:
             app.setFont(gui_font)
             QToolTip.setFont(gui_font)
+        super().__init__()
+        self.settings = settings
         self.setWindowTitle('FibreSight')
         self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1280, 820)
@@ -408,7 +421,7 @@ class FibreSightWorkbench(QMainWindow):
         self.display_black = DISPLAY_BLACK_DEFAULT
         self.display_white = DISPLAY_WHITE_DEFAULT
         self.display_mode = 'image'
-        self.interface_font_size = GUI_FONT_SIZE
+        self.interface_font_size = interface_font_size
         self._syncing_roi_table = False
         self._process_stdout_buffer = ''
         self._process_stderr_buffer = ''
@@ -508,7 +521,7 @@ class FibreSightWorkbench(QMainWindow):
         for size in GUI_FONT_SIZES:
             action = QAction(f'{size} pt', self.interface_font_group)
             action.setCheckable(True)
-            action.setChecked(size == GUI_FONT_SIZE)
+            action.setChecked(size == self.interface_font_size)
             action.triggered.connect(
                 lambda _checked, point_size=size: self.set_interface_font_size(
                     point_size
@@ -1772,6 +1785,8 @@ class FibreSightWorkbench(QMainWindow):
                 )
         self.interface_font_size = point_size
         self.interface_font_actions[point_size].setChecked(True)
+        self.settings.setValue('interface/font_size', point_size)
+        self.settings.sync()
         self.plot_image(preserve_view=True)
         self.controls_split_timer.start(0)
         self.schedule_curation_layout()

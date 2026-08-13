@@ -457,6 +457,27 @@ def layout(window):
     assert light_theme['canvas'] == '#1a1a1c'
 
 
+def interface_font_persistence(window):
+    from PyQt5.QtWidgets import QApplication, QToolTip
+
+    from fibre_sight.fibre_sight_workbench_gui import FibreSightWorkbench
+
+    window.interface_font_actions[10].trigger()
+    QApplication.instance().processEvents()
+    assert window.settings.value('interface/font_size', type=float) == 10.0
+
+    restored = FibreSightWorkbench(settings=window.settings)
+    assert restored.interface_font_size == 10.0
+    assert restored.interface_font_actions[10].isChecked()
+    assert restored.predict_button.font().pointSizeF() == 10.0
+    assert QToolTip.font().pointSizeF() == 10.0
+    assert all(
+        restored.roi_table.horizontalHeaderItem(column).font().pointSizeF() == 10.0
+        for column in range(restored.roi_table.columnCount())
+        )
+    restored.close()
+
+
 def image_loading(window):
     import numpy as np
     from PyQt5.QtWidgets import QFileDialog, QPushButton
@@ -1355,6 +1376,7 @@ def roi_io_paths(window):
 
 PROBES = {
     'layout': layout,
+    'interface_font_persistence': interface_font_persistence,
     'image_loading': image_loading,
     'global_resources': global_resources,
     'probability_invalidation': probability_invalidation,
@@ -1397,6 +1419,9 @@ class GUIProbeTests(unittest.TestCase):
             with self.subTest(scale_factor=scale_factor):
                 self.run_probe('layout', scale_factor)
 
+    def test_interface_font_size_persists(self):
+        self.run_probe('interface_font_persistence')
+
     def test_loading_an_image_tracks_the_global_path(self):
         self.run_probe('image_loading')
 
@@ -1434,7 +1459,7 @@ class GUIProbeTests(unittest.TestCase):
 #%% entry point
 if __name__ == '__main__':
     if len(sys.argv) == 2 and sys.argv[1] in PROBES:
-        from PyQt5.QtCore import Qt
+        from PyQt5.QtCore import QSettings, Qt
         from PyQt5.QtWidgets import QApplication
 
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
@@ -1444,9 +1469,14 @@ if __name__ == '__main__':
 
         from fibre_sight.fibre_sight_workbench_gui import FibreSightWorkbench
 
-        window = FibreSightWorkbench()
-        PROBES[sys.argv[1]](window)
-        window.close()
+        with tempfile.TemporaryDirectory(prefix='fibre sight settings ') as temp_dir:
+            settings = QSettings(
+                str(Path(temp_dir) / 'settings.ini'),
+                QSettings.IniFormat,
+                )
+            window = FibreSightWorkbench(settings=settings)
+            PROBES[sys.argv[1]](window)
+            window.close()
         app.quit()
     else:
         unittest.main()
