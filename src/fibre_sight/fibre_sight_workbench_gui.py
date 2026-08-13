@@ -998,8 +998,8 @@ class FibreSightWorkbench(QMainWindow):
         stage_layout.addWidget(self.interface_font_button)
 
         main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(7)
+        main_layout.setContentsMargins(10, 8, 10, 8)
+        main_layout.setSpacing(6)
         main_layout.addWidget(stage_header)
         main_layout.addWidget(self.main_splitter, 1)
 

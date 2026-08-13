@@ -113,7 +113,10 @@ def layout(window):
         QWidget,
         )
 
-    from fibre_sight.fibre_sight_workbench_gui import GUI_FONT_SIZE
+    from fibre_sight.fibre_sight_workbench_gui import (
+        GUI_FONT_SIZE,
+        GUI_FONT_SIZES,
+        )
 
     assert GUI_FONT_SIZE == (12.0 if sys.platform == 'darwin' else 9.0)
 
@@ -351,20 +354,55 @@ def layout(window):
     assert window.training_tab.verticalScrollBar().maximum() > 0
     assert window.roi_table.height() >= 140
 
-    window.resize(1000, 680)
+    # test fontsize with resizing, 13 Aug 2026
+    for point_size in GUI_FONT_SIZES:
+        window.interface_font_actions[point_size].trigger()
+        window.resize(1000, 680)
+        window.tabs.setCurrentIndex(0)
+        for _ in range(3):
+            QApplication.instance().processEvents()
+
+        assert window.size().width() == 1000
+        assert window.size().height() == 680
+        assert window.minimumSizeHint().width() <= 1000
+        assert window.minimumSizeHint().height() <= 680
+        assert window.roi_table.isVisible()
+        assert window.roi_table.height() >= 140
+        assert window.black_slider.visibleRegion().boundingRect().width() > 0
+        assert window.white_slider.visibleRegion().boundingRect().width() > 0
+        assert window.predict_tab.verticalScrollBar().maximum() == 0
+        for widget in [
+            window.interface_font_button,
+            window.roi_overlay_check,
+            window.dark_mode_check,
+            ]:
+            assert widget.visibleRegion().boundingRect().width() == widget.width()
+            assert widget.width() >= widget.sizeHint().width()
+
+        for button in [
+            window.fix_selected_button,
+            window.segment_load_roi_button,
+            *window.curate_buttons.values(),
+            ]:
+            assert button.width() >= button.sizeHint().width()
+
+        window.tabs.setCurrentIndex(1)
+        for _ in range(2):
+            QApplication.instance().processEvents()
+        assert window.mser_scroll.verticalScrollBar().maximum() > 0
+        assert window.roi_table.height() >= 140
+
+        window.tabs.setCurrentIndex(2)
+        for _ in range(2):
+            QApplication.instance().processEvents()
+        assert window.training_tab.verticalScrollBar().maximum() > 0
+        assert window.roi_table.height() >= 140
+
+    window.interface_font_actions[GUI_FONT_SIZE].trigger()
     window.tabs.setCurrentIndex(0)
     for _ in range(3):
         QApplication.instance().processEvents()
 
-    assert window.size().width() == 1000
-    assert window.size().height() == 680
-    assert window.minimumSizeHint().width() <= 1000
-    assert window.minimumSizeHint().height() <= 680
-    assert window.roi_table.isVisible()
-    assert window.roi_table.height() >= 140
-    assert window.black_slider.visibleRegion().boundingRect().width() > 0
-    assert window.white_slider.visibleRegion().boundingRect().width() > 0
-    assert window.predict_tab.verticalScrollBar().maximum() == 0
     assert window.state_label.sizePolicy().horizontalPolicy() == QSizePolicy.Ignored
     assert window.model_label.sizePolicy().horizontalPolicy() == QSizePolicy.Ignored
 
