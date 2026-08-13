@@ -2,13 +2,11 @@
 
 [![tests](https://github.com/dinghaoluo/fibre-sight/actions/workflows/tests.yml/badge.svg)](https://github.com/dinghaoluo/fibre-sight/actions/workflows/tests.yml)
 
-FibreSight predicts axonal ROIs from two-dimensional channel-2 reference images (`ref_mat_ch2.npy`). The workbench runs either the bundled U-Net checkpoint or the older MSER proposal route; the resulting ROIs can then be inspected, merged, deleted, and exported.
+FibreSight is an integrated workbench for neurite segmentation, equipped with a GUI and CLI support. It is plug-and-play, with the bundled checkpoint U-Net model able to predict axonal ROIs from images out of the box, but the workbench also includes the entire training pipeline for use on drastically different datasets, from MSER-assisted data labelling and curation, to U-Net training and evaluation. To use the checkpoint model directly, see the `quick start` section below. For training using your own dataset, see [How to Train Your Model™](TRAINING.md).
 
 ![FibreSight workbench with predicted ROI outlines and curation controls](docs/images/fibre-sight-workbench.png)
 
-The checkpoint was developed from 53 hand-labelled two-photon sessions containing 1,296 curated ROIs. It reached 0.926 foreground-pixel recall on nine session-held-out images from the same four animals and acquisition source; the released operating point deliberately favours over-proposal. See the [model card](MODEL_CARD.md) and [methods record](METHODS.md) for the full evaluation.
-
-For another indicator, microscope, or labelling convention, the repository includes the full training and evaluation workflow; see [How to Train Your Model™](TRAINING.md).
+The checkpoint U-Net model was developed from 53 hand-labelled two-photon sessions containing 1,296 curated ROIs. It reached 0.926 foreground-pixel recall on nine session-held-out images from the same four animals and acquisition source; the released operating point deliberately favours over-proposal. See the [model card](MODEL_CARD.md) and [methods record](METHODS.md) for the full evaluation.
 
 ## quick start
 
