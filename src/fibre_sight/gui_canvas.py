@@ -1,7 +1,9 @@
 '''
 Created on 12 May 2026
 
-zooming, panning, and ROI display helpers for the workbench
+Modified on 14 August 2026 to simplify display and navigation helpers
+
+zooming, panning, and ROI display helpers for the GUI
 
 @author: Dinghao Luo
 '''
@@ -18,9 +20,6 @@ from PyQt5.QtWidgets import QApplication
 #%% colours
 def generate_distinct_colours(n):
     colours = []
-    if n <= 0:
-        return colours
-
     hue = 0.0
     # walking around the hue circle keeps neighbouring ROI labels distinct
     golden_ratio = 0.61803398875
@@ -39,25 +38,6 @@ def normalise_for_display(
     finite = np.isfinite(image)
     if not np.any(finite):
         return np.zeros_like(image, dtype=np.float32)
-
-    try:
-        black_percentile = float(black_percentile)
-        white_percentile = float(white_percentile)
-    except (TypeError, ValueError):
-        black_percentile, white_percentile = 1.0, 99.7
-
-    if not np.isfinite(black_percentile):
-        black_percentile = 1.0
-    if not np.isfinite(white_percentile):
-        white_percentile = 99.7
-
-    black_percentile = np.clip(black_percentile, 0.0, 100.0)
-    white_percentile = np.clip(white_percentile, 0.0, 100.0)
-    if black_percentile > white_percentile:
-        black_percentile, white_percentile = (
-            white_percentile,
-            black_percentile,
-            )
 
     low, high = np.percentile(
         image[finite],
@@ -175,9 +155,6 @@ class ZoomableCanvas(FigureCanvas):
         x_display, y_display = self.mouseEventCoords(event)
         dx = x_display - self._drag_start_display[0]
         dy = y_display - self._drag_start_display[1]
-        if self.ax.bbox.width <= 0 or self.ax.bbox.height <= 0:
-            return
-
         x_span = self._drag_start_xlim[1] - self._drag_start_xlim[0]
         y_span = self._drag_start_ylim[1] - self._drag_start_ylim[0]
         dx_data = dx * x_span / self.ax.bbox.width
@@ -197,11 +174,6 @@ class ZoomableCanvas(FigureCanvas):
             return None
 
         left, right, bottom, top = self.ax.images[0].get_extent()
-        limits = np.asarray([left, right, bottom, top], dtype=float)
-        if not np.all(np.isfinite(limits)):
-            return None
-        if left == right or bottom == top:
-            return None
         return (float(left), float(right)), (float(bottom), float(top))
 
     @staticmethod
@@ -232,15 +204,13 @@ class ZoomableCanvas(FigureCanvas):
 
     def _zoom_at(self, scale, x_data, y_data):
         image_limits = self._image_limits()
-        if image_limits is None or not np.isfinite(scale) or scale <= 0:
+        if image_limits is None:
             return False
 
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
         x_span = xlim[1] - xlim[0]
         y_span = ylim[1] - ylim[0]
-        if x_span == 0 or y_span == 0:
-            return False
 
         fit_x_span = image_limits[0][1] - image_limits[0][0]
         fit_y_span = image_limits[1][1] - image_limits[1][0]
@@ -272,8 +242,6 @@ class ZoomableCanvas(FigureCanvas):
         return self._set_clamped_view(new_xlim, new_ylim)
 
     def zoom_in(self, factor=_BUTTON_ZOOM_FACTOR):
-        if not np.isfinite(factor) or factor <= 0:
-            return False
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
         return self._zoom_at(
@@ -283,8 +251,6 @@ class ZoomableCanvas(FigureCanvas):
             )
 
     def zoom_out(self, factor=_BUTTON_ZOOM_FACTOR):
-        if not np.isfinite(factor) or factor <= 0:
-            return False
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
         return self._zoom_at(
@@ -294,8 +260,6 @@ class ZoomableCanvas(FigureCanvas):
             )
 
     def centre_on(self, x_data, y_data):
-        if not np.isfinite(x_data) or not np.isfinite(y_data):
-            return False
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
         x_span = xlim[1] - xlim[0]
@@ -319,6 +283,3 @@ class ZoomableCanvas(FigureCanvas):
         self.ax.set_ylim(image_limits[1])
         self.draw_idle()
         return True
-
-    def reset_view(self):
-        return self.fit_to_image()

@@ -1,4 +1,5 @@
 # Created on 26 April 2026
+# Modified on 14 August 2026 to make the training choices explicit
 # recall-heavy trial with support targets and Tversky loss
 data:
   manifest: manifests/ch2_manifest.csv
@@ -12,14 +13,18 @@ data:
   cache_images: true
   target_mode: foreground_support
   support_radius: 3
+  augmentation:
+    rotation_90: true
+    noise_sd: 0.02
 
 model:
   in_channels: 1
   out_channels: 2
   base_channels: 32
   depth: 4
+  attention_gates: false
 
-# This was the recall trial; the support channel and larger false-negative penalty stay auxiliary.
+# this was the recall trial; the support channel and larger false-negative penalty stay auxiliary
 loss:
   mode: bce_tversky
   bce_weight: 0.5
@@ -46,4 +51,3 @@ postprocess:
   threshold: 0.5
   min_size: 30
   max_size:
-

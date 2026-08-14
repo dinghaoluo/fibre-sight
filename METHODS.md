@@ -32,7 +32,6 @@ The older MSER route remains in the workbench because it was the proposal method
 | `thinness maximum` | `0.8` | Compactness ceiling; lower values favour thinner regions. |
 | `tophat kernel` | `11` pixels | Scale of the background-removal filter used before MSER. |
 | `CLAHE clip` | `2.0` | Strength of local contrast equalisation. |
-| `intensity clip` | `99.0` | Upper intensity percentile used before MSER normalisation. |
 
 Fixed ROIs are written into the label image before a new MSER pass, so a hand decision survives later changes to these controls.
 

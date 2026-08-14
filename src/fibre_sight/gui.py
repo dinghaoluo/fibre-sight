@@ -7,7 +7,9 @@ Modified on 2 June 2026 during the first command-line and diagnostics pass
 Modified on 23 June 2026 to bring the MSER editor and model workflow together
 Modified on 24 July 2026 to load packaged assets and the bundled model
 Modified on 25 July 2026 to separate the workbench tasks and reduce the control density
-fibre-sight workbench for labelling, training, prediction, and ROI curation
+Modified on 14 August 2026 to simplify the GUI workflow and tests
+
+labelling, training, prediction, and ROI curation in the FibreSight GUI
 
 @author: Dinghao Luo
 '''
@@ -15,7 +17,6 @@ fibre-sight workbench for labelling, training, prediction, and ROI curation
 
 #%% imports
 from pathlib import Path
-import re
 import shlex
 import sys
 
@@ -86,13 +87,18 @@ from PyQt5.QtWidgets import (
     )
 
 from ._repo import (
-    default_output_root,
-    default_source_root,
-    get_workspace_root,
-    package_path,
+    OUTPUT_ROOT,
+    PACKAGE_ROOT,
+    SOURCE_ROOT,
+    WORKSPACE_ROOT,
     )
-from .api import AxonROIPredictor, get_default_checkpoint, get_model_entry
-from .config import load_config, save_config
+from .api import (
+    BUNDLED_CHECKPOINT,
+    BUNDLED_MIN_SIZE,
+    BUNDLED_THRESHOLD,
+    ROIPredictor,
+    )
+from .config import load_recipe, save_recipe
 from .gui_canvas import (
     ZoomableCanvas,
     generate_distinct_colours,
@@ -102,15 +108,15 @@ from .gui_canvas import (
 from .mser_segmenter import (
     PARAMETER_SPECS,
     PARAMETER_TOOLTIPS,
-    run_mser_segmentation,
+    segment_mser,
     )
+from .manifest import read_manifest
 from .postprocess import probability_to_roi_dict
 from .roi_io import labels_to_roi_dict, load_roi_dict, roi_dict_to_label, save_roi_dict
 
 
-WORKSPACE_ROOT = get_workspace_root()
-APP_ICON_PATH = package_path('assets', 'fibresight_icon.ico')
-MONONOKI_FONT_DIR = package_path('assets', 'fonts', 'mononoki')
+APP_ICON_PATH = PACKAGE_ROOT / 'assets' / 'fibresight_icon.ico'
+MONONOKI_FONT_DIR = PACKAGE_ROOT / 'assets' / 'fonts' / 'mononoki'
 MONONOKI_FONT_FAMILY = 'mononoki'
 GUI_FONT_SIZE = 12.0 if sys.platform == 'darwin' else 9.0
 GUI_FONT_SIZES = range(9, 14)
@@ -131,7 +137,6 @@ SEGMENT_GROUPS = (
         (
             ('tophat kernel', 'tophat kernel'),
             ('clahe clip', 'CLAHE clip'),
-            ('clip-percentile', 'intensity clip'),
         ),
     ),
     (
@@ -213,91 +218,6 @@ def load_gui_font(size=None, bold=False):
     return font
 
 
-def display_path(path):
-    path = Path(path)
-    try:
-        return str(path.resolve().relative_to(WORKSPACE_ROOT.resolve()))
-    except (OSError, ValueError):
-        try:
-            parts = path.resolve().relative_to(Path.home().resolve()).parts
-        except (OSError, ValueError):
-            parts = path.parts
-            if path.anchor and parts and parts[0] == path.anchor:
-                parts = parts[1:]
-        return str(Path('…', *parts[-3:]))
-
-
-def elide_path(path_text, metrics, width):
-    if not path_text or metrics.horizontalAdvance(path_text) <= width:
-        return path_text
-
-    path = Path(path_text)
-    parts = list(path.parts)
-    if len(parts) <= 1:
-        return metrics.elidedText(path_text, Qt.ElideMiddle, width)
-
-    filename = parts[-1]
-    prefix = parts[0] if parts[0] not in {'/', '\\'} else ''
-    candidates = []
-    if prefix and prefix != '…':
-        candidates.append(str(Path(prefix, '…', filename)))
-    candidates.append(str(Path('…', filename)))
-    for candidate in candidates:
-        if metrics.horizontalAdvance(candidate) <= width:
-            return candidate
-    return metrics.elidedText(filename, Qt.ElideMiddle, width)
-
-
-def format_log_text(text):
-    text = str(text)
-    try:
-        workspace = str(WORKSPACE_ROOT.resolve())
-    except OSError:
-        workspace = str(WORKSPACE_ROOT)
-    text = text.replace(workspace, '.')
-
-    quoted_path = re.compile(r'(?P<quote>[\'"])(?P<path>/[^\'"]+)(?P=quote)')
-    def replace_quoted_path(match):
-        quote = match.group('quote')
-        shortened_path = display_path(match.group('path'))
-        return f'{quote}{shortened_path}{quote}'
-
-    text = quoted_path.sub(replace_quoted_path, text)
-
-    home = str(Path.home())
-    lines = []
-    for line in text.splitlines(keepends=True):
-        line_end = len(line.rstrip('\r\n'))
-        content = line[:line_end]
-        path_start = None
-        for marker in (' from ', ' to ', ': '):
-            marker_idx = content.rfind(marker)
-            if marker_idx < 0:
-                continue
-            candidate = content[marker_idx + len(marker):]
-            if candidate.startswith('/') or re.match(r'^[A-Za-z]:[\\/]', candidate):
-                path_start = marker_idx + len(marker)
-                break
-
-        if path_start is None:
-            home_idx = content.find(home)
-            if home_idx >= 0:
-                path_start = home_idx
-
-        if path_start is not None:
-            candidate = content[path_start:]
-            line = (
-                line[:path_start] +
-                display_path(candidate) +
-                line[line_end:]
-                )
-        lines.append(line)
-    text = ''.join(lines)
-
-    path_pattern = re.compile(r'(?<![\w.…])/(?:[^\s|,;:()]+/)*[^\s|,;:()]+')
-    return path_pattern.sub(lambda match: display_path(match.group(0)), text)
-
-
 class ElidedLabel(QLabel):
     def __init__(self, text='', mode=Qt.ElideMiddle):
         super().__init__()
@@ -327,56 +247,8 @@ class ElidedLabel(QLabel):
         QLabel.setText(self, shown)
 
 
-class PathLineEdit(QLineEdit):
-    def __init__(self, text=''):
-        super().__init__()
-        self._overlay = QLabel(self)
-        self._overlay.setObjectName('pathOverlay')
-        self._overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self._overlay.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        self.textChanged.connect(self._update_path_display)
-        self.setText(text)
-
-    def focusInEvent(self, event):
-        self._overlay.hide()
-        super().focusInEvent(event)
-
-    def focusOutEvent(self, event):
-        super().focusOutEvent(event)
-        self._update_path_display()
-        self._overlay.show()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._position_overlay()
-        self._update_path_display()
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._position_overlay()
-        self._update_path_display()
-        if not self.hasFocus():
-            self._overlay.show()
-
-    def _position_overlay(self):
-        frame = self.style().pixelMetric(self.style().PM_DefaultFrameWidth, None, self)
-        self._overlay.setGeometry(
-            frame + 5,
-            frame,
-            max(0, self.width() - 2 * frame - 10),
-            max(0, self.height() - 2 * frame),
-            )
-
-    def _update_path_display(self, _text=None):
-        text = self.text()
-        self.setToolTip(text)
-        shown = display_path(text) if text else ''
-        metrics = self._overlay.fontMetrics()
-        self._overlay.setText(elide_path(shown, metrics, self._overlay.width()))
-
-
 #%% main window
-class FibreSightWorkbench(QMainWindow):
+class FibreSightGUI(QMainWindow):
     def __init__(self, settings=None):
         app = QApplication.instance()
         if app is not None:
@@ -423,8 +295,6 @@ class FibreSightWorkbench(QMainWindow):
         self.display_mode = 'image'
         self.interface_font_size = interface_font_size
         self._syncing_roi_table = False
-        self._process_stdout_buffer = ''
-        self._process_stderr_buffer = ''
         self._process_was_stopped = False
         self._controls_split_positions = {}
         self._sizing_controls_splitter = False
@@ -562,10 +432,10 @@ class FibreSightWorkbench(QMainWindow):
         return tab, scroll, content, action_bar, action_layout
 
     def _build_training_widgets(self):
-        self.source_root_line = PathLineEdit(str(default_source_root()))
-        self.manifest_line = PathLineEdit(str(WORKSPACE_ROOT / 'manifests' / 'ch2_manifest.csv'))
-        self.config_line = PathLineEdit(
-            str(package_path('configs', 'ch2_unet.yaml'))
+        self.source_root_line = QLineEdit(str(SOURCE_ROOT))
+        self.manifest_line = QLineEdit(str(WORKSPACE_ROOT / 'manifests' / 'ch2_manifest.csv'))
+        self.config_line = QLineEdit(
+            str(PACKAGE_ROOT / 'configs' / 'ch2_unet.yaml')
             )
         self.run_name_line = QLineEdit('ch2_unet')
         self.source_root_line.textChanged.connect(lambda _: self.refresh_status())
@@ -618,24 +488,23 @@ class FibreSightWorkbench(QMainWindow):
         self.stop_process_button.clicked.connect(self.stop_process)
 
     def _build_prediction_widgets(self):
-        self.image_line = PathLineEdit()
-        self.checkpoint_line = PathLineEdit(str(get_default_checkpoint()))
-        self.image_line.textChanged.connect(self.prediction_inputs_changed)
+        self.image_line = QLineEdit()
+        self.checkpoint_line = QLineEdit(str(BUNDLED_CHECKPOINT))
+        self.image_line.textChanged.connect(self.prediction_changed)
         self.image_line.editingFinished.connect(self.load_edited_channel_image)
-        self.checkpoint_line.textChanged.connect(self.prediction_inputs_changed)
+        self.checkpoint_line.textChanged.connect(self.prediction_changed)
 
-        model_entry = get_model_entry()
         # these stayed visible because they were the useful controls during tuning
         self.threshold_spin = QDoubleSpinBox()
         self.threshold_spin.setRange(0.01, 0.99)
         self.threshold_spin.setSingleStep(0.01)
         self.threshold_spin.setDecimals(2)
-        self.threshold_spin.setValue(float(model_entry['threshold']))
+        self.threshold_spin.setValue(BUNDLED_THRESHOLD)
         self.prepare_value_control(self.threshold_spin)
 
         self.min_size_spin = QSpinBox()
         self.min_size_spin.setRange(1, 100000)
-        self.min_size_spin.setValue(int(model_entry['min_size']))
+        self.min_size_spin.setValue(BUNDLED_MIN_SIZE)
         self.prepare_value_control(self.min_size_spin)
 
         self.predict_button = QPushButton('predict')
@@ -1537,10 +1406,6 @@ class FibreSightWorkbench(QMainWindow):
             QWidget#labelTab QLabel#sectionHeading {{
                 background: {theme['surface_alt']};
             }}
-            QLabel#pathOverlay {{
-                background: {theme['surface_alt']};
-                color: {theme['text']};
-            }}
             QLineEdit, QDoubleSpinBox, QSpinBox {{
                 border: 1px solid {theme['border']};
                 border-radius: 2px;
@@ -1758,9 +1623,6 @@ class FibreSightWorkbench(QMainWindow):
         self.plot_image(preserve_view=True)
 
     def set_interface_font_size(self, point_size):
-        if point_size not in GUI_FONT_SIZES:
-            raise ValueError(f'unsupported interface font size: {point_size}')
-
         text_widget_types = (
             QAbstractButton,
             QAbstractSpinBox,
@@ -1794,39 +1656,32 @@ class FibreSightWorkbench(QMainWindow):
         self.controls_split_timer.start(0)
         self.schedule_curation_layout()
 
-    @staticmethod
-    def selected_device():
-        return 'auto'
-
-    def prediction_inputs_changed(self, _text=None):
-        self.invalidate_probability()
+    def prediction_changed(self, _text=None):
+        self.clear_probability()
         self.refresh_status()
 
-    def invalidate_probability(self, redraw=True):
+    def clear_probability(self, redraw=True):
         needs_redraw = self.probability is not None or self.display_mode == 'confidence'
         self.probability = None
         self.display_mode = 'image'
-        if hasattr(self, 'image_view_button'):
-            blockers = [
-                QSignalBlocker(self.image_view_button),
-                QSignalBlocker(self.confidence_view_button),
-                ]
-            self.image_view_button.setChecked(True)
-            self.confidence_view_button.setChecked(False)
-            self.confidence_view_button.setEnabled(False)
-            self.confidence_view_button.setToolTip(
-                'available after prediction produces a confidence map'
-                )
-            del blockers
-            self.update_display_control_state()
+        blockers = [
+            QSignalBlocker(self.image_view_button),
+            QSignalBlocker(self.confidence_view_button),
+            ]
+        self.image_view_button.setChecked(True)
+        self.confidence_view_button.setChecked(False)
+        self.confidence_view_button.setEnabled(False)
+        self.confidence_view_button.setToolTip(
+            'available after prediction produces a confidence map'
+            )
+        del blockers
+        self.update_display_control_state()
         if redraw and needs_redraw:
             self.plot_image(preserve_view=True)
 
     def set_display_mode(self, mode):
         if mode == 'confidence' and self.probability is None:
             mode = 'image'
-        if mode not in {'image', 'confidence'}:
-            raise ValueError(f'unknown display mode: {mode}')
 
         self.display_mode = mode
         blockers = [
@@ -1971,9 +1826,6 @@ class FibreSightWorkbench(QMainWindow):
         return dict(zip(roi_ids, colours))
 
     def refresh_roi_table(self):
-        if not hasattr(self, 'roi_table'):
-            return
-
         self._syncing_roi_table = True
         blocker = QSignalBlocker(self.roi_table)
         roi_ids = sorted(int(roi_id) for roi_id in self.roi_dict)
@@ -2138,7 +1990,7 @@ class FibreSightWorkbench(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             'select trained model',
-            str(default_output_root() / 'runs'),
+            str(OUTPUT_ROOT / 'runs'),
             'Trained models (*.pt)',
             )
         if path:
@@ -2185,13 +2037,13 @@ class FibreSightWorkbench(QMainWindow):
             return
 
         run_name = self.run_name_line.text().strip()
-        checkpoint_path = default_output_root() / 'runs' / run_name / 'best.pt'
+        checkpoint_path = OUTPUT_ROOT / 'runs' / run_name / 'best.pt'
         args = ['--config', str(config_path)]
         if self.start_process('train', 'train_unet', args):
             self.pending_checkpoint_path = checkpoint_path
 
     def evaluate_model(self):
-        model_path = self.current_model_path()
+        model_path = self.checkpoint_line.text().strip()
         if not model_path:
             self.print_log('please train or load a model first')
             return
@@ -2212,7 +2064,7 @@ class FibreSightWorkbench(QMainWindow):
             '--threshold', str(self.threshold_spin.value()),
             '--min-size', str(self.min_size_spin.value()),
             '--tta',
-            '--device', self.selected_device(),
+            '--device', 'auto',
             ]
         self.start_process('evaluate', 'evaluate', args)
 
@@ -2232,7 +2084,7 @@ class FibreSightWorkbench(QMainWindow):
 
     def preview_model_predictions(self):
         manifest = Path(self.manifest_line.text().strip())
-        model_path_text = self.current_model_path()
+        model_path_text = self.checkpoint_line.text().strip()
         if not manifest.exists():
             self.print_log(f'dataset table does not exist yet: {manifest}')
             self.refresh_status('dataset table missing')
@@ -2254,7 +2106,7 @@ class FibreSightWorkbench(QMainWindow):
             '--threshold', str(self.threshold_spin.value()),
             '--min-size', str(self.min_size_spin.value()),
             '--n', '4',
-            '--device', self.selected_device(),
+            '--device', 'auto',
             ]
         self.start_process('preview predictions', 'plot_model_diagnostics', args)
 
@@ -2265,35 +2117,23 @@ class FibreSightWorkbench(QMainWindow):
             self.refresh_status('dataset table missing')
             return
 
-        try:
-            import csv
-
-            with open(path, 'r', newline='') as f:
-                rows = list(csv.DictReader(f))
-        except Exception as exc:
-            self.print_log(f'failed to read dataset table: {exc}')
-            self.refresh_status('dataset table read failed')
-            return
-
-        included = [
-            row for row in rows
-            if str(row.get('included', '')).lower() in {'true', '1', 'yes', 'y'}
-            ]
+        sessions = read_manifest(path)
+        included = [session for session in sessions if session['included']]
         split_counts = {}
-        for row in included:
-            split = row.get('split', '') or 'unsplit'
+        for session in included:
+            split = session['split'] or 'unsplit'
             split_counts[split] = split_counts.get(split, 0) + 1
 
         excluded_reasons = {}
-        for row in rows:
-            if str(row.get('included', '')).lower() in {'true', '1', 'yes', 'y'}:
+        for session in sessions:
+            if session['included']:
                 continue
-            reason = row.get('exclusion_reason', '') or 'not included'
+            reason = session['exclusion_reason'] or 'not included'
             excluded_reasons[reason] = excluded_reasons.get(reason, 0) + 1
 
-        roi_total = sum(int(float(row.get('roi_count') or 0)) for row in included)
+        roi_total = sum(session['roi_count'] for session in included)
         self.print_log(f'\ndataset table: {path}')
-        self.print_log(f'total sessions: {len(rows)}')
+        self.print_log(f'total sessions: {len(sessions)}')
         self.print_log(f'included sessions: {len(included)} | total ROIs: {roi_total}')
         self.print_log(f'splits: {split_counts if split_counts else {}}')
         if excluded_reasons:
@@ -2301,25 +2141,21 @@ class FibreSightWorkbench(QMainWindow):
         self.refresh_status('dataset summary ready')
 
     def write_training_config(self):
-        config = load_config(self.config_line.text())
+        config = load_recipe(self.config_line.text())
         run_name = self.run_name_line.text().strip()
         if not run_name:
             raise ValueError('run name cannot be empty')
 
         # leave the baseline YAML alone whilst trying controls here; save this recipe beside the run
-        config.setdefault('data', {})
-        config.setdefault('train', {})
-        config.setdefault('postprocess', {})
-
         config['data']['manifest'] = self.path_for_config(self.manifest_line.text())
         config['train']['run_name'] = run_name
         config['train']['epochs'] = int(self.epochs_spin.value())
-        config['train']['device'] = self.selected_device()
+        config['train']['device'] = 'auto'
         config['postprocess']['threshold'] = float(self.threshold_spin.value())
         config['postprocess']['min_size'] = int(self.min_size_spin.value())
 
-        out_path = default_output_root() / 'gui_configs' / f'{run_name}.yaml'
-        save_config(config, out_path)
+        out_path = OUTPUT_ROOT / 'gui_configs' / f'{run_name}.yaml'
+        save_recipe(config, out_path)
         self.print_log(f'training recipe written to {out_path}')
         return out_path
 
@@ -2329,8 +2165,6 @@ class FibreSightWorkbench(QMainWindow):
             return False
 
         self.current_process_name = process_name
-        self._process_stdout_buffer = ''
-        self._process_stderr_buffer = ''
         self._process_was_stopped = False
         self.process = QProcess(self)
         WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -2362,35 +2196,17 @@ class FibreSightWorkbench(QMainWindow):
         if self.process is None:
             return
         text = bytes(self.process.readAllStandardOutput()).decode(errors='replace')
-        self.buffer_process_text('_process_stdout_buffer', text)
+        self.print_log(text, end='')
 
     def read_process_stderr(self):
         if self.process is None:
             return
         text = bytes(self.process.readAllStandardError()).decode(errors='replace')
-        self.buffer_process_text('_process_stderr_buffer', text)
-
-    def buffer_process_text(self, buffer_name, text):
-        buffered = getattr(self, buffer_name) + text
-        lines = buffered.split('\n')
-        setattr(self, buffer_name, lines.pop())
-        for line in lines:
-            self.print_log(line[:-1] if line.endswith('\r') else line)
-
-    def flush_process_buffers(self):
-        for buffer_name in (
-                '_process_stdout_buffer',
-                '_process_stderr_buffer',
-                ):
-            text = getattr(self, buffer_name)
-            if text:
-                self.print_log(text)
-            setattr(self, buffer_name, '')
+        self.print_log(text, end='')
 
     def process_finished(self, exit_code, exit_status):
         self.read_process_stdout()
         self.read_process_stderr()
-        self.flush_process_buffers()
         process_name = self.current_process_name or 'process'
         outcome = 'stopped' if self._process_was_stopped else f'exit code {exit_code}'
         self.print_log(f'\n{process_name} finished: {outcome}')
@@ -2406,7 +2222,7 @@ class FibreSightWorkbench(QMainWindow):
             self.checkpoint_line.setText(str(self.pending_checkpoint_path))
             self.last_saved_model_path = self.pending_checkpoint_path
             self.predictor = None
-            self.invalidate_probability()
+            self.clear_probability()
             self.print_log(f'trained model ready: {self.pending_checkpoint_path}')
 
         self.current_process_name = None
@@ -2450,13 +2266,13 @@ class FibreSightWorkbench(QMainWindow):
 
         self.ref_image = image
         self.image_path = Path(path)
-        self.recname = self.get_recname(self.image_path)
+        self.recname = self.recording_name(self.image_path)
         self.roi_dict = {}
         self.labelled = np.zeros_like(self.ref_image, dtype=np.int32)
         self.selected.clear()
         self.fixed_ids.clear()
         self.undo_stack.clear()
-        self.invalidate_probability(redraw=False)
+        self.clear_probability(redraw=False)
         self.reset_display_range(redraw=False)
 
         default_roi = self.default_roi_path()
@@ -2465,7 +2281,7 @@ class FibreSightWorkbench(QMainWindow):
             self.print_log('import ROIs to review or continue from them')
         self.update_export_tooltip()
         self.plot_image()
-        self.canvas.reset_view()
+        self.canvas.fit_to_image()
         self.refresh_status('channel-2 image loaded')
 
     def load_model(self):
@@ -2473,7 +2289,14 @@ class FibreSightWorkbench(QMainWindow):
         self.statusBar().showMessage('loading trained model')
         QApplication.processEvents()
         try:
-            self.predictor = self.make_predictor()
+            checkpoint = self.checkpoint_line.text().strip()
+            self.predictor = ROIPredictor(
+                checkpoint_path=Path(checkpoint) if checkpoint else None,
+                device='auto',
+                threshold=float(self.threshold_spin.value()),
+                min_size=int(self.min_size_spin.value()),
+                tta=True,
+                )
             self.predictor.load()
             self.checkpoint_line.setText(str(self.predictor.checkpoint_path))
         except Exception as exc:
@@ -2485,7 +2308,7 @@ class FibreSightWorkbench(QMainWindow):
             QApplication.restoreOverrideCursor()
 
         self.last_saved_model_path = self.predictor.checkpoint_path
-        self.invalidate_probability()
+        self.clear_probability()
         self.print_log(f'model loaded from {self.predictor.checkpoint_path}')
         self.refresh_status('model loaded')
 
@@ -2529,7 +2352,9 @@ class FibreSightWorkbench(QMainWindow):
         self.statusBar().showMessage('running prediction')
         QApplication.processEvents()
         try:
-            prediction = self.predictor.predict_image(self.ref_image)
+            roi_dict, labelled, probability = self.predictor.predict_image(
+                self.ref_image
+                )
         except Exception as exc:
             self.print_log(f'prediction failed: {exc}')
             self.refresh_status('prediction failed')
@@ -2539,18 +2364,18 @@ class FibreSightWorkbench(QMainWindow):
 
         self.push_undo_state()
         # prediction returns to the same editable state as an MSER or loaded ROI dict
-        self.roi_dict = prediction.roi_dict
-        self.labelled = prediction.labelled
-        self.probability = prediction.probability
+        self.roi_dict = roi_dict
+        self.labelled = labelled
+        self.probability = probability
         self.selected.clear()
         self.fixed_ids.clear()
 
         self.set_display_mode('image')
-        self.canvas.reset_view()
+        self.canvas.fit_to_image()
         self.print_log(
             f'predicted {len(self.roi_dict)} ROIs '
-            f'(threshold {prediction.threshold:.2f}, '
-            f'min area {prediction.min_size} px)'
+            f'(threshold {self.predictor.threshold:.2f}, '
+            f'min area {self.predictor.min_size} px)'
             )
         self.refresh_status()
         self.statusBar().clearMessage()
@@ -2566,26 +2391,13 @@ class FibreSightWorkbench(QMainWindow):
             self.probability,
             threshold=float(self.threshold_spin.value()),
             min_size=int(self.min_size_spin.value()),
+            max_size=self.predictor.max_size,
             )
         self.selected.clear()
         self.fixed_ids.clear()
         self.plot_image(preserve_view=True)
         self.print_log(f'rebuilt {len(self.roi_dict)} ROIs from the confidence map')
         self.refresh_status('ROIs rebuilt from the confidence map')
-
-    def make_predictor(self):
-        checkpoint = self.checkpoint_line.text().strip()
-        checkpoint_path = Path(checkpoint) if checkpoint else None
-        return AxonROIPredictor(
-            checkpoint_path=checkpoint_path,
-            device=self.selected_device(),
-            threshold=float(self.threshold_spin.value()),
-            min_size=int(self.min_size_spin.value()),
-            tta=True,
-            )
-
-    def current_model_path(self):
-        return self.checkpoint_line.text().strip()
 
     #%% roi io
     def load_roi_file(self):
@@ -2604,7 +2416,7 @@ class FibreSightWorkbench(QMainWindow):
 
         try:
             roi_dict = load_roi_dict(path)
-            labelled, _, _ = roi_dict_to_label(roi_dict, self.ref_image.shape)
+            labelled, _ = roi_dict_to_label(roi_dict, self.ref_image.shape)
         except Exception as exc:
             self.print_log(f'failed to import ROIs: {exc}')
             return
@@ -2614,7 +2426,7 @@ class FibreSightWorkbench(QMainWindow):
         self.labelled = labelled
         self.selected.clear()
         self.fixed_ids.clear()
-        self.invalidate_probability(redraw=False)
+        self.clear_probability(redraw=False)
         self.plot_image()
         self.print_log(f'imported ROIs from {path}')
         self.refresh_status('ROIs imported')
@@ -2633,21 +2445,19 @@ class FibreSightWorkbench(QMainWindow):
 
     def default_roi_path(self):
         if self.image_path is None:
-            return default_output_root() / 'predicted_ROI_dict.npy'
+            return OUTPUT_ROOT / 'predicted_ROI_dict.npy'
 
-        example_root = package_path().parents[1] / 'examples'
+        example_root = PACKAGE_ROOT.parents[1] / 'examples'
         if (
             example_root.is_dir() and
             self.image_path.resolve().is_relative_to(example_root.resolve())
         ):
             # shipped examples stay unchanged; their edited output belongs in workspace
-            return default_output_root() / 'demo_predicted_ROI_dict.npy'
+            return OUTPUT_ROOT / 'demo_predicted_ROI_dict.npy'
 
         return self.image_path.parent / f'{self.recname}_ROI_dict.npy'
 
     def update_export_tooltip(self):
-        if not hasattr(self, 'curate_buttons'):
-            return
         self.curate_buttons['save_roi'].setToolTip(
             f'export immediately to {self.default_roi_path()}'
             )
@@ -2659,14 +2469,14 @@ class FibreSightWorkbench(QMainWindow):
             self.segment_param_widgets[spec['name']].setValue(spec['default'])
         self.refresh_status('parameters reset')
 
-    def get_segment_params(self):
+    def segment_params(self):
         params = {}
         for spec in PARAMETER_SPECS:
             value = self.segment_param_widgets[spec['name']].value()
             params[spec['name']] = int(value) if spec['kind'] == 'int' else float(value)
         return params
 
-    def get_fixed_roi_dict(self):
+    def fixed_rois(self):
         if not self.roi_dict or not self.fixed_ids:
             return {}
         return {
@@ -2675,7 +2485,6 @@ class FibreSightWorkbench(QMainWindow):
                 'ypix': self.roi_dict[roi_id]['ypix'].copy(),
             }
             for roi_id in sorted(self.fixed_ids)
-            if roi_id in self.roi_dict
         }
 
     def segment_rois(self):
@@ -2683,18 +2492,15 @@ class FibreSightWorkbench(QMainWindow):
             self.print_log('please load the selected channel-2 image first')
             return
 
-        if self.labelled is not None:
-            self.push_undo_state()
-
         # the MSER route still helps before a model exists and on images that need hand repair
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self.statusBar().showMessage('running MSER segmentation')
         QApplication.processEvents()
         try:
-            roi_dict, labelled, fixed_ids, stats = run_mser_segmentation(
+            roi_dict, labelled, fixed_ids, stats = segment_mser(
                 self.ref_image,
-                self.get_segment_params(),
-                fixed_rois=self.get_fixed_roi_dict(),
+                self.segment_params(),
+                fixed_rois=self.fixed_rois(),
             )
         except Exception as exc:
             self.print_log(f'segmentation failed: {exc}')
@@ -2703,13 +2509,15 @@ class FibreSightWorkbench(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
+        if self.labelled is not None:
+            self.push_undo_state()
         self.roi_dict = roi_dict
         self.labelled = labelled
         self.fixed_ids = fixed_ids
         self.selected.clear()
-        self.invalidate_probability(redraw=False)
+        self.clear_probability(redraw=False)
         self.plot_image()
-        self.canvas.reset_view()
+        self.canvas.fit_to_image()
         mser_regions = stats['MSER regions']
         kept_rois = stats['kept ROIs']
         fixed_rois = stats['fixed ROIs']
@@ -2724,23 +2532,13 @@ class FibreSightWorkbench(QMainWindow):
         if not selected_ids:
             return
         if selected_ids.issubset(self.fixed_ids):
-            self.unfix_selected()
+            self.fixed_ids.difference_update(selected_ids)
+            status = 'selected ROIs unfixed'
         else:
-            self.fix_selected()
-
-    def fix_selected(self):
-        if not self.selected:
-            return
-        self.fixed_ids.update(roi_id for roi_id in self.selected if roi_id in self.roi_dict)
+            self.fixed_ids.update(selected_ids)
+            status = 'selected ROIs fixed'
         self.plot_image(preserve_view=True)
-        self.refresh_status('selected ROIs fixed')
-
-    def unfix_selected(self):
-        if not self.selected:
-            return
-        self.fixed_ids.difference_update(self.selected)
-        self.plot_image(preserve_view=True)
-        self.refresh_status('selected ROIs unfixed')
+        self.refresh_status(status)
 
     def clear_fixed(self):
         if not self.fixed_ids:
@@ -2874,7 +2672,7 @@ class FibreSightWorkbench(QMainWindow):
 
     #%% plotting
     def plot_image(self, preserve_view=False):
-        xlim, ylim = self.get_current_view()
+        xlim, ylim = self.current_view()
         theme = self._theme()
         self.refresh_roi_table()
         self.update_display_control_state()
@@ -2961,9 +2759,6 @@ class FibreSightWorkbench(QMainWindow):
             return
 
         colour_map = self.roi_colour_map()
-        if set(ids) != set(colour_map):
-            colours = generate_distinct_colours(len(ids))
-            colour_map = dict(zip(ids, colours))
 
         if self.display_mode == 'confidence':
             for roi_id in ids:
@@ -3049,13 +2844,13 @@ class FibreSightWorkbench(QMainWindow):
             linestyles=linestyle,
             )
 
-    def get_current_view(self):
+    def current_view(self):
         if not self.ax.images:
             return None, None
         return self.ax.get_xlim(), self.ax.get_ylim()
 
     def reset_view(self):
-        self.canvas.reset_view()
+        self.canvas.fit_to_image()
         self.refresh_status('view fitted')
 
     def zoom_in(self):
@@ -3115,7 +2910,7 @@ class FibreSightWorkbench(QMainWindow):
             )
         self.model_label.setText(self.model_status_text())
         self.update_export_tooltip()
-        self.update_workflow_state()
+        self.update_controls()
         if message:
             # keep routine confirmation off the canvas whilst I am selecting and fixing ROIs
             status_bar = self.statusBar()
@@ -3140,24 +2935,21 @@ class FibreSightWorkbench(QMainWindow):
         if self.predictor is None:
             return f'model: {name} · {next_step}'
 
-        try:
-            matches = (
-                Path(self.predictor.checkpoint_path).resolve() ==
-                Path(checkpoint).resolve()
-                )
-        except (OSError, ValueError):
-            matches = False
+        matches = (
+            Path(self.predictor.checkpoint_path).resolve() ==
+            Path(checkpoint).resolve()
+            )
         if not matches:
             return f'model: {name} · {next_step}'
         return f'model: {name} · {self.predictor.device}'
 
-    def update_workflow_state(self):
+    def update_controls(self):
         image_text = self.image_line.text().strip()
         image_path_ready = bool(image_text) and Path(image_text).exists()
         image_ready = self.image_selection_matches_loaded()
         checkpoint_text = self.checkpoint_line.text().strip()
         checkpoint_ready = bool(checkpoint_text) and Path(checkpoint_text).exists()
-        model_ready = bool(self.current_model_path()) and Path(self.current_model_path()).exists()
+        model_ready = checkpoint_ready
         manifest_text = self.manifest_line.text().strip()
         manifest_ready = bool(manifest_text) and Path(manifest_text).exists()
         config_text = self.config_line.text().strip()
@@ -3231,11 +3023,8 @@ class FibreSightWorkbench(QMainWindow):
             self.controls_split_timer.start(0)
 
     def print_log(self, text, end='\n'):
-        text = format_log_text(text)
-        if end:
-            text = f'{text}{end}'
         self.output_box.moveCursor(QTextCursor.End)
-        self.output_box.insertPlainText(text)
+        self.output_box.insertPlainText(f'{text}{end}')
         self.output_box.moveCursor(QTextCursor.End)
         # the log pane starts collapsed; open it far enough to read the newest lines
         if self.activity_splitter.sizes()[1] < 72:
@@ -3243,7 +3032,7 @@ class FibreSightWorkbench(QMainWindow):
             self.activity_splitter.setSizes([total - 105, 105])
 
     @staticmethod
-    def get_recname(path):
+    def recording_name(path):
         name = Path(path).name
         if '_ref_mat' in name:
             return name.split('_ref_mat')[0]
@@ -3268,7 +3057,7 @@ def main():
     app.setStyle('Fusion')
     app.setFont(load_gui_font())
     app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
-    window = FibreSightWorkbench()
+    window = FibreSightGUI()
     window.show()
     sys.exit(app.exec_())
 

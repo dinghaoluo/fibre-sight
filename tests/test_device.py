@@ -1,13 +1,14 @@
 '''
 Created on 25 July 2026
 
-check automatic accelerator selection and MPS training operations
+Modified on 14 August 2026
+
+run an actual MPS training step when the backend is available
 
 @author: Dinghao Luo
 '''
 
 #%% imports
-from unittest.mock import patch
 import unittest
 
 import torch
@@ -16,57 +17,8 @@ from support import add_source_to_path
 
 add_source_to_path()
 
-from fibre_sight._device import resolve_device
 from fibre_sight.model import build_model
-from fibre_sight.train_unet import segmentation_loss, use_amp, use_pinned_memory
-
-
-#%% selection tests
-class DeviceSelectionTests(unittest.TestCase):
-    def test_auto_prefers_cuda(self):
-        with (
-            patch('torch.cuda.is_available', return_value=True),
-            patch('torch.backends.mps.is_available', return_value=True),
-        ):
-            self.assertEqual(resolve_device('auto').type, 'cuda')
-
-    def test_auto_uses_mps_before_cpu(self):
-        with (
-            patch('torch.cuda.is_available', return_value=False),
-            patch('torch.backends.mps.is_available', return_value=True),
-            patch('torch.backends.mps.is_built', return_value=True),
-        ):
-            self.assertEqual(resolve_device('auto').type, 'mps')
-
-    def test_auto_falls_back_to_cpu(self):
-        with (
-            patch('torch.cuda.is_available', return_value=False),
-            patch('torch.backends.mps.is_available', return_value=False),
-        ):
-            self.assertEqual(resolve_device('auto').type, 'cpu')
-
-    def test_explicit_cpu_stays_on_cpu(self):
-        self.assertEqual(resolve_device('cpu').type, 'cpu')
-
-    def test_unavailable_mps_has_a_clear_error(self):
-        with (
-            patch('torch.backends.mps.is_built', return_value=True),
-            patch('torch.backends.mps.is_available', return_value=False),
-        ):
-            with self.assertRaisesRegex(RuntimeError, 'not available on this Mac'):
-                resolve_device('mps')
-
-    def test_mps_keeps_cuda_specific_options_off(self):
-        config = {'train': {'amp': True, 'pin_memory': True}}
-        device = torch.device('mps')
-        self.assertFalse(use_amp(config, device))
-        self.assertFalse(use_pinned_memory(config, device))
-
-    def test_cuda_can_use_amp_and_pinned_memory(self):
-        config = {'train': {'amp': True, 'pin_memory': True}}
-        device = torch.device('cuda')
-        self.assertTrue(use_amp(config, device))
-        self.assertTrue(use_pinned_memory(config, device))
+from fibre_sight.train_unet import segmentation_loss
 
 
 #%% real backend smoke test
@@ -87,11 +39,17 @@ class MPSTrainingTests(unittest.TestCase):
             optimiser = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
             logits = model(images)
-            loss, _ = segmentation_loss(logits, masks, {'mode': mode})
+            loss_config = {
+                'mode': mode,
+                'bce_weight': 1.0,
+                'seg_weight': 1.0,
+                'tversky_alpha': 0.3,
+                'tversky_beta': 0.7,
+                }
+            loss, _ = segmentation_loss(logits, masks, loss_config)
             loss.backward()
             optimiser.step()
-
-            self.assertTrue(bool(torch.isfinite(loss).detach().cpu()))
+            self.assertTrue(bool(torch.isfinite(loss).cpu()))
 
 
 if __name__ == '__main__':

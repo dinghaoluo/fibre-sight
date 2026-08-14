@@ -1,6 +1,8 @@
 '''
 Created on 21 April 2026
 
+Modified on 14 August 2026
+
 turn probability maps into one ROI dictionary entry per connected component
 
 @author: Dinghao Luo
@@ -16,19 +18,12 @@ from .roi_io import labels_to_roi_dict
 #%% labels
 def probability_to_labels(probability, threshold=0.5, min_size=30, max_size=None):
     mask = np.asarray(probability) >= threshold
-    labelled, n_labels = ndi.label(mask)
-
-    if n_labels == 0:
-        return labelled.astype(np.int32)
-
-    labelled = filter_labels(labelled, min_size=min_size, max_size=max_size)
-    # filtering leaves gaps in the component IDs; consecutive IDs keep the
-    # saved ROI dictionary legible during curation
-    labelled, _ = ndi.label(labelled > 0)
-    return labelled.astype(np.int32)
+    labelled, _ = ndi.label(mask)
+    labelled = _filter_labels(labelled, min_size=min_size, max_size=max_size)
+    return labelled
 
 
-def filter_labels(labelled, min_size=30, max_size=None):
+def _filter_labels(labelled, min_size=30, max_size=None):
     labelled = np.asarray(labelled)
     out = np.zeros_like(labelled, dtype=np.int32)
     next_id = 1

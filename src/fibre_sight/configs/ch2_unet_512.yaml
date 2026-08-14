@@ -1,4 +1,5 @@
 # Created on 24 April 2026
+# Modified on 14 August 2026 to make the training choices explicit
 # 512-pixel crop trial; batch size stays at two
 data:
   manifest: manifests/ch2_manifest.csv
@@ -10,7 +11,8 @@ data:
   foreground_fraction: 0.75
   normalise_percentiles: [1, 99.7]
   cache_images: true
-  # 1 August 2026: match the baseline augmentation before changing crop size and width.
+  target_mode: foreground
+  # 1 August 2026: match the baseline augmentation before changing crop size and width
   augmentation:
     rotation_90: true
     noise_sd: 0.02
@@ -20,8 +22,9 @@ model:
   out_channels: 1
   base_channels: 32
   depth: 4
+  attention_gates: false
 
-# This trial changed crop size and model width, so the baseline loss remains unchanged.
+# this trial changed crop size and model width, so the baseline loss stays unchanged
 loss:
   mode: bce_dice
   bce_weight: 1.0
@@ -44,4 +47,3 @@ postprocess:
   threshold: 0.5
   min_size: 30
   max_size:
-

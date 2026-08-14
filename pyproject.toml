@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.gui-scripts]
-fibre-sight = 'fibre_sight.fibre_sight_workbench_gui:main'
+fibre-sight = 'fibre_sight.gui:main'
 
 [project.scripts]
 fibre-sight-build-manifest = 'fibre_sight.build_manifest:main'

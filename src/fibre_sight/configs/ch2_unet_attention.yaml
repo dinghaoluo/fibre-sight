@@ -1,4 +1,5 @@
 # Created on 2 August 2026
+# Modified on 14 August 2026 to make the training choices explicit
 # attention-gated skip connections with the working 256-pixel recipe
 data:
   manifest: manifests/ch2_manifest.csv
@@ -10,7 +11,8 @@ data:
   foreground_fraction: 0.75
   normalise_percentiles: [1, 99.7]
   cache_images: true
-  # 1 August 2026: preserve the augmentation used by the released checkpoint.
+  target_mode: foreground
+  # 1 August 2026: preserve the augmentation used by the released checkpoint
   augmentation:
     rotation_90: true
     noise_sd: 0.02
@@ -22,7 +24,7 @@ model:
   depth: 4
   attention_gates: true
 
-# 2 August 2026: change the skip paths only; keep the working loss fixed.
+# 2 August 2026: change the skip paths only; keep the working loss fixed
 loss:
   mode: bce_dice
   bce_weight: 1.0

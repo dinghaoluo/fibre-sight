@@ -3,7 +3,9 @@ Created on 6 April 2026
 
 Modified on 23 June 2026
 Modified on 24 July 2026 to replace lab paths with a local workspace
-paths used by the command-line tools and workbench
+Modified on 14 August 2026
+
+paths used by the command-line tools and GUI
 
 @author: Dinghao Luo
 '''
@@ -14,41 +16,16 @@ import os
 
 
 #%% package and workspace paths
-def package_root():
-    return Path(__file__).resolve().parent
+PACKAGE_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = PACKAGE_ROOT.parents[1]
 
+if 'FIBRE_SIGHT_WORKSPACE' in os.environ:
+    WORKSPACE_ROOT = Path(os.environ['FIBRE_SIGHT_WORKSPACE']).expanduser()
+elif (REPO_ROOT / 'pyproject.toml').is_file():
+    WORKSPACE_ROOT = REPO_ROOT / 'workspace'
+else:
+    WORKSPACE_ROOT = Path.home() / 'fibre-sight'
 
-def package_path(*parts):
-    return package_root().joinpath(*parts)
-
-
-def _clone_root():
-    package_dir = package_root()
-    for candidate in list(package_dir.parents)[:3]:
-        source_package = candidate / 'src' / 'fibre_sight'
-        if (candidate / 'pyproject.toml').is_file() and source_package.resolve() == package_dir:
-            return candidate
-    return None
-
-
-def get_workspace_root():
-    configured = os.environ.get('FIBRE_SIGHT_WORKSPACE', '').strip()
-    if configured:
-        return Path(configured).expanduser()
-
-    clone_root = _clone_root()
-    if clone_root is not None:
-        return clone_root / 'workspace'
-    return Path.home() / 'fibre-sight'
-
-
-def default_source_root():
-    return get_workspace_root() / 'labelled_sessions'
-
-
-def default_output_root():
-    return get_workspace_root() / 'output'
-
-
-def default_figure_root():
-    return default_output_root() / 'figures'
+SOURCE_ROOT = WORKSPACE_ROOT / 'labelled_sessions'
+OUTPUT_ROOT = WORKSPACE_ROOT / 'output'
+FIGURE_ROOT = OUTPUT_ROOT / 'figures'

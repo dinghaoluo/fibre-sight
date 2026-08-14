@@ -6,7 +6,6 @@
 
 | field | value |
 | --- | --- |
-| Registry key | `ch2_v1` |
 | Checkpoint | `src/fibre_sight/models/fibre_sight_ch2_v1.pt` |
 | Input | one two-dimensional channel-2 reference array |
 | Output | one foreground probability map and an ROI dictionary |

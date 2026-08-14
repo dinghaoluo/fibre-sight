@@ -1,20 +1,12 @@
 '''
 Created on 24 July 2026
 
-small console and matplotlib formatting helpers
+Modified on 14 August 2026
+
+matplotlib formatting used by the analysis figures
 
 @author: Dinghao Luo
 '''
-
-#%% console
-def print_files_saved(entries, gap=1):
-    gap = min(gap, 1)
-    prefix = '\n' * gap
-    bar = '-' * 12
-    print(f'{prefix}{bar}\nFILES SAVED\n{bar}')
-    for label, path in entries:
-        print(f'{label}: {path}')
-
 
 #%% plotting
 def mpl_formatting():
