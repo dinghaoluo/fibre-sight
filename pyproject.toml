@@ -27,6 +27,7 @@ dependencies = [
   'scikit-image>=0.21',
   'scipy>=1.10',
   'torch>=2.3',
+  'tifffile>=2024.2',
   'tqdm>=4.66',
 ]
 
