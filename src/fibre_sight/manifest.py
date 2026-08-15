@@ -137,7 +137,7 @@ def scan_source_root(source_root):
 
 
 #%% splitting
-def assign_session_splits(sessions, val_fraction=0.15, test_fraction=0.15, seed=7):
+def assign_session_splits(sessions, val_fraction=0.15, test_fraction=0.15, seed=42):
     # whole sessions stay together so one recording cannot enter two splits
     rng = np.random.default_rng(seed)
     included = [session for session in sessions if _as_bool(session['included'])]

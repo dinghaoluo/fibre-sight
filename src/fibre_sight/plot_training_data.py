@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--split', default=None)
     parser.add_argument('--n', type=int, default=6)
-    parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument(
         '--out',
         type=Path,
@@ -48,7 +48,7 @@ def make_overlay(image, labelled, alpha=0.55):
         return out
 
     # stable colours make repeat previews comparable while the sampled sessions change
-    rng = np.random.default_rng(20260512)
+    rng = np.random.default_rng(42)
     colours = rng.uniform(0.1, 1.0, size=(int(labelled.max()) + 1, 3))
     overlay = colours[labelled]
     mask = labelled > 0
@@ -64,7 +64,7 @@ def make_overlay(image, labelled, alpha=0.55):
     return out
 
 
-def choose_sessions(sessions, n_sessions, seed=7):
+def choose_sessions(sessions, n_sessions, seed=42):
     if len(sessions) <= n_sessions:
         return sessions
 

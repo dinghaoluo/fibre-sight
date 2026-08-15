@@ -19,6 +19,3 @@ workspace/
 
 # log files
 *.log
-
-# development data
-dev-data/

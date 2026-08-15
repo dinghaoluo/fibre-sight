@@ -26,7 +26,7 @@ fibre-sight-build-manifest
 This scans the labelled sessions, writes `workspace/manifests/ch2_manifest.csv`, and prints the number of included sessions, the animals found, the total ROI count, and the split sizes. Splits are assigned at session level with a 15% validation and 15% test fraction by default:
 
 ```
-fibre-sight-build-manifest --val-fraction 0.2 --test-fraction 0.2 --seed 11
+fibre-sight-build-manifest --val-fraction 0.2 --test-fraction 0.2 --seed 42
 ```
 
 Use `--no-splits` to write the manifest without splits and assign an animal-held-out split manually in the CSV. `--source-root` and `--out` move the input and output locations.

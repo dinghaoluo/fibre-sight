@@ -53,7 +53,7 @@ class ROIDataset(Dataset):
             cache_images=False,
             target_mode='foreground',
             support_radius=3,
-            seed=7,
+            seed=42,
             ):
         self.sessions = read_manifest(manifest_path, included_only=True, split=split)
         if not self.sessions:

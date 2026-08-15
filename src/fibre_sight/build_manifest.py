@@ -34,7 +34,7 @@ def parse_args():
         )
     parser.add_argument('--val-fraction', type=float, default=0.15)
     parser.add_argument('--test-fraction', type=float, default=0.15)
-    parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--no-splits', action='store_true')
     return parser.parse_args()
 

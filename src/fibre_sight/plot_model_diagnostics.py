@@ -38,7 +38,7 @@ def parse_args():
     parser.add_argument('--device', default='auto')
     parser.add_argument('--no-tta', action='store_true')
     parser.add_argument('--n', type=int, default=4)
-    parser.add_argument('--seed', type=int, default=17)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument(
         '--out',
         type=Path,
