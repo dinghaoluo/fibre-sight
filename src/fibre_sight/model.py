@@ -71,7 +71,7 @@ class Up(nn.Module):
     def __init__(self, in_channels, skip_channels, out_channels, attention_gates=False):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        # 2 August 2026: gate only the skip path so the working decoder stays intact
+        # 2 August 2026: attention sits on the skip path; the working decoder stays intact
         self.attention = (
             AttentionGate(skip_channels, out_channels)
             if attention_gates else None

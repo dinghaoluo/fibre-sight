@@ -358,7 +358,7 @@ def main():
             f'val Dice {val_score:.4f}'
             )
 
-        # keep the checkpoint with the best validation Dice; this is the mask overlap I inspect
+        # keep the checkpoint with the best validation Dice, the mask overlap I inspect
         if val_score > best_score:
             best_score = val_score
             save_checkpoint(run_dir / 'best.pt', model, optimiser, epoch, best_score, config)

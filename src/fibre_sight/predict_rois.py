@@ -73,7 +73,7 @@ def _predict_tensor(tensor, model, tta=False):
     if not tta:
         return torch.sigmoid(model(tensor)[:, :1])
 
-    # average the four flip views without interpolating the thin ROI shapes
+    # the four flip views return to the original pixel grid before averaging
     predictions = []
     for dims in [(), (2,), (3,), (2, 3)]:
         input_tensor = torch.flip(tensor, dims=dims) if dims else tensor

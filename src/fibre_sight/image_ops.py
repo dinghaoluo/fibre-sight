@@ -36,8 +36,7 @@ def sample_crop_bounds(mask, patch_size, rng, foreground_fraction=0.75):
     if patch_size > height or patch_size > width:
         raise ValueError('patch size exceeds the image dimensions')
 
-    # keep some background-only patches instead of teaching the model that
-    # every crop contains an axon
+    # keep some background-only patches so the model learns that empty crops occur
     use_foreground = rng.random() < foreground_fraction and np.any(mask)
     if use_foreground:
         ypix, xpix = np.where(mask)
@@ -70,7 +69,7 @@ def augment_pair(
         image = np.flip(image, axis=1)
         mask = np.flip(mask, axis=1)
 
-    # 1 August 2026: keep rotations lossless; thin masks do not need interpolation
+    # 1 August 2026: use the same lossless rotations for images and thin masks
     if rotation_90:
         k = int(rng.integers(0, 4))
         if k:

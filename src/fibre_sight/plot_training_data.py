@@ -47,7 +47,7 @@ def make_overlay(image, labelled, alpha=0.55):
     if labelled.max() == 0:
         return out
 
-    # stable colours make repeat previews comparable while the sampled sessions change
+    # stable colours make repeat previews comparable whilst the sampled sessions change
     rng = np.random.default_rng(42)
     colours = rng.uniform(0.1, 1.0, size=(int(labelled.max()) + 1, 3))
     overlay = colours[labelled]

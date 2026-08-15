@@ -350,7 +350,7 @@ class FibreSightGUI(QMainWindow):
 
         self.tabs = QTabWidget()
         self.predict_tab, self.predict_tab_content = self._make_scroll_tab()
-        # Predict is short enough to fit; Qt style rounding should not add a scrollbar
+        # Predict fits inside the rounded Qt tab at its minimum width
         self.predict_tab.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         (
             self.mser_tab,
@@ -2179,7 +2179,7 @@ class FibreSightGUI(QMainWindow):
         command_text = shlex.join(['python'] + command_args)
         self.print_log(f'\n$ {command_text}')
         self.process.start()
-        # the log keeps the command and output; the status bar only confirms that it started
+        # the log keeps the command and output; the status bar records the start
         self.refresh_status(f'{process_name} started')
         return True
 
@@ -2384,8 +2384,7 @@ class FibreSightGUI(QMainWindow):
         if self.probability is None:
             return
 
-        # reuse the confidence map here; changing the threshold should not rerun
-        # the model whilst I am deciding which faint fibres to keep
+        # threshold changes reuse the confidence map whilst I decide which faint fibres to keep
         self.push_undo_state()
         self.roi_dict, self.labelled = probability_to_roi_dict(
             self.probability,

@@ -24,7 +24,7 @@ model:
   depth: 4
   attention_gates: true
 
-# 2 August 2026: change the skip paths only; keep the working loss fixed
+# 2 August 2026: attention changes the skip paths; loss stays at the working baseline
 loss:
   mode: bce_dice
   bce_weight: 1.0
