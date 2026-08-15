@@ -60,25 +60,40 @@ def plane_at(planes, z):
 
 
 #%% known motion
+def _soft_pulse(n_frames, start, length):
+    pulse = np.zeros(n_frames, dtype=np.float32)
+    if start >= n_frames:
+        return pulse
+    stop = min(start + length, n_frames)
+    phase = np.linspace(0, np.pi, stop - start, dtype=np.float32)
+    pulse[start:stop] = np.sin(phase) ** 2
+    return pulse
+
+
 def motion_truth(n_frames, shape, seed=42):
+    from scipy.ndimage import gaussian_filter1d
+
     rng = np.random.default_rng(seed)
     time = np.arange(n_frames, dtype=np.float32)
 
-    walk_y = np.cumsum(rng.normal(0, 0.055, n_frames))
-    walk_x = np.cumsum(rng.normal(0, 0.055, n_frames))
-    shift_y = 2.8 * np.sin(time / 73) + walk_y
-    shift_x = 3.4 * np.cos(time / 91) + walk_x
+    drift_y = gaussian_filter1d(np.cumsum(rng.normal(0, 0.018, n_frames)), 20)
+    drift_x = gaussian_filter1d(np.cumsum(rng.normal(0, 0.018, n_frames)), 20)
+    shift_y = drift_y - np.median(drift_y)
+    shift_x = drift_x - np.median(drift_x)
 
-    # short impulses reproduce the abrupt lateral component around movement bouts
-    for start, length, dy, dx in [
-            (230, 11, 4.5, -3.5),
-            (720, 14, -5.0, 4.0),
-            (1230, 12, 5.5, 3.5),
-            (1710, 15, -4.5, -5.0),
-            ]:
-        stop = min(start + length, n_frames)
-        shift_y[start:stop] += dy
-        shift_x[start:stop] += dx
+    # 15 August 2026: supplied bouts centre on 11 frames, with a 19-24 frame upper quartile
+    start = 20
+    while start < n_frames:
+        length = int(rng.integers(15, 31))
+        pulse = _soft_pulse(n_frames, start, length)
+        phase = np.linspace(-1, 1, length, dtype=np.float32)[:n_frames - start]
+        angle = rng.uniform(0, 2 * np.pi) + rng.uniform(-0.6, 0.6) * phase
+        amplitude = rng.uniform(1.5, 5.0)
+        if rng.random() < 0.15:
+            amplitude *= 1.4
+        shift_y[start:start + len(phase)] += amplitude * pulse[start:start + len(phase)] * np.sin(angle)
+        shift_x[start:start + len(phase)] += amplitude * pulse[start:start + len(phase)] * np.cos(angle)
+        start += int(rng.integers(45, 91))
 
     height, width = shape
     y, x = np.mgrid[:height, :width].astype(np.float32)
@@ -95,29 +110,38 @@ def motion_truth(n_frames, shape, seed=42):
     basis_y -= basis_y.mean(axis=(1, 2), keepdims=True)
     basis_x -= basis_x.mean(axis=(1, 2), keepdims=True)
 
-    coefficient = np.zeros((n_frames, 2), dtype=np.float32)
     block = np.arange(n_frames) % 1000
-    nonrigid = (block >= 500) & (block < 750)
-    coefficient[nonrigid, 0] = 1.8 * np.sin(time[nonrigid] / 31)
-    coefficient[nonrigid, 1] = 1.2 * np.cos(time[nonrigid] / 43)
+    coefficient = np.zeros((n_frames, 2), dtype=np.float32)
+    for block_start in range(0, n_frames, 1000):
+        for centre in range(block_start + 515, min(block_start + 750, n_frames), 35):
+            length = int(rng.integers(15, 31))
+            start = centre - length // 2
+            pulse = _soft_pulse(n_frames, start, length)
+            angle = rng.uniform(0, 2 * np.pi)
+            amplitude = rng.uniform(1.3, 2.1)
+            coefficient[:, 0] += amplitude * pulse * np.sin(angle)
+            coefficient[:, 1] += amplitude * pulse * np.cos(angle)
+    nonrigid = np.linalg.norm(coefficient, axis=1) > 0.05
 
     z = 0.12 * np.sin(time / 410)
     for start, length, level in [
-            (310, 9, 1.0),
+            (310, 12, 1.0),
             (810, 15, -2.0),
-            (1310, 12, -1.0),
+            (1310, 15, -1.0),
             (1810, 15, 2.0),
             ]:
-        z[start:min(start + length, n_frames)] = level
+        pulse = _soft_pulse(n_frames, start, length)
+        z += pulse * (level - z)
 
-    ambiguous = np.zeros(n_frames, dtype=bool)
-    for start in (460, 960, 1460, 1960):
-        ambiguous[start:min(start + 6, n_frames)] = True
+    ambiguity = np.zeros(n_frames, dtype=np.float32)
+    for start in (455, 955, 1455, 1955):
+        ambiguity = np.maximum(ambiguity, _soft_pulse(n_frames, start, 15))
+    ambiguous = ambiguity > 0.05
     estimable = (~ambiguous) & (np.abs(z) < 1.5)
 
     scenario = np.full(n_frames, 'intensity', dtype='<U12')
     scenario[block < 250] = 'clean'
-    scenario[(block >= 500) & (block < 750)] = 'nonrigid'
+    scenario[nonrigid] = 'nonrigid'
     scenario[(np.abs(z) >= 0.5)] = 'focal'
     scenario[ambiguous] = 'ambiguous'
 
@@ -128,6 +152,7 @@ def motion_truth(n_frames, shape, seed=42):
         'basis_x': basis_x,
         'coefficient': coefficient,
         'z': z.astype(np.float32),
+        'ambiguity': ambiguity,
         'ambiguous': ambiguous,
         'estimable': estimable,
         'scenario': scenario,
@@ -256,10 +281,13 @@ def make_benchmark(root=BENCHMARK_ROOT, n_frames=2000, seed=42):
         bleaching = 1 - 0.18 * frame / (n_frames - 1)
         gain = 1 + 0.16 * np.sin(frame / 47)
         offset = 12 * np.sin(frame / 83)
-        if truth['ambiguous'][frame]:
+        if truth['ambiguity'][frame] > 0:
             tile = control_frame[:64, :64]
-            control_frame = np.tile(tile, (height // 64, width // 64))
-            signal_frame = np.tile(signal_frame[:64, :64], (height // 64, width // 64))
+            repeated_control = np.tile(tile, (height // 64, width // 64))
+            repeated_signal = np.tile(signal_frame[:64, :64], (height // 64, width // 64))
+            weight = truth['ambiguity'][frame]
+            control_frame = (1 - weight) * control_frame + weight * repeated_control
+            signal_frame = (1 - weight) * signal_frame + weight * repeated_signal
 
         # 14 August 2026: matched to sampled signal and control histograms in the raw TIFF
         control_movie[frame] = _camera_frame(
@@ -508,6 +536,162 @@ def run_caiman(root=BENCHMARK_ROOT, piecewise=False):
     np.savez_compressed(root / 'caiman_rigid.npz', **result)
 
 
+#%% FibreSight
+def run_fibresight(root=BENCHMARK_ROOT):
+    from fibre_sight.preprocessing import estimate_shift, make_reference
+
+    root = Path(root)
+    movie = tifffile.memmap(root / 'control.tif')
+    with np.load(root / 'truth.npz') as saved:
+        truth = {name: saved[name] for name in saved.files}
+
+    control = np.load(EXAMPLE_ROOT / 'demo_train_02_ref_mat_ch2.npy')
+    below = np.load(EXAMPLE_ROOT / 'demo_train_01_ref_mat_ch2.npy')
+    above = np.load(EXAMPLE_ROOT / 'demo_test_ref_mat_ch2.npy')
+    known_reference = make_planes(control, below, above)[2] ** 2
+    calibration = (np.arange(len(movie)) < len(movie) // 2) & truth['estimable']
+    phase_whitening = np.asarray([0, 0.5, 1], dtype=np.float32)
+    calibration_median = np.empty(len(phase_whitening), dtype=np.float32)
+    calibration_p95 = np.empty(len(phase_whitening), dtype=np.float32)
+    calibration_start = time.perf_counter()
+
+    # 14 August 2026: phase-only correlation lost subpixel accuracy at this noise level
+    for choice_i, whitening in enumerate(phase_whitening):
+        displacement = []
+        for frame in movie[:len(movie) // 2]:
+            estimate = estimate_shift(
+                known_reference, frame, whitening=float(whitening), check_tiles=False)
+            displacement.append([-estimate['shift_y'], -estimate['shift_x']])
+        displacement = np.asarray(displacement)
+        error, _, _, valid = registration_errors(
+            displacement[:, 0],
+            displacement[:, 1],
+            truth['shift_y'][:len(displacement)],
+            truth['shift_x'][:len(displacement)],
+            calibration[:len(displacement)],
+            truth['estimable'][:len(displacement)],
+            )
+        calibration_median[choice_i] = np.median(error[valid])
+        calibration_p95[choice_i] = np.percentile(error[valid], 95)
+
+    whitening = float(phase_whitening[np.argmin(calibration_p95)])
+    calibration_seconds = time.perf_counter() - calibration_start
+    start_time = time.perf_counter()
+    reference = make_reference(movie, whitening=whitening)
+    shift_y = np.empty(len(movie), dtype=np.float32)
+    shift_x = np.empty(len(movie), dtype=np.float32)
+    peak_ratio = np.empty(len(movie), dtype=np.float32)
+    tile_disagreement = np.empty(len(movie), dtype=np.float32)
+    out_of_range = np.empty(len(movie), dtype=bool)
+    for frame_i, frame in enumerate(movie):
+        estimate = estimate_shift(reference['image'], frame, whitening=whitening)
+        # truth records observed movement; the applied correction has the opposite sign
+        shift_y[frame_i] = -estimate['shift_y']
+        shift_x[frame_i] = -estimate['shift_x']
+        peak_ratio[frame_i] = estimate['peak_ratio']
+        tile_disagreement[frame_i] = estimate['tile_disagreement']
+        out_of_range[frame_i] = estimate['out_of_range']
+
+    np.savez_compressed(
+        root / 'fibresight_rigid.npz',
+        shift_y=shift_y,
+        shift_x=shift_x,
+        peak_ratio=peak_ratio,
+        tile_disagreement=tile_disagreement,
+        out_of_range=out_of_range,
+        reference=reference['image'],
+        reference_accepted=reference['accepted'],
+        phase_whitening=phase_whitening,
+        calibration_median=calibration_median,
+        calibration_p95=calibration_p95,
+        selected_whitening=np.float32(whitening),
+        calibration_seconds=np.float64(calibration_seconds),
+        seconds=np.float64(time.perf_counter() - start_time),
+        version=importlib.metadata.version('fibre-sight'),
+        )
+
+
+#%% review movie
+def make_review_movie(root=BENCHMARK_ROOT):
+    import av
+    import cv2
+    from fibre_sight.preprocessing import warp_frame
+
+    root = Path(root)
+    movie = tifffile.memmap(root / 'control.tif')
+    with np.load(root / 'truth.npz') as saved:
+        truth = {name: saved[name] for name in saved.files}
+
+    names = ['suite2p_rigid', 'caiman_rigid', 'fibresight_rigid']
+    results = []
+    calibration = (np.arange(len(movie)) < len(movie) // 2) & truth['estimable']
+    known = np.column_stack([truth['shift_y'], truth['shift_x']])
+    for name in names:
+        with np.load(root / f'{name}.npz') as saved:
+            movement = np.column_stack([saved['shift_y'], saved['shift_x']])
+        offset = np.median(movement[calibration] - known[calibration], axis=0)
+        results.append((movement, offset))
+
+    sample = np.asarray(movie[np.linspace(0, len(movie) - 1, 100, dtype=int)])
+    low, high = np.percentile(sample, [0.1, 99.9])
+    height, width = movie.shape[1:]
+    path = EXAMPLE_ROOT / 'rigid_registration_benchmark.mp4'
+    video = av.open(path, 'w')
+    stream = video.add_stream(
+        'libx264', rate=round(float(truth['sampling_frequency_hz'])),
+        options={'crf': '23', 'preset': 'medium'},
+        )
+    shown_height = 3 * height // 4
+    shown_width = 3 * width // 4
+    margin = 8
+    gutter = 16
+    title_height = 28
+    stream.width = 2 * margin + 4 * shown_width + 3 * gutter
+    stream.height = shown_height + 2 * margin + title_height
+    stream.pix_fmt = 'yuv420p'
+
+    labels = ['raw', 'Suite2p rigid', 'CaImAn rigid', 'FibreSight rigid']
+    sections = [
+        ('ordinary movement', 0, 300),
+        ('non-rigid movement', 500, 800),
+        ('focal-plane stress', 760, 1060),
+        ]
+    for section, start, stop in sections:
+        for frame_i in range(start, stop):
+            frame = movie[frame_i]
+            panels = [np.asarray(frame, dtype=np.float32)]
+            for movement, offset in results:
+                correction = -movement[frame_i] + offset
+                registered, _ = warp_frame(frame, *correction)
+                panels.append(registered)
+
+            shown = []
+            for panel, label in zip(panels, labels):
+                panel = np.nan_to_num((panel - low) / (high - low), nan=0)
+                panel = np.clip(255 * panel, 0, 255).astype(np.uint8)
+                panel = cv2.resize(panel, (shown_width, shown_height), interpolation=cv2.INTER_AREA)
+                panel = cv2.cvtColor(panel, cv2.COLOR_GRAY2BGR)
+                cv2.putText(panel, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+                cv2.putText(panel, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                shown.append(panel)
+            canvas = np.full((stream.height, stream.width, 3), 24, dtype=np.uint8)
+            cv2.putText(
+                canvas, section, (margin, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (235, 235, 235), 1,
+                )
+            for panel_i, panel in enumerate(shown):
+                x = margin + panel_i * (shown_width + gutter)
+                y = margin + title_height
+                canvas[y:y + shown_height, x:x + shown_width] = panel
+            video_frame = av.VideoFrame.from_ndarray(canvas, format='bgr24')
+            for packet in stream.encode(video_frame):
+                video.mux(packet)
+    for packet in stream.encode():
+        video.mux(packet)
+    video.close()
+    return path
+
+
 #%% errors
 def registration_errors(estimate_y, estimate_x, truth_y, truth_x, calibration, estimable):
     offset_y = np.median(estimate_y[calibration] - truth_y[calibration])
@@ -589,7 +773,10 @@ def measure(root=BENCHMARK_ROOT):
     with np.load(root / 'truth.npz') as saved:
         truth = {name: saved[name] for name in saved.files}
     rows = []
-    for name in ('suite2p_rigid', 'suite2p_piecewise', 'caiman_rigid', 'caiman_piecewise'):
+    for name in (
+            'suite2p_rigid', 'suite2p_piecewise',
+            'caiman_rigid', 'caiman_piecewise', 'fibresight_rigid',
+            ):
         with np.load(root / f'{name}.npz') as saved:
             result = {field: saved[field] for field in saved.files}
         rows.extend(_metric_rows(name, result, truth))
@@ -603,7 +790,10 @@ def measure(root=BENCHMARK_ROOT):
 #%% command line
 def main():
     parser = ArgumentParser()
-    parser.add_argument('step', choices=['make', 'suite2p', 'caiman', 'caiman-part', 'measure'])
+    parser.add_argument(
+        'step',
+        choices=['make', 'suite2p', 'caiman', 'caiman-part', 'fibresight', 'movie', 'measure'],
+        )
     parser.add_argument('start', nargs='?', type=int)
     parser.add_argument('stop', nargs='?', type=int)
     parser.add_argument('--piecewise', action='store_true')
@@ -618,6 +808,10 @@ def main():
         run_caiman(piecewise=args.piecewise)
     elif args.step == 'caiman-part':
         _run_caiman_piecewise_part(BENCHMARK_ROOT, args.start, args.stop)
+    elif args.step == 'fibresight':
+        run_fibresight()
+    elif args.step == 'movie':
+        make_review_movie()
     else:
         measure()
 

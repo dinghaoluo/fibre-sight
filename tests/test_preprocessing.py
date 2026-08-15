@@ -12,13 +12,21 @@ import tempfile
 import unittest
 
 import numpy as np
+from scipy import ndimage as ndi
 import tifffile
 
 from support import add_source_to_path
 
 add_source_to_path()
 
-from fibre_sight.preprocessing import read_tiffs
+from fibre_sight.preprocessing import (
+    estimate_channel_offset,
+    estimate_shift,
+    make_reference,
+    read_tiffs,
+    register_pair,
+    warp_frame,
+    )
 
 
 #%% helpers
@@ -44,6 +52,11 @@ def _write_pages(path, pages, times=None, frames=None, channels=None):
                 metadata=None,
                 contiguous=False,
                 )
+
+
+def _image(shape=(96, 112)):
+    rng = np.random.default_rng(42)
+    return ndi.gaussian_filter(rng.normal(size=shape), 2).astype(np.float32)
 
 
 #%% tests
@@ -146,6 +159,81 @@ class PreprocessingTests(unittest.TestCase):
                         [path], signal_channel=1, control_channel=2,
                         sampling_frequency_hz=30,
                         ))
+
+    def test_rigid_shift_has_subpixel_accuracy_without_wrapped_edges(self):
+        reference = _image()
+        observed_shift = np.asarray([2.4, -3.7])
+        frame = ndi.shift(reference, observed_shift, order=1, mode='constant', cval=0)
+
+        estimate = estimate_shift(reference, frame, check_tiles=False)
+        correction = np.asarray([estimate['shift_y'], estimate['shift_x']])
+        np.testing.assert_allclose(correction, -observed_shift, atol=0.15)
+
+        registered, bounds = warp_frame(frame, *correction)
+        expected_valid = np.zeros(reference.shape, dtype=bool)
+        y0, y1, x0, x1 = bounds
+        expected_valid[y0:y1, x0:x1] = True
+        np.testing.assert_array_equal(np.isfinite(registered), expected_valid)
+        self.assertGreater(np.corrcoef(reference[expected_valid], registered[expected_valid])[0, 1], 0.99)
+
+    def test_two_pass_reference_recovers_the_unmoved_image(self):
+        rng = np.random.default_rng(42)
+        image = _image((64, 80))
+        frames = []
+        for _ in range(30):
+            shift = rng.uniform(-4, 4, 2)
+            frame = ndi.shift(image, shift, order=1, mode='constant', cval=0)
+            frames.append((1 + rng.uniform(-0.15, 0.15)) * frame + rng.normal(0, 0.03, image.shape))
+        frames = np.asarray(frames, dtype=np.float32)
+
+        result = make_reference(
+            frames,
+            max_frames=30,
+            min_frames=20,
+            min_peak_ratio=1.02,
+            max_tile_disagreement=1.5,
+            )
+        unregistered = frames.mean(axis=0)
+        registered_shift = estimate_shift(image, result['image'], check_tiles=False)
+        mean_shift = estimate_shift(image, unregistered, check_tiles=False)
+        registered, _ = warp_frame(
+            result['image'], registered_shift['shift_y'], registered_shift['shift_x'])
+        unregistered, _ = warp_frame(unregistered, mean_shift['shift_y'], mean_shift['shift_x'])
+        registered_valid = np.isfinite(registered)
+        mean_valid = np.isfinite(unregistered)
+        registered_ncc = np.corrcoef(image[registered_valid], registered[registered_valid])[0, 1]
+        mean_ncc = np.corrcoef(image[mean_valid], unregistered[mean_valid])[0, 1]
+        self.assertGreater(registered_ncc, mean_ncc + 0.05)
+
+    def test_signal_and_control_share_movement_after_channel_alignment(self):
+        image = _image()
+        channel_displacement = np.asarray([1.3, -2.2])
+        control_references = np.repeat(image[None], 8, axis=0)
+        signal_references = np.repeat(
+            ndi.shift(image, channel_displacement, order=1, mode='constant', cval=0)[None],
+            8,
+            axis=0,
+            )
+        offset = estimate_channel_offset(signal_references, control_references)
+        np.testing.assert_allclose(
+            [offset['shift_y'], offset['shift_x']], -channel_displacement, atol=0.15)
+        self.assertTrue(offset['accepted'])
+
+        movement = np.asarray([2.4, -1.7])
+        control = ndi.shift(image, movement, order=1, mode='constant', cval=0)
+        signal = ndi.shift(
+            image, movement + channel_displacement, order=1, mode='constant', cval=0)
+        estimate = estimate_shift(image, control, check_tiles=False)
+        result = register_pair(
+            signal,
+            control,
+            estimate['shift_y'],
+            estimate['shift_x'],
+            signal_offset=(offset['shift_y'], offset['shift_x']),
+            )
+        valid = np.isfinite(result['signal']) & np.isfinite(result['control'])
+        self.assertGreater(
+            np.corrcoef(result['signal'][valid], result['control'][valid])[0, 1], 0.99)
 
 
 if __name__ == '__main__':

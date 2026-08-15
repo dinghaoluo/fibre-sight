@@ -16,11 +16,23 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from registration_benchmark import _warp, registration_errors
+from registration_benchmark import _warp, motion_truth, registration_errors
 
 
 #%% tests
 class RegistrationBenchmarkTests(unittest.TestCase):
+    def test_synthetic_movement_enters_and_leaves_softly(self):
+        truth = motion_truth(2000, (64, 80))
+        rigid_step = np.hypot(np.diff(truth['shift_y']), np.diff(truth['shift_x']))
+        local_step = np.linalg.norm(np.diff(truth['coefficient'], axis=0), axis=1)
+
+        self.assertLess(rigid_step.max(), 1.5)
+        self.assertGreater(np.mean(rigid_step > 0.1), 0.20)
+        self.assertGreater(
+            np.percentile(np.hypot(truth['shift_y'], truth['shift_x']), 95), 2.5)
+        self.assertLess(local_step.max(), 0.5)
+        self.assertLess(np.abs(np.diff(truth['z'])).max(), 0.7)
+
     def test_positive_displacement_moves_image_down_and_right(self):
         image = np.zeros((21, 21), dtype=np.float32)
         image[10, 10] = 1
