@@ -2179,7 +2179,6 @@ class FibreSightGUI(QMainWindow):
         command_text = shlex.join(['python'] + command_args)
         self.print_log(f'\n$ {command_text}')
         self.process.start()
-        # the log keeps the command and output; the status bar records the start
         self.refresh_status(f'{process_name} started')
         return True
 

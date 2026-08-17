@@ -19,14 +19,12 @@ SRC_ROOT = PROJECT_ROOT / 'src'
 
 #%% helpers
 def add_source_to_path():
-    '''put the checkout source tree first on sys.path'''
     source_path = str(SRC_ROOT)
     if source_path not in sys.path:
         sys.path.insert(0, source_path)
 
 
 def source_environment():
-    '''return an environment which imports the checkout source tree'''
     env = os.environ.copy()
     existing = env.get('PYTHONPATH', '')
     paths = [str(SRC_ROOT)]

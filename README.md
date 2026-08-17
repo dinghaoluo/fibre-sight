@@ -92,6 +92,8 @@ The checkpoint was trained on channel-2 references acquired and processed within
 
 Not yet. The current workbench begins with a precomputed two-dimensional `.npy` reference image and ends with an ROI dictionary. It does not yet register TIFF movies, generate reference images from a stack, or extract activity traces. `read_tiffs(...)` now covers the first step by reading signal and control pairs from numerically ordered TIFF chunks, including multiplexed ScanImage stacks and separate synchronous channel stacks.
 
+The current motion-correction comparisons and their pinned external environments are recorded in the [benchmark notes](BENCHMARK.md).
+
 ## workspace
 
 Working data stay outside the package. A clone uses `workspace/` at the repository root by default:
