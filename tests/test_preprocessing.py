@@ -1,6 +1,7 @@
 '''
 Created on 14 August 2026
 Modified on 18 August 2026
+Modified on 19 August 2026
 
 check TIFF reading, registration, and saved QC
 
@@ -23,15 +24,19 @@ add_source_to_path()
 from fibre_sight.preprocessing import (
     add_quality_control_to_nwb,
     assess_tile_field,
+    compare_registration_models,
     estimate_channel_offset,
     estimate_shift,
     estimate_tile_shifts,
     estimate_tile_shifts_coarse_to_fine,
     evaluate_tile_field,
     focal_loss_episodes,
+    fit_tile_field,
+    index_tiffs,
     make_local_references,
     make_reference,
     measure_quality,
+    preprocess_recording,
     read_tiffs,
     refine_tile_field,
     register_pair,
@@ -43,25 +48,11 @@ from fibre_sight.preprocessing import (
 
 
 #%% helpers
-def _description(time_s=None, frame=None):
-    lines = []
-    if frame is not None:
-        lines.append(f'frameNumbers = {frame}')
-    if time_s is not None:
-        lines.append(f'frameTimestamps_sec = {time_s:.9f}')
-    return '\n'.join(lines)
-
-
-def _write_pages(path, pages, times=None, frames=None, channels=None):
-    times = times if times is not None else [None] * len(pages)
-    frames = frames if frames is not None else [None] * len(pages)
-    software = None if channels is None else f'SI.hChannels.channelSave = {channels}'
+def _write_pages(path, pages):
     with tifffile.TiffWriter(path) as writer:
-        for page, time_s, frame in zip(pages, times, frames):
+        for page in pages:
             writer.write(
                 page,
-                description=_description(time_s, frame),
-                software=software,
                 metadata=None,
                 contiguous=False,
                 )
@@ -81,47 +72,48 @@ class PreprocessingTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_multiplexed_tiffs_follow_chunk_and_channel_order(self):
+    def test_multiplexed_index_follows_chunk_and_channel_order(self):
         early_path = self.root / 'recording_2.tif'
         late_path = self.root / 'recording_10.tif'
         early_signal = np.full((3, 5), 10, dtype=np.int16)
         early_control = np.full((3, 5), 20, dtype=np.int16)
         late_signal = np.full((3, 5), 11, dtype=np.int16)
         late_control = np.full((3, 5), 21, dtype=np.int16)
-        frame_time = 1 / 30
         _write_pages(
             early_path,
             [early_control, early_signal],
-            times=[0, 0],
-            frames=[1, 1],
-            channels='[2 1]',
             )
         _write_pages(
             late_path,
             [late_control, late_signal],
-            times=[frame_time, frame_time],
-            frames=[2, 2],
-            channels='[2 1]',
             )
 
-        frames = list(read_tiffs(
+        recording = index_tiffs(
             [late_path, early_path],
-            signal_channel=1,
-            control_channel=2,
+            signal_channel=2,
+            control_channel=1,
             sampling_frequency_hz=30,
-            ))
-
-        np.testing.assert_allclose(
-            [frame['time_s'] for frame in frames],
-            [0, frame_time],
-            atol=1e-9,
+            signal_label='dLight',
+            control_label='tdTomato',
             )
+
+        self.assertEqual(recording['sampling_frequency_hz'], 30)
+        self.assertEqual(recording['signal_label'], 'dLight')
+        self.assertEqual(recording['control_label'], 'tdTomato')
+        self.assertEqual(recording['shape'], (3, 5))
+        self.assertEqual(recording['dtype'], np.dtype('int16'))
+        self.assertEqual(recording['n_frames'], 2)
+        self.assertEqual(recording['frames'][0]['signal_page'], 1)
+        self.assertEqual(recording['frames'][0]['control_page'], 0)
+        self.assertEqual(recording['frames'][1]['signal_tiff'], late_path)
+
+        frames = list(read_tiffs(recording))
         np.testing.assert_array_equal(frames[0]['signal'], early_signal)
         np.testing.assert_array_equal(frames[0]['control'], early_control)
         np.testing.assert_array_equal(frames[1]['signal'], late_signal)
         np.testing.assert_array_equal(frames[1]['control'], late_control)
 
-    def test_separate_tiffs_use_nominal_time(self):
+    def test_separate_tiffs_share_one_frame_index(self):
         signal_path = self.root / 'signal_2.tif'
         control_path = self.root / 'control_2.tif'
         signal = np.arange(24, dtype=np.uint16).reshape(2, 3, 4)
@@ -129,16 +121,20 @@ class PreprocessingTests(unittest.TestCase):
         _write_pages(signal_path, signal)
         _write_pages(control_path, control)
 
-        frames = list(read_tiffs(
+        recording = index_tiffs(
             [signal_path],
             control_tiffs=[control_path],
             multiplexed=False,
             signal_channel=1,
             control_channel=2,
             sampling_frequency_hz=20,
-            ))
+            )
 
-        self.assertEqual([frame['time_s'] for frame in frames], [0, 0.05])
+        self.assertEqual(
+            [frame['frame'] for frame in recording['frames']], [0, 1])
+        self.assertEqual(recording['frames'][1]['signal_page'], 1)
+        self.assertEqual(recording['frames'][1]['control_page'], 1)
+        frames = list(read_tiffs(recording))
         np.testing.assert_array_equal(frames[1]['signal'], signal[1])
         np.testing.assert_array_equal(frames[1]['control'], control[1])
 
@@ -166,12 +162,72 @@ class PreprocessingTests(unittest.TestCase):
 
         for name, pages in cases:
             with self.subTest(name=name):
-                _write_pages(path, pages, channels='[1 2]')
+                _write_pages(path, pages)
                 with self.assertRaises(ValueError):
-                    list(read_tiffs(
+                    index_tiffs(
                         [path], signal_channel=1, control_channel=2,
                         sampling_frequency_hz=30,
-                        ))
+                        )
+
+    def test_preprocessing_rejects_channel_and_output_conflicts(self):
+        signal_path = self.root / 'signal.tif'
+        control_path = self.root / 'control.tif'
+        output_path = self.root / 'recording.nwb'
+        _write_pages(signal_path, np.zeros((2, 8, 8), dtype=np.int16))
+        _write_pages(control_path, np.zeros((1, 8, 8), dtype=np.int16))
+
+        with self.assertRaisesRegex(ValueError, 'different frame counts'):
+            preprocess_recording(
+                [signal_path], output_path, 1, 2, False, 30,
+                control_tiff_paths=[control_path], registration_model='rigid')
+        with self.assertRaisesRegex(ValueError, 'different one-based numbers'):
+            preprocess_recording(
+                [signal_path], output_path, 1, 1, True, 30,
+                registration_model='rigid')
+
+        output_path.touch()
+        with self.assertRaises(FileExistsError):
+            preprocess_recording(
+                [signal_path], output_path, 1, 2, True, 30,
+                registration_model='rigid')
+
+    def test_preprocessed_nwb_keeps_non_square_image_orientation(self):
+        from datetime import datetime, timezone
+        from pynwb import NWBHDF5IO
+
+        image = np.rint((_image((64, 96)) + 2) * 1000).astype(np.int16)
+        image[16, 20], image[16, 75] = 101, 202
+        image[48, 20], image[48, 75] = 303, 404
+        pages = np.empty((100, *image.shape), dtype=np.int16)
+        pages[0::2] = image
+        pages[1::2] = image
+        tiff_path = self.root / 'non_square.tif'
+        output_path = self.root / 'non_square.nwb'
+        _write_pages(tiff_path, pages)
+
+        preprocess_recording(
+            [tiff_path], output_path, 1, 2, True, 30,
+            registration_model='piecewise',
+            session_start_time=datetime(2026, 8, 19, tzinfo=timezone.utc),
+            )
+
+        with NWBHDF5IO(output_path, 'r') as io:
+            module = io.read().processing['preprocessing']
+            stored = np.asarray(module['registered_control'].data[0])
+            reference = np.asarray(
+                module['registration_references']['control_reference'].data)
+            shift_y, shift_x = module['rigid_translation'].data[0]
+            source_hash = module['source_tiffs']['sha256'][0]
+            n_grid_points = len(module['piecewise_spline_grid'])
+            coefficient_shape = module['piecewise_spline_coefficients'].data.shape
+
+        self.assertEqual(stored.shape, (96, 64))
+        self.assertEqual(reference.shape, (96, 64))
+        self.assertEqual(len(source_hash), 64)
+        self.assertEqual(n_grid_points, coefficient_shape[2] * coefficient_shape[3])
+        expected, _ = warp_frame(image, shift_y, shift_x)
+        expected = np.nan_to_num(np.rint(expected), nan=0).astype(np.int16)
+        np.testing.assert_array_equal(stored.T, expected)
 
     def test_rigid_shift_has_subpixel_accuracy_without_wrapped_edges(self):
         reference = _image()
@@ -279,14 +335,12 @@ class PreprocessingTests(unittest.TestCase):
         self.assertFalse(field['accepted'][bad_tile])
         self.assertLess(np.percentile(error, 95), 0.3)
 
-        assessment = assess_tile_field(field, reference.shape)
         registered = register_pair_piecewise(
             frame,
             frame,
             rigid['shift_y'],
             rigid['shift_x'],
             field,
-            assessment,
             )
         valid = registered['control_valid']
         np.testing.assert_array_equal(
@@ -296,7 +350,14 @@ class PreprocessingTests(unittest.TestCase):
         self.assertGreater(np.corrcoef(
             reference[valid], registered['control'][valid])[0, 1], 0.98)
 
-        focal = assess_tile_field(field, reference.shape, focal_loss=True)
+        focal = register_pair_piecewise(
+            frame,
+            frame,
+            rigid['shift_y'],
+            rigid['shift_x'],
+            field,
+            focal_loss=True,
+            )
         self.assertEqual(focal['fallback_reason'], 'focal_loss')
         oversized = {**field, 'global_shift_y': np.float32(4)}
         oversized = assess_tile_field(oversized, reference.shape)
@@ -323,6 +384,78 @@ class PreprocessingTests(unittest.TestCase):
         selected = select_registration_model(rigid, piecewise)
         self.assertEqual(selected['selected_model'], 'rigid')
         self.assertFalse(selected['passed']['gradient_ncc'])
+
+    def test_automatic_registration_uses_held_out_tile_residuals(self):
+        reference = _image((256, 256))
+        y, x = np.indices(reference.shape, dtype=np.float32)
+        observed_y = 1.5 * np.sin(2 * np.pi * x / reference.shape[1])
+        observed_x = 1.2 * np.sin(2 * np.pi * y / reference.shape[0])
+        frame = ndi.map_coordinates(
+            reference,
+            [y - observed_y, x - observed_x],
+            order=1,
+            mode='constant',
+            ).astype(np.float32)
+        rigid = estimate_shift(reference, frame, check_tiles=False)
+        tiles = estimate_tile_shifts(
+            reference,
+            frame,
+            (rigid['shift_y'], rigid['shift_x']),
+            tile_size=64,
+            )
+        field = fit_tile_field(
+            tiles,
+            reference.shape,
+            64,
+            spatial_penalty=10,
+            magnitude_penalty=1,
+            )
+
+        comparison = compare_registration_models(
+            reference,
+            [frame] * 8,
+            [frame] * 8,
+            [rigid] * 8,
+            [tiles] * 8,
+            [field] * 8,
+            )
+
+        self.assertEqual(comparison['selected_model'], 'piecewise_rigid')
+        self.assertGreater(comparison['comparison']['residual_p95_gain_px'], 1)
+        self.assertGreater(comparison['comparison']['gradient_ncc_gain'], 0.1)
+
+        focal = compare_registration_models(
+            reference,
+            [frame] * 8,
+            [frame] * 8,
+            [rigid] * 8,
+            [tiles] * 8,
+            [field] * 8,
+            focal_loss=np.ones(8, dtype=bool),
+            )
+        self.assertEqual(focal['selected_model'], 'rigid')
+        self.assertEqual(focal['piecewise']['residual_p95_px'],
+                         focal['rigid']['residual_p95_px'])
+
+        empty_tiles = {
+            **tiles,
+            'accepted': np.zeros(len(tiles['tile_y']), dtype=bool),
+            'precision': np.zeros((len(tiles['tile_y']), 2, 2), dtype=np.float32),
+            }
+        empty_field = {
+            **field,
+            'accepted': np.zeros(len(field['accepted']), dtype=bool),
+            }
+        no_local_evidence = compare_registration_models(
+            reference,
+            [frame] * 4,
+            [frame] * 4,
+            [rigid] * 4,
+            [empty_tiles] * 4,
+            [empty_field] * 4,
+            )
+        self.assertEqual(no_local_evidence['selected_model'], 'rigid')
+        self.assertTrue(np.isnan(no_local_evidence['rigid']['residual_p95_px']))
 
     def test_two_pass_reference_recovers_the_unmoved_image(self):
         rng = np.random.default_rng(42)
@@ -386,11 +519,26 @@ class PreprocessingTests(unittest.TestCase):
             control,
             estimate['shift_y'],
             estimate['shift_x'],
-            signal_offset=(offset['shift_y'], offset['shift_x']),
+            signal_to_control_offset=(offset['shift_y'], offset['shift_x']),
             )
         valid = np.isfinite(result['signal']) & np.isfinite(result['control'])
         self.assertGreater(
             np.corrcoef(result['signal'][valid], result['control'][valid])[0, 1], 0.99)
+
+        signal_reference = ndi.shift(
+            image, channel_displacement, order=1, mode='constant', cval=0)
+        signal_estimate = estimate_shift(signal_reference, signal, check_tiles=False)
+        signal_led = register_pair(
+            signal,
+            control,
+            signal_estimate['shift_y'],
+            signal_estimate['shift_x'],
+            signal_to_control_offset=(offset['shift_y'], offset['shift_x']),
+            registration_channel='signal',
+            )
+        valid = np.isfinite(signal_led['signal']) & np.isfinite(signal_led['control'])
+        self.assertGreater(np.corrcoef(
+            signal_led['signal'][valid], signal_led['control'][valid])[0, 1], 0.99)
 
     def test_quality_separates_registered_and_focal_frames(self):
         reference = _image()
@@ -644,12 +792,12 @@ class PreprocessingTests(unittest.TestCase):
         with NWBHDF5IO(path, 'r') as io:
             saved = io.read()
             module = saved.processing['quality_control']
-            self.assertIn('rigid_registration_qc', module.data_interfaces)
-            self.assertIn('timing_fault', module['rigid_registration_qc'].colnames)
-            self.assertIn('threshold_calibration', module['rigid_registration_qc'].colnames)
+            self.assertIn('registration_qc', module.data_interfaces)
+            self.assertIn('timing_fault', module['registration_qc'].colnames)
+            self.assertIn('threshold_calibration', module['registration_qc'].colnames)
             self.assertEqual(module['axial_similarity'].unit, 'dimensionless')
             self.assertAlmostEqual(
-                module['rigid_registration_thresholds']['canonical_focal'][0],
+                module['registration_thresholds']['canonical_focal'][0],
                 quality['thresholds']['canonical_focal'],
                 )
             self.assertEqual(len(saved.intervals['focal_loss']), 1)

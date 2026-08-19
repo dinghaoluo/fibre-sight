@@ -3,6 +3,7 @@ Created on 15 August 2026
 Modified on 16 August 2026
 Modified on 17 August 2026 to move the benchmark out of the repository root
 Modified on 18 August 2026
+Modified on 19 August 2026
 
 make and run the multi-image registration benchmark
 
@@ -31,6 +32,7 @@ SUITE_ROOT = PROJECT_ROOT / 'workspace' / 'registration-benchmark-suite'
 INTENSITY_ROOT = PROJECT_ROOT / 'workspace' / 'registration-benchmark-intensity'
 REAL_ROOT = PROJECT_ROOT / 'workspace' / 'registration-benchmark-real'
 FOCAL_ROOT = PROJECT_ROOT / 'workspace' / 'registration-benchmark-focal'
+AUTO_ROOT = PROJECT_ROOT / 'workspace' / 'registration-auto-validation'
 REAL_TIFF = PROJECT_ROOT / 'workspace' / 'dev' / '1000_85%_z3_fov4_00001_00001.tif'
 FIBRESIGHT_PYTHON = Path(sys.executable)
 SUITE2P_PYTHON = PROJECT_ROOT / 'workspace' / 'dev' / 'envs' / 'suite2p-0.11.1' / 'bin' / 'python'
@@ -62,6 +64,11 @@ SOURCE_ANATOMY = {
     'labmate-gcamp-soma.npy': 'somatic',
     }
 BASE_SOURCES = SOURCES[:3]
+AUTO_SOURCES = (
+    'lab-fibresight-demo-train-01.npy',
+    'lab-fibresight-demo-train-02.npy',
+    'lab-fibresight-demo-test.npy',
+    )
 RECIPES = ('ordinary_motion', 'large_motion', 'local_deformation', 'focal_change')
 PHOTON_COUNTS = (30, 65, 150)
 BLEACHING_LEVELS = (0, 0.2, 0.5)
@@ -197,6 +204,23 @@ def focal_cases(root=FOCAL_ROOT):
             'root': Path(root) / source_name,
             'case_order': len(cases) + 1,
             })
+    return cases
+
+
+def auto_validation_cases(root=AUTO_ROOT):
+    cases = []
+    for source_i, source in enumerate(AUTO_SOURCES):
+        for recipe_i, recipe in enumerate(RECIPES):
+            # 18 August 2026: seed branch 6 gives validation independent movement and noise
+            sequence = np.random.SeedSequence([42, 6, source_i, recipe_i])
+            cases.append({
+                'case': f'{source}/{recipe}',
+                'source': source,
+                'recipe': recipe,
+                'seed': int(sequence.generate_state(1, dtype=np.uint32)[0]),
+                'root': Path(root) / source / recipe,
+                'case_order': len(cases) + 1,
+                })
     return cases
 
 
@@ -962,77 +986,120 @@ def measure_piecewise_suite(root=SUITE_ROOT):
         writer.writerows(rows)
 
 
-def measure_auto_suite(root=SUITE_ROOT):
+def measure_auto_suite(root=SUITE_ROOT, cases=None):
     import tifffile
     from fibre_sight.preprocessing import (
-        _gradient_ncc,
-        select_registration_model,
-        warp_frame,
-        warp_frame_piecewise,
+        compare_registration_models,
+        estimate_channel_offset,
+        measure_quality,
+        register_pair,
         )
 
     root = Path(root)
     rows = []
-    for case in benchmark_cases(root):
-        movie = tifffile.memmap(case['root'] / 'control.tif')
+    cases = benchmark_cases(root) if cases is None else cases
+    for case_i, case in enumerate(cases, start=1):
+        case_name = case['case']
+        print(f'{case_i:02d}/{len(cases)}  {case_name}')
+        control_movie = tifffile.memmap(case['root'] / 'control.tif')
+        signal_path = case['root'] / 'signal.tif'
+        signal_movie = (
+            tifffile.memmap(signal_path) if signal_path.exists() else control_movie)
         with np.load(case['root'] / 'fibresight_rigid.npz') as saved:
             rigid = {name: saved[name] for name in saved.files}
         with np.load(case['root'] / 'fibresight_field_80_w0.npz') as saved:
             piecewise = {name: saved[name] for name in saved.files}
-        sample = np.linspace(0, len(movie) // 2 - 1, 100, dtype=int)
-        rigid_ncc = []
-        piecewise_ncc = []
-        rigid_valid = []
-        piecewise_valid = []
+        sample = np.linspace(0, len(control_movie) // 2 - 1, 100, dtype=int)
+        signal_frames = np.asarray(signal_movie[sample])
+        control_frames = np.asarray(control_movie[sample])
+        estimates = [{
+            'shift_y': -float(rigid['shift_y'][frame_i]),
+            'shift_x': -float(rigid['shift_x'][frame_i]),
+            'peak_ratio': float(rigid['peak_ratio'][frame_i]),
+            'tile_disagreement': float(rigid['tile_disagreement'][frame_i]),
+            'out_of_range': bool(rigid['out_of_range'][frame_i]),
+            'search_boundary': (
+                bool(rigid['search_boundary'][frame_i])
+                if 'search_boundary' in rigid else False),
+            } for frame_i in sample]
+        aligned = [
+            register_pair(signal, control, estimate['shift_y'], estimate['shift_x'])
+            for signal, control, estimate in zip(signal_frames, control_frames, estimates)
+            ]
+        channel_offset = estimate_channel_offset(
+            [pair['signal'] for pair in aligned],
+            [pair['control'] for pair in aligned],
+            )
+        signal_to_control_offset = (
+            channel_offset['shift_y'], channel_offset['shift_x'])
+
+        penalty_i = int(np.flatnonzero(
+            piecewise['field_penalties'] == piecewise['refined_penalty'])[0])
+        tile_results = []
+        fields = []
         for frame_i in sample:
-            rigid_frame, rigid_bounds = warp_frame(
-                movie[frame_i], -rigid['shift_y'][frame_i], -rigid['shift_x'][frame_i])
-            rigid_ncc.append(_gradient_ncc(rigid['reference'], rigid_frame))
-            y0, y1, x0, x1 = rigid_bounds
-            rigid_valid.append((y1 - y0) * (x1 - x0) / rigid_frame.size)
-            if piecewise['model_used'][frame_i] == 'rigid':
-                piecewise_frame = rigid_frame
-                piecewise_mask = np.isfinite(rigid_frame)
-            else:
-                field = {
-                    'global_shift_y': -piecewise['piecewise_global_y'][frame_i],
-                    'global_shift_x': -piecewise['piecewise_global_x'][frame_i],
-                    'coefficient_y': -piecewise['piecewise_coefficient_y'][frame_i],
-                    'coefficient_x': -piecewise['piecewise_coefficient_x'][frame_i],
-                    'control_y': piecewise['field_control_y'],
-                    'control_x': piecewise['field_control_x'],
-                    'tile_size': piecewise['tile_size'],
-                    }
-                piecewise_frame, _, piecewise_mask = warp_frame_piecewise(
-                    movie[frame_i], field,
-                    (-rigid['shift_y'][frame_i], -rigid['shift_x'][frame_i]))
-            piecewise_ncc.append(_gradient_ncc(
-                rigid['reference'], piecewise_frame))
-            piecewise_valid.append(np.mean(piecewise_mask))
+            precision = np.empty((len(piecewise['tile_y']), 2, 2), dtype=np.float32)
+            precision[:, 0, 0] = piecewise['field_precision_yy'][frame_i]
+            precision[:, 0, 1] = piecewise['field_precision_yx'][frame_i]
+            precision[:, 1, 0] = piecewise['field_precision_yx'][frame_i]
+            precision[:, 1, 1] = piecewise['field_precision_xx'][frame_i]
+            tile_results.append({
+                'tile_y': piecewise['tile_y'],
+                'tile_x': piecewise['tile_x'],
+                'residual_y': -piecewise['local_y'][frame_i],
+                'residual_x': -piecewise['local_x'][frame_i],
+                'accepted': piecewise['field_accepted'][frame_i],
+                'precision': precision,
+                })
+            fields.append({
+                'global_shift_y': -piecewise['field_global_y'][penalty_i, frame_i],
+                'global_shift_x': -piecewise['field_global_x'][penalty_i, frame_i],
+                'coefficient_y': -piecewise['field_coefficient_y'][penalty_i, frame_i],
+                'coefficient_x': -piecewise['field_coefficient_x'][penalty_i, frame_i],
+                'control_y': piecewise['field_control_y'],
+                'control_x': piecewise['field_control_x'],
+                'tile_y': piecewise['tile_y'],
+                'tile_x': piecewise['tile_x'],
+                'predicted_y': -piecewise['field_local_y'][penalty_i, frame_i],
+                'predicted_x': -piecewise['field_local_x'][penalty_i, frame_i],
+                'accepted': piecewise['field_accepted'][frame_i],
+                'spatial_penalty': piecewise['field_penalties'][penalty_i],
+                'magnitude_penalty': piecewise['field_magnitude_penalty'],
+                'tile_size': piecewise['tile_size'],
+                })
+
+        focus_evidence_available = any(
+            estimate['peak_ratio'] >= 1.1
+            and estimate['tile_disagreement'] <= 1
+            and not estimate['out_of_range']
+            for estimate in estimates)
+        if focus_evidence_available:
+            quality = measure_quality(
+                rigid['reference'],
+                control_frames,
+                estimates,
+                30,
+                timestamps=np.arange(len(sample), dtype=float) / 30,
+                )
+            focal_loss = quality['recommended_state'] == 'focal_loss'
+        else:
+            # 18 August 2026: auto stays rigid when these frames cannot calibrate focus evidence
+            focal_loss = np.ones(len(sample), dtype=bool)
+        decision = compare_registration_models(
+            rigid['reference'],
+            signal_frames,
+            control_frames,
+            estimates,
+            tile_results,
+            fields,
+            signal_to_control_offset=signal_to_control_offset,
+            focal_loss=focal_loss,
+            )
 
         with (case['root'] / 'metrics.csv').open() as file:
             metric_rows = list(DictReader(file))
         with (case['root'] / 'piecewise_metrics.csv').open() as file:
             metric_rows.extend(DictReader(file))
-        rigid_p95 = next(float(row['p95_error_px']) for row in metric_rows
-            if row['method'] == 'fibresight_rigid' and row['group'] == 'calibration')
-        piecewise_p95 = next(float(row['p95_error_px']) for row in metric_rows
-            if row['method'] == 'fibresight_piecewise' and row['group'] == 'calibration')
-        decision = select_registration_model(
-            {
-                'gradient_ncc': float(np.nanmean(rigid_ncc)),
-                'residual_p95_px': rigid_p95,
-                'valid_fraction': float(np.mean(rigid_valid)),
-                'cross_channel_residual_px': 0,
-                },
-            {
-                'gradient_ncc': float(np.nanmean(piecewise_ncc)),
-                'residual_p95_px': piecewise_p95,
-                'valid_fraction': float(np.mean(piecewise_valid)),
-                'cross_channel_residual_px': 0,
-                'accepted_or_fallback_fraction': 1,
-                },
-            )
         selected = decision['selected_model']
         selected_method = (
             'fibresight_piecewise' if selected == 'piecewise_rigid'
@@ -1040,11 +1107,24 @@ def measure_auto_suite(root=SUITE_ROOT):
         selected_p95 = next(float(row['p95_error_px']) for row in metric_rows
             if row['method'] == selected_method
             and row['group'] == 'heldout')
+        rigid_p95 = next(float(row['p95_error_px']) for row in metric_rows
+            if row['method'] == 'fibresight_rigid' and row['group'] == 'heldout')
+        piecewise_p95 = next(float(row['p95_error_px']) for row in metric_rows
+            if row['method'] == 'fibresight_piecewise' and row['group'] == 'heldout')
         rows.append({
             **{name: case[name] for name in (
                 'case_order', 'case', 'source', 'recipe')},
             'selected_model': selected,
             'heldout_p95_error_px': selected_p95,
+            'rigid_heldout_p95_error_px': rigid_p95,
+            'piecewise_heldout_p95_error_px': piecewise_p95,
+            'best_heldout_model': (
+                'piecewise_rigid' if piecewise_p95 < rigid_p95 else 'rigid'),
+            'selection_regret_px': selected_p95 - min(rigid_p95, piecewise_p95),
+            'signal_source': 'signal_movie' if signal_path.exists() else 'control_copy',
+            'focus_evidence_available': focus_evidence_available,
+            **{f'rigid_{name}': value for name, value in decision['rigid'].items()},
+            **{f'piecewise_{name}': value for name, value in decision['piecewise'].items()},
             **decision['comparison'],
             **{f'passed_{name}': value for name, value in decision['passed'].items()},
             })
@@ -1052,6 +1132,53 @@ def measure_auto_suite(root=SUITE_ROOT):
         writer = DictWriter(file, fieldnames=rows[0])
         writer.writeheader()
         writer.writerows(rows)
+
+
+def run_auto_validation(root=AUTO_ROOT, n_frames=1000):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    cases = auto_validation_cases(root)
+    with (root / 'cases.csv').open('w', newline='') as file:
+        writer = DictWriter(
+            file,
+            fieldnames=['case_order', 'case', 'source', 'recipe', 'seed', 'frames'],
+            )
+        writer.writeheader()
+        for case in cases:
+            writer.writerow({
+                **{name: case[name] for name in writer.fieldnames if name != 'frames'},
+                'frames': n_frames,
+                })
+
+    for case_i, case in enumerate(cases, start=1):
+        case_name = case['case']
+        print(f'{case_i:02d}/{len(cases)}  {case_name}')
+        benchmark.make_benchmark(
+            root=case['root'],
+            n_frames=n_frames,
+            seed=case['seed'],
+            source=case['source'],
+            recipe=case['recipe'],
+            save_signal=True,
+            )
+        benchmark.run_fibresight(case['root'])
+        benchmark.run_fibresight_tile_evidence(
+            case['root'],
+            name='fibresight_field_80_w0',
+            **FIELD_METHODS['fibresight_field_80_w0'],
+            )
+        benchmark.measure(
+            case['root'], ['fibresight_rigid'], compare_references=False)
+        benchmark.measure_tile_fields(
+            case['root'], ['fibresight_field_80_w0'])
+
+    measure_auto_suite(root, cases)
+    for case in cases:
+        # 18 August 2026: the seed and source reproduce these files; the table is the result
+        for path in case['root'].glob('*.tif'):
+            path.unlink()
+        for path in case['root'].glob('*.npz'):
+            path.unlink()
 
 
 def summarise_piecewise_suite(
@@ -2214,7 +2341,7 @@ def summarise_intensity_suite(root=INTENSITY_ROOT, figure_root=EXAMPLE_ROOT):
 #%% real recording
 def make_real_data(root=REAL_ROOT, raw_tiff=REAL_TIFF):
     import tifffile
-    from fibre_sight.preprocessing import read_tiffs
+    from fibre_sight.preprocessing import index_tiffs, read_tiffs
 
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -2228,10 +2355,10 @@ def make_real_data(root=REAL_ROOT, raw_tiff=REAL_TIFF):
     movie = tifffile.memmap(
         root / 'control.tif', shape=(n_frames, *shape), dtype=dtype,
         bigtiff=True, metadata=None, extratags=tiff_tags)
-    pairs = read_tiffs(
+    recording = index_tiffs(
         [raw_tiff], signal_channel=1, control_channel=2,
         sampling_frequency_hz=30, multiplexed=True)
-    for pair in pairs:
+    for pair in read_tiffs(recording):
         movie[pair['frame']] = pair['control']
     movie.flush()
     np.savez(
@@ -2929,6 +3056,7 @@ def main():
             'make-focal', 'run-focal', 'measure-focal',
             'run-piecewise', 'measure-piecewise',
             'measure-auto',
+            'validate-auto',
             'summarise-piecewise',
             'run-piecewise-intensity',
             'quality', 'review-rigid',
@@ -2980,6 +3108,8 @@ def main():
         measure_piecewise_suite(suite_root)
     elif args.step == 'measure-auto':
         measure_auto_suite(suite_root)
+    elif args.step == 'validate-auto':
+        run_auto_validation(args.root or AUTO_ROOT, args.frames)
     elif args.step == 'summarise-piecewise':
         summarise_piecewise_suite(suite_root, INTENSITY_ROOT)
     elif args.step == 'run-piecewise-intensity':

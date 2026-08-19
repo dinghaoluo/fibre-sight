@@ -90,7 +90,7 @@ The checkpoint was trained on channel-2 references acquired and processed within
 
 ### Can FibreSight start from a TIFF movie?
 
-Not yet. The current workbench begins with a precomputed two-dimensional `.npy` reference image and ends with an ROI dictionary. It does not yet register TIFF movies, generate reference images from a stack, or extract activity traces. `read_tiffs(...)` now covers the first step by reading signal and control pairs from numerically ordered TIFF chunks, including multiplexed ScanImage stacks and separate synchronous channel stacks.
+Yes, through the Python API. `preprocess_recording(...)` indexes paired TIFF pages, builds the reference, registers both channels with one shared motion estimate, and writes the movies and QC into NWB. The GUI still begins with a precomputed two-dimensional `.npy` reference image and ends with an ROI dictionary; activity-trace extraction belongs to the next stage.
 
 The current motion-correction comparisons and their pinned external environments are recorded in the [benchmark notes](BENCHMARK.md).
 

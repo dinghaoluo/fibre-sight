@@ -94,7 +94,9 @@ On the common 7 by 7 grid, FibreSight's mean held-out p95 error is 0.802346 px a
 
 CaImAn piecewise and PatchWarp affine failed enough public cases that their comparisons use seven complete sources. FibreSight's advantage is 1.028027 px against CaImAn (95% interval 0.391416 to 1.664638; 28 paired cases) and 1.173012 px against PatchWarp (0.400907 to 1.945117; 33 paired cases). The PyFlowReg comparison uses all ten sources and gives an advantage of 2.894895 px (0.579315 to 5.210474). These intervals describe the cases each method could estimate; the separate failure counts remain part of the result.
 
-Automatic model selection compares calibration-half gradient NCC, residual p95, valid area, cross-channel residual alignment, and accepted-or-fallback coverage. The control-only synthetic suite holds the cross-channel comparison neutral. `auto` selects piecewise registration for three cases and rigid registration for 37; its mean held-out p95 error is 0.630996 px.
+Automatic model selection compares calibration-half gradient NCC, spatially cross-validated tile-residual p95, valid area, measured signal/control residual alignment, and accepted-or-named-fallback coverage. Four interleaved tile folds fit on three spatial classes and score the fourth. Synthetic truth is opened afterwards, solely to score the choice. On the 40-case suite, whose saved movies contain only the control channel, `auto` selects piecewise registration for three cases and rigid registration for 37; its mean held-out p95 error is 0.630996 px.
+
+The independent validation uses a separate seed branch, 1,000 frames per case, and newly generated signal and control movies for the original three references and four motion recipes. `auto` selects piecewise registration in two of 12 cases, with both choices improving on rigid; the other ten cases retain rigid. Its mean held-out p95 error is 0.316378 px, compared with 0.435837 px for rigid, 0.245210 px for forced piecewise, and 0.192131 px for the lower-error model chosen afterwards from truth. The selector misses four piecewise gains, three during focal-change recipes and one during local deformation, because their gradient-NCC gains remain below the frozen 0.01 boundary. The largest missed gain is 0.586877 px. Every case supplies focus evidence, and the measured cross-channel residual passes every comparison. The generated channels share one static coordinate system; the coordinate direction for a non-zero signal/control offset is tested separately in `test_preprocessing.py`. I have kept the 0.01 boundary unchanged after this held-out inspection. `auto` therefore remains the planned default: this validation found no harmful escalation beyond rigid, although its conservative boundary leaves measurable piecewise improvement unused.
 
 Across the expanded suite, FibreSight's rigid and field subprocesses have a median combined wall time of 76.989 s. Maximum process RSS is 1.796 GiB for rigid registration and 1.321 GiB for the field pass, below the 2 GiB working limit. The 512-pixel sources determine both maxima.
 
@@ -216,6 +218,7 @@ python -m benchmarking.registration_benchmark_suite review-rigid
 python -m benchmarking.registration_benchmark_suite run-piecewise
 python -m benchmarking.registration_benchmark_suite measure-piecewise
 python -m benchmarking.registration_benchmark_suite measure-auto
+python -m benchmarking.registration_benchmark_suite validate-auto --frames 1000
 python -m benchmarking.registration_benchmark_suite run-piecewise-intensity --frames 2000
 python -m benchmarking.registration_benchmark_suite summarise-piecewise
 ```
@@ -302,12 +305,12 @@ The ignored real-data directory, `workspace/registration-benchmark-real/`, conta
 
 The ignored focal directory, `workspace/registration-benchmark-focal/`, contains the three controlled-defocus movies, truth arrays, FibreSight results, per-frame QC arrays, `focal_metrics.csv`, and `focal_threshold_calibration.csv`. The base suite's `quality` command writes `quality_metrics.csv` for the unrelated-anatomy diagnostic. Both commands keep every observation and report an `analysis_valid` mask; neither interpolates or deletes focal intervals.
 
-`add_quality_control_to_nwb(...)` can place the per-observation fields in an NWB file, whilst complete movie storage belongs to the later NWB stage.
+`preprocess_recording(...)` writes the registered signal and control movies, recording index, references, transforms, QC fields, focal intervals, and axial-similarity trace into one NWB file. The optional `benchmarking/nwb_storage_proof.py` replays the 200-frame float32/int16 comparison on the local `with-jumps` recording; that private recording is not required for the public synthetic benchmark.
 
 The NWB locations are fixed as follows:
 
-- `processing['quality_control']['rigid_registration_qc']` is a `DynamicTable` with one row per paired observation. Its columns are `dx_px`, `dy_px`, `displacement_magnitude_px`, `peak_ratio`, `tile_disagreement_px`, `canonical_gradient_ncc`, `local_gradient_ncc`, `high_frequency_fraction`, `spatial_correlation`, `temporal_difference`, `control_gain`, `control_offset`, `valid_pixel_fraction`, `search_boundary`, `detector_artifact`, `timing_fault`, `local_reference_fallback`, `threshold_calibration`, `recommended_state`, `reason_code`, and `analysis_valid`.
-- `processing['quality_control']['rigid_registration_thresholds']` is a one-row `DynamicTable` containing the five exact, recording-specific classification boundaries and their MAD factor.
+- `processing['quality_control']['registration_qc']` is a `DynamicTable` with one row per paired observation. Its columns are `dx_px`, `dy_px`, `displacement_magnitude_px`, `peak_ratio`, `tile_disagreement_px`, `canonical_gradient_ncc`, `local_gradient_ncc`, `high_frequency_fraction`, `spatial_correlation`, `temporal_difference`, `control_gain`, `control_offset`, `valid_pixel_fraction`, `search_boundary`, `detector_artifact`, `timing_fault`, `local_reference_fallback`, `threshold_calibration`, `recommended_state`, `reason_code`, and `analysis_valid`.
+- `processing['quality_control']['registration_thresholds']` is a one-row `DynamicTable` containing the five exact, recording-specific classification boundaries and their MAD factor.
 - `processing['quality_control']['axial_similarity']` is a `TimeSeries` with unit `dimensionless`; each value is the centred 60 s rolling mean of canonical gradient-NCC (1,800 observations at uninterrupted 30 Hz) and is a similarity trace, not a calibrated z displacement.
 - `nwbfile.intervals['focal_loss']` is a `TimeIntervals` table with `start_time`, `stop_time`, `duration_s`, `duration_class`, `reason_code`, and `n_frames`. Focal candidates separated by at most 0.10 s are merged, then labelled `brief`, `transient`, or `sustained` using the 0.25 s and 0.50 s boundaries.
 

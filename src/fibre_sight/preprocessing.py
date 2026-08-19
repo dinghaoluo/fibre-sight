@@ -1,6 +1,7 @@
 '''
 Created on 14 August 2026
 Modified on 18 August 2026
+Modified on 19 August 2026
 
 read paired TIFF frames, correct rigid and piecewise movement, and record registration QC
 
@@ -9,20 +10,35 @@ read paired TIFF frames, correct rigid and piecewise movement, and record regist
 
 #%% imports
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
 from functools import cache, partial
+import hashlib
+from itertools import groupby, islice
+import json
+import os
 from pathlib import Path
 import re
+import tempfile
+from time import perf_counter
 
 import cv2
+import h5py
+from hdmf.backends.hdf5.h5_utils import H5DataIO
+from hdmf.common import DynamicTable
 import numpy as np
+from pynwb import NWBFile, NWBHDF5IO, TimeSeries, validate
+from pynwb.base import Images
+from pynwb.image import GrayscaleImage, ImageSeries
 from scipy import fft, ndimage as ndi
 from scipy.interpolate import RegularGridInterpolator
 from scipy.signal.windows import tukey
 import tifffile
 
 
-#%% TIFF metadata
+#%% TIFF order
 _NUMBER = re.compile(r'(\d+)')
+_SCANIMAGE_EPOCH = re.compile(r'^epoch\s*=\s*\[([^]]+)]', re.MULTILINE)
 
 
 def _sort_tiffs(paths):
@@ -35,53 +51,16 @@ def _sort_tiffs(paths):
     return sorted((Path(path) for path in paths), key=sort_key)
 
 
-def _description_value(description, name):
-    match = re.search(rf'^{re.escape(name)}\s*=\s*(.+?)\s*$', description, re.MULTILINE)
-    return match.group(1) if match else None
-
-
-def _saved_channels(page):
-    software = page.tags.get('Software')
-    if software is None:
-        return None
-    value = _description_value(str(software.value), 'SI.hChannels.channelSave')
-    if value is None:
-        return None
-    return tuple(int(number) for number in re.findall(r'\d+', value))
-
-
-def _frame_info(page):
-    description = page.description or ''
-    frame = _description_value(description, 'frameNumbers')
-    time_s = _description_value(description, 'frameTimestamps_sec')
-    return (
-        int(frame) if frame is not None else None,
-        float(time_s) if time_s is not None else None,
-        )
-
-
 #%% page pairing
 def _multiplexed_pairs(tiff_files, signal_channel, control_channel):
-    channel_order = None
+    # 19 August 2026: channels are the two visible positions in each TIFF pair
+    signal_offset = signal_channel - 1
+    control_offset = control_channel - 1
     for path in tiff_files:
         with tifffile.TiffFile(path) as tiff:
-            channels = _saved_channels(tiff.pages[0])
-            if channels is None:
-                raise ValueError(f'missing ScanImage channelSave metadata: {path}')
-            if len(channels) != 2 or set(channels) != {signal_channel, control_channel}:
-                raise ValueError(
-                    f'saved channels {channels} do not match '
-                    f'{signal_channel}/{control_channel}: {path}'
-                    )
-            if channel_order is None:
-                channel_order = channels
-            elif channels != channel_order:
-                raise ValueError(f'saved channel order changes from {channel_order} to {channels}')
             if len(tiff.pages) % 2:
                 raise ValueError(f'incomplete signal/control pair: {path}')
 
-            signal_offset = channels.index(signal_channel)
-            control_offset = channels.index(control_channel)
             for page_i in range(0, len(tiff.pages), 2):
                 yield (
                     tiff.pages[page_i + signal_offset],
@@ -115,8 +94,8 @@ def _separate_pairs(signal_tiffs, control_tiffs):
                     )
 
 
-#%% reader
-def read_tiffs(
+#%% recording index
+def index_tiffs(
         signal_tiffs,
         *,
         signal_channel,
@@ -124,11 +103,15 @@ def read_tiffs(
         sampling_frequency_hz,
         multiplexed=True,
         control_tiffs=None,
+        signal_label=None,
+        control_label=None,
         ):
     if signal_channel < 1 or control_channel < 1 or signal_channel == control_channel:
         raise ValueError('signal and control channels must be different one-based numbers')
     if sampling_frequency_hz <= 0:
         raise ValueError('sampling_frequency_hz must be positive')
+    if multiplexed and {signal_channel, control_channel} != {1, 2}:
+        raise ValueError('multiplexed channel numbers must be 1 and 2')
 
     signal_tiffs = _sort_tiffs(signal_tiffs)
     if not signal_tiffs:
@@ -136,6 +119,7 @@ def read_tiffs(
 
     if multiplexed:
         pairs = _multiplexed_pairs(signal_tiffs, signal_channel, control_channel)
+        control_tiffs = signal_tiffs
     else:
         if control_tiffs is None:
             raise ValueError('control_tiffs is required for separate TIFFs')
@@ -144,7 +128,8 @@ def read_tiffs(
 
     shape = None
     dtype = None
-    prev_time = None
+    frames = []
+    # 19 August 2026: page order is the record; ScanImage counters may restart between chunks
     for frame, pair in enumerate(pairs):
         signal_page, control_page, signal_path, control_path, signal_i, control_i = pair
         if signal_page.shape != control_page.shape or signal_page.dtype != control_page.dtype:
@@ -155,39 +140,96 @@ def read_tiffs(
         elif signal_page.shape != shape or signal_page.dtype != dtype:
             raise ValueError('TIFF frame shape or dtype changes within the recording')
 
-        signal_frame, signal_time = _frame_info(signal_page)
-        control_frame, control_time = _frame_info(control_page)
-        if (
-                signal_frame is not None
-                and control_frame is not None
-                and signal_frame != control_frame
-                ):
-            raise ValueError('paired ScanImage frames have different frame numbers')
-        if (
-                signal_time is not None
-                and control_time is not None
-                and signal_time != control_time
-                ):
-            raise ValueError('paired ScanImage frames have different timestamps')
-
-        time_s = signal_time if signal_time is not None else control_time
-        if time_s is None:
-            time_s = 0.0 if prev_time is None else prev_time + 1 / sampling_frequency_hz
-        if prev_time is not None:
-            if time_s <= prev_time:
-                raise ValueError('TIFF timestamps do not increase')
-
-        yield {
+        frames.append({
             'frame': frame,
-            'time_s': time_s,
-            'signal': signal_page.asarray(),
-            'control': control_page.asarray(),
             'signal_tiff': signal_path,
             'control_tiff': control_path,
             'signal_page': signal_i,
             'control_page': control_i,
+            })
+
+    return {
+        'sampling_frequency_hz': float(sampling_frequency_hz),
+        'multiplexed': bool(multiplexed),
+        'signal_channel': int(signal_channel),
+        'control_channel': int(control_channel),
+        'signal_label': signal_label,
+        'control_label': control_label,
+        'shape': tuple(shape),
+        'dtype': np.dtype(dtype),
+        'signal_tiffs': tuple(signal_tiffs),
+        'control_tiffs': tuple(control_tiffs),
+        'n_frames': len(frames),
+        'frames': frames,
         }
-        prev_time = time_s
+
+
+#%% reader
+def read_tiffs(recording):
+    path_pair = lambda frame: (frame['signal_tiff'], frame['control_tiff'])
+    for paths, frames in groupby(recording['frames'], key=path_pair):
+        signal_path, control_path = paths
+        with ExitStack() as stack:
+            signal_tiff = stack.enter_context(tifffile.TiffFile(signal_path))
+            control_tiff = (
+                signal_tiff if signal_path == control_path
+                else stack.enter_context(tifffile.TiffFile(control_path))
+                )
+            for frame in frames:
+                yield {
+                    **frame,
+                    'signal': signal_tiff.pages[frame['signal_page']].asarray(),
+                    'control': control_tiff.pages[frame['control_page']].asarray(),
+                    }
+
+
+#%% acquisition time
+def read_session_start_time(path):
+    path = Path(path)
+    local_timezone = datetime.now().astimezone().tzinfo
+    with tifffile.TiffFile(path) as tiff:
+        page = tiff.pages[0]
+        match = _SCANIMAGE_EPOCH.search(page.description or '')
+        if match:
+            values = [float(value) for value in match.group(1).split()]
+            if len(values) != 6:
+                raise ValueError(f'unexpected ScanImage epoch in {path}')
+            seconds = int(values[5])
+            start_time = datetime(
+                *(int(value) for value in values[:5]), seconds,
+                tzinfo=local_timezone,
+                ) + timedelta(microseconds=round((values[5] - seconds) * 1e6))
+            return start_time, {
+                'source': 'ScanImage epoch',
+                'raw_value': match.group(1),
+                'timezone': str(local_timezone),
+                }
+
+        datetime_tag = page.tags.get('DateTime')
+        if datetime_tag is not None:
+            raw_value = str(datetime_tag.value)
+            start_time = datetime.strptime(
+                raw_value, '%Y:%m:%d %H:%M:%S').replace(tzinfo=local_timezone)
+            return start_time, {
+                'source': 'TIFF DateTime',
+                'raw_value': raw_value,
+                'timezone': str(local_timezone),
+                }
+
+    modified_time = path.stat().st_mtime
+    if np.isfinite(modified_time):
+        return datetime.fromtimestamp(modified_time, timezone.utc), {
+            'source': 'file modification time',
+            'raw_value': str(modified_time),
+            'timezone': 'UTC',
+            }
+
+    # 19 August 2026: Cajal's birthday is unambiguously not an acquisition time
+    return datetime(1852, 5, 1, tzinfo=timezone.utc), {
+        'source': 'Santiago Ramon y Cajal birthday fallback',
+        'raw_value': '1852-05-01',
+        'timezone': 'UTC',
+        }
 
 
 #%% rigid registration
@@ -988,7 +1030,7 @@ def field_coordinates(field, shape, rigid_shift=(0, 0), static_offset=(0, 0)):
 
 
 def warp_frame_piecewise(frame, field, rigid_shift=(0, 0), static_offset=(0, 0)):
-    source_y, source_x, valid, bounds = field_coordinates(
+    source_y, source_x, valid, _ = field_coordinates(
         field, frame.shape, rigid_shift, static_offset)
     registered = cv2.remap(
         np.asarray(frame, dtype=np.float32),
@@ -998,7 +1040,14 @@ def warp_frame_piecewise(frame, field, rigid_shift=(0, 0), static_offset=(0, 0))
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=np.nan,
         )
+    # 19 August 2026: OpenCV's 1/32-pixel interpolation can sample the border just inside an edge
+    valid &= np.isfinite(registered)
     registered[~valid] = np.nan
+    rows, columns = np.nonzero(valid)
+    bounds = (
+        int(rows.min()), int(rows.max() + 1),
+        int(columns.min()), int(columns.max() + 1),
+        )
     return registered, bounds, valid
 
 
@@ -1311,9 +1360,11 @@ def make_reference(
         }
 
 
-def _gradient_ncc(first, second):
-    first = np.hypot(ndi.sobel(first, axis=0), ndi.sobel(first, axis=1))
-    second = np.hypot(ndi.sobel(second, axis=0), ndi.sobel(second, axis=1))
+def _gradient_image(image):
+    return np.hypot(ndi.sobel(image, axis=0), ndi.sobel(image, axis=1))
+
+
+def _ncc(first, second):
     valid = np.isfinite(first) & np.isfinite(second)
     if not valid.any():
         return np.nan
@@ -1321,6 +1372,10 @@ def _gradient_ncc(first, second):
     second = second[valid] - second[valid].mean()
     power = np.sqrt(np.dot(first, first) * np.dot(second, second))
     return float(np.dot(first, second) / power) if power else np.nan
+
+
+def _gradient_ncc(first, second):
+    return _ncc(_gradient_image(first), _gradient_image(second))
 
 
 #%% motion and focal QC
@@ -1337,7 +1392,13 @@ def _high_frequency_image(image):
 
 def _high_frequency_fraction(reference_detail, image):
     valid = np.isfinite(image)
-    interior = ndi.binary_erosion(valid, iterations=8)
+    interior = cv2.erode(
+        valid.astype(np.uint8),
+        np.asarray([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8),
+        iterations=8,
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0,
+        ).astype(bool)
     if not interior.any():
         return np.nan
     image_detail = _high_frequency_image(image)
@@ -1481,8 +1542,11 @@ def make_local_references(
         reference_index[frame_indices] = len(references) - 1
     return {
         'images': np.asarray(references),
+        'gradient_images': np.asarray([
+            _gradient_image(image) for image in references]),
         'reference_index': reference_index,
         'canonical_fallback': np.asarray(canonical_fallback, dtype=bool),
+        'window': np.unique(window_index),
         }
 
 
@@ -1492,46 +1556,22 @@ def _temporal_difference(first, second):
         return np.nan
     first = first[valid]
     second = second[valid]
-    first_mad = np.median(np.abs(first - np.median(first)))
-    second_mad = np.median(np.abs(second - np.median(second)))
+    first_centre = np.median(first)
+    second_centre = np.median(second)
+    first_mad = np.median(np.abs(first - first_centre))
+    second_mad = np.median(np.abs(second - second_centre))
     if not first_mad or not second_mad:
         return np.nan
-    first = (first - np.median(first)) / first_mad
-    second = (second - np.median(second)) / second_mad
+    first = (first - first_centre) / first_mad
+    second = (second - second_centre) / second_mad
     return float(np.sqrt(np.mean((first - second) ** 2)))
 
 
-def measure_quality(
-        reference,
-        frames,
-        estimates,
-        sampling_frequency_hz,
-        *,
-        calibration_mask=None,
-        focal_mads=2,
-        local_references=None,
-        timestamps=None,
-        write_registered=None,
-        ):
-    n_frames = len(frames)
-    if calibration_mask is not None:
-        calibration_mask = np.asarray(calibration_mask, dtype=bool)
-        if calibration_mask.shape != (n_frames,):
-            raise ValueError('calibration_mask must have one value per frame')
-        if not calibration_mask.any():
-            raise ValueError('no usable frames for QC calibration')
-    timestamps = (
-        np.arange(n_frames, dtype=float) / sampling_frequency_hz
-        if timestamps is None else np.asarray(timestamps, dtype=float)
-        )
-    if local_references is None:
-        local_references = make_local_references(
-            reference, frames, estimates, sampling_frequency_hz,
-            timestamps=timestamps)
+def _new_quality_fields(n_frames, timestamps, sampling_frequency_hz):
     frame_period = 1 / sampling_frequency_hz
     timing_fault = np.zeros(n_frames, dtype=bool)
     timing_fault[1:] = np.abs(np.diff(timestamps) - frame_period) > frame_period / 2
-    fields = {
+    return {
         'time_s': timestamps,
         'dx_px': np.empty(n_frames, dtype=np.float32),
         'dy_px': np.empty(n_frames, dtype=np.float32),
@@ -1552,55 +1592,78 @@ def measure_quality(
         'local_reference_fallback': np.empty(n_frames, dtype=bool),
         'recommended_state': np.empty(n_frames, dtype=object),
         'reason_code': np.empty(n_frames, dtype=object),
-    }
-    outside_search = np.empty(n_frames, dtype=bool)
-    previous_registered = None
-    reference_detail = _high_frequency_image(reference)
+        '_outside_search': np.empty(n_frames, dtype=bool),
+        }
 
-    for frame_i, (frame, estimate) in enumerate(zip(frames, estimates)):
-        registered, bounds = warp_frame(
-            frame, estimate['shift_y'], estimate['shift_x'])
-        local_i = local_references['reference_index'][frame_i]
-        local_reference = local_references['images'][local_i]
-        canonical_ncc = _gradient_ncc(reference, registered)
-        local_ncc = _gradient_ncc(local_reference, registered)
-        high_frequency = _high_frequency_fraction(reference_detail, registered)
-        spatial_correlation = _spatial_correlation(registered)
-        gain, offset = _gain_offset(reference, registered)
-        y0, y1, x0, x1 = bounds
-        valid_fraction = (y1 - y0) * (x1 - x0) / frame.size
-        limits = np.iinfo(frame.dtype) if np.issubdtype(frame.dtype, np.integer) else None
-        saturation = (
-            np.mean((frame == limits.min) | (frame == limits.max))
-            if limits is not None else 0
-            )
-        detector_artifact = frame.min() == frame.max() or saturation > 0.01
-        search_boundary = estimate['search_boundary']
 
-        fields['dx_px'][frame_i] = estimate['shift_x']
-        fields['dy_px'][frame_i] = estimate['shift_y']
-        fields['displacement_magnitude_px'][frame_i] = np.hypot(
-            estimate['shift_y'], estimate['shift_x'])
-        fields['peak_ratio'][frame_i] = estimate['peak_ratio']
-        fields['tile_disagreement_px'][frame_i] = estimate['tile_disagreement']
-        fields['canonical_gradient_ncc'][frame_i] = canonical_ncc
-        fields['local_gradient_ncc'][frame_i] = local_ncc
-        fields['high_frequency_fraction'][frame_i] = high_frequency
-        fields['spatial_correlation'][frame_i] = spatial_correlation
-        if previous_registered is not None:
-            fields['temporal_difference'][frame_i] = _temporal_difference(
-                previous_registered, registered)
-        fields['control_gain'][frame_i] = gain
-        fields['control_offset'][frame_i] = offset
-        fields['valid_pixel_fraction'][frame_i] = valid_fraction
-        fields['search_boundary'][frame_i] = search_boundary
-        fields['detector_artifact'][frame_i] = detector_artifact
-        fields['local_reference_fallback'][frame_i] = (
-            local_references['canonical_fallback'][local_i])
-        outside_search[frame_i] = estimate['out_of_range'] or search_boundary
-        if write_registered is not None:
-            write_registered(frame_i, registered, bounds)
-        previous_registered = registered
+def _measure_registered_quality(
+        fields,
+        frame_i,
+        raw_control,
+        registered_control,
+        estimate,
+        reference,
+        reference_detail,
+        reference_gradient,
+        local_references,
+        previous_registered,
+        ):
+    local_i = local_references['reference_index'][frame_i]
+    gain, offset = _gain_offset(reference, registered_control)
+    valid = np.isfinite(registered_control)
+    limits = (
+        np.iinfo(raw_control.dtype)
+        if np.issubdtype(raw_control.dtype, np.integer) else None)
+    saturation = (
+        np.mean((raw_control == limits.min) | (raw_control == limits.max))
+        if limits is not None else 0)
+
+    fields['dx_px'][frame_i] = estimate['shift_x']
+    fields['dy_px'][frame_i] = estimate['shift_y']
+    fields['displacement_magnitude_px'][frame_i] = np.hypot(
+        estimate['shift_y'], estimate['shift_x'])
+    fields['peak_ratio'][frame_i] = estimate['peak_ratio']
+    fields['tile_disagreement_px'][frame_i] = estimate['tile_disagreement']
+    registered_gradient = _gradient_image(registered_control)
+    fields['canonical_gradient_ncc'][frame_i] = _ncc(
+        reference_gradient, registered_gradient)
+    fields['local_gradient_ncc'][frame_i] = _ncc(
+        local_references['gradient_images'][local_i], registered_gradient)
+    fields['high_frequency_fraction'][frame_i] = _high_frequency_fraction(
+        reference_detail, registered_control)
+    fields['spatial_correlation'][frame_i] = _spatial_correlation(registered_control)
+    if previous_registered is not None:
+        fields['temporal_difference'][frame_i] = _temporal_difference(
+            previous_registered, registered_control)
+    fields['control_gain'][frame_i] = gain
+    fields['control_offset'][frame_i] = offset
+    fields['valid_pixel_fraction'][frame_i] = valid.mean()
+    fields['search_boundary'][frame_i] = estimate['search_boundary']
+    fields['detector_artifact'][frame_i] = (
+        raw_control.min() == raw_control.max() or saturation > 0.01)
+    fields['local_reference_fallback'][frame_i] = (
+        local_references['canonical_fallback'][local_i])
+    fields['_outside_search'][frame_i] = (
+        estimate['out_of_range'] or estimate['search_boundary'])
+    return registered_control
+
+
+def _finish_quality(
+        fields,
+        estimates,
+        sampling_frequency_hz,
+        *,
+        calibration_mask=None,
+        focal_mads=2,
+        local_references=None,
+        ):
+    n_frames = len(estimates)
+    if calibration_mask is not None:
+        calibration_mask = np.asarray(calibration_mask, dtype=bool)
+        if calibration_mask.shape != (n_frames,):
+            raise ValueError('calibration_mask must have one value per frame')
+        if not calibration_mask.any():
+            raise ValueError('no usable frames for QC calibration')
 
     credible_motion = (
         np.isfinite(fields['peak_ratio'])
@@ -1608,6 +1671,7 @@ def measure_quality(
         & np.isfinite(fields['tile_disagreement_px'])
         & (fields['tile_disagreement_px'] <= 1.0)
         )
+    outside_search = fields.pop('_outside_search')
     baseline = (
         ~fields['detector_artifact']
         & ~fields['timing_fault']
@@ -1616,8 +1680,8 @@ def measure_quality(
         )
     if calibration_mask is not None:
         baseline &= calibration_mask
-    # 17 August 2026: two MADs was the strongest controlled-defocus boundary which
-    # kept all 153 calibration focal frames and gave no ordinary-frame false positives
+    # 17 August 2026: two MADs retained every calibration focal frame without
+    # ordinary-frame false positives in the controlled-defocus benchmark
     thresholds = _quality_thresholds(fields, baseline, focal_mads)
     if not np.isfinite(list(thresholds.values())).all():
         raise ValueError('no usable frames for QC calibration')
@@ -1648,10 +1712,10 @@ def measure_quality(
                 else 'outside_search_range')
             state = 'out_of_range'
         elif focal_candidates[frame_i]:
-            # 17 August 2026: four focal measurements retain focal_loss when lateral confidence fails
+            # 17 August 2026: four measurements retain focal_loss when lateral confidence fails
             reasons.extend(motion_reasons)
-            reasons.append('low_canonical_similarity')
             reasons.extend((
+                'low_canonical_similarity',
                 'low_local_similarity',
                 'low_high_frequency_fraction',
                 'low_control_gain',
@@ -1673,13 +1737,72 @@ def measure_quality(
     axial_input = fields['canonical_gradient_ncc'].copy()
     axial_input[fields['detector_artifact'] | outside_search] = np.nan
     fields['axial_similarity'] = rolling_axial_similarity(
-        axial_input, sampling_frequency_hz, timestamps=timestamps)
+        axial_input, sampling_frequency_hz, timestamps=fields['time_s'])
     fields['focal_loss_episodes'] = focal_loss_episodes(
         fields['recommended_state'], sampling_frequency_hz,
-        timestamps=timestamps, reason_codes=fields['reason_code'])
+        timestamps=fields['time_s'], reason_codes=fields['reason_code'])
     fields['local_references'] = local_references
     fields['thresholds'] = {**thresholds, 'focal_mads': float(focal_mads)}
     return fields
+
+
+def measure_quality(
+        reference,
+        frames,
+        estimates,
+        sampling_frequency_hz,
+        *,
+        calibration_mask=None,
+        focal_mads=2,
+        local_references=None,
+        timestamps=None,
+        write_registered=None,
+        ):
+    n_frames = len(frames)
+    if calibration_mask is not None:
+        calibration_mask = np.asarray(calibration_mask, dtype=bool)
+        if calibration_mask.shape != (n_frames,):
+            raise ValueError('calibration_mask must have one value per frame')
+        if not calibration_mask.any():
+            raise ValueError('no usable frames for QC calibration')
+    timestamps = (
+        np.arange(n_frames, dtype=float) / sampling_frequency_hz
+        if timestamps is None else np.asarray(timestamps, dtype=float)
+        )
+    if local_references is None:
+        local_references = make_local_references(
+            reference, frames, estimates, sampling_frequency_hz,
+            timestamps=timestamps)
+    fields = _new_quality_fields(n_frames, timestamps, sampling_frequency_hz)
+    previous_registered = None
+    reference_detail = _high_frequency_image(reference)
+    reference_gradient = _gradient_image(reference)
+
+    for frame_i, (frame, estimate) in enumerate(zip(frames, estimates)):
+        registered, bounds = warp_frame(
+            frame, estimate['shift_y'], estimate['shift_x'])
+        previous_registered = _measure_registered_quality(
+            fields,
+            frame_i,
+            frame,
+            registered,
+            estimate,
+            reference,
+            reference_detail,
+            reference_gradient,
+            local_references,
+            previous_registered,
+            )
+        if write_registered is not None:
+            write_registered(frame_i, registered, bounds)
+    return _finish_quality(
+        fields,
+        estimates,
+        sampling_frequency_hz,
+        calibration_mask=calibration_mask,
+        focal_mads=focal_mads,
+        local_references=local_references,
+        )
 
 
 def rolling_axial_similarity(
@@ -1776,16 +1899,14 @@ def focal_loss_episodes(
 
 
 def add_quality_control_to_nwb(nwbfile, quality):
-    from hdmf.common import DynamicTable
-    from pynwb import TimeSeries
-
     module = nwbfile.create_processing_module(
         name='quality_control',
         description='per-frame registration and focal-loss measurements',
         )
     table = DynamicTable(
-        name='rigid_registration_qc',
+        name='registration_qc',
         description='one row for each paired signal/control observation',
+        id=np.arange(len(quality['time_s'])),
         )
     # 17 August 2026: dy_px stores shift_y; dx_px stores shift_x
     descriptions = {
@@ -1815,14 +1936,8 @@ def add_quality_control_to_nwb(nwbfile, quality):
         'analysis_valid': 'true only for the accepted state',
         }
     for name, description in descriptions.items():
-        table.add_column(name=name, description=description)
-    for frame_i in range(len(quality['time_s'])):
-        table.add_row(**{
-            name: quality[name][frame_i].item()
-            if isinstance(quality[name][frame_i], np.generic)
-            else quality[name][frame_i]
-            for name in descriptions
-            })
+        table.add_column(
+            name=name, description=description, data=quality[name])
     module.add(table)
 
     threshold_descriptions = {
@@ -1834,7 +1949,7 @@ def add_quality_control_to_nwb(nwbfile, quality):
         'focal_mads': 'MAD distance used for the four focal-loss boundaries',
         }
     threshold_table = DynamicTable(
-        name='rigid_registration_thresholds',
+        name='registration_thresholds',
         description='thresholds learned from this recording',
         )
     for name, description in threshold_descriptions.items():
@@ -1874,8 +1989,12 @@ def estimate_channel_offset(signal_frames, control_frames, *, whitening=0):
     quarter_shifts = []
     references = []
     for indices in np.array_split(np.arange(len(signal_frames)), 4):
-        signal_reference = np.nanmean(signal_frames[indices], axis=0)
-        control_reference = np.nanmean(control_frames[indices], axis=0)
+        signal_reference = _mean_registered(signal_frames[indices])
+        control_reference = _mean_registered(control_frames[indices])
+        signal_reference = np.where(
+            np.isfinite(signal_reference), signal_reference, np.nanmedian(signal_reference))
+        control_reference = np.where(
+            np.isfinite(control_reference), control_reference, np.nanmedian(control_reference))
         estimate = estimate_shift(
             control_reference, signal_reference, whitening=whitening, check_tiles=False)
         quarter_shifts.append([estimate['shift_y'], estimate['shift_x']])
@@ -1905,10 +2024,38 @@ def estimate_channel_offset(signal_frames, control_frames, *, whitening=0):
         }
 
 
-def register_pair(signal, control, shift_y, shift_x, signal_offset=(0, 0)):
-    control_registered, control_bounds = warp_frame(control, shift_y, shift_x)
-    signal_shift = shift_y + signal_offset[0], shift_x + signal_offset[1]
-    signal_registered, signal_bounds = warp_frame(signal, *signal_shift)
+def _channel_corrections(
+        shift_y,
+        shift_x,
+        signal_to_control_offset,
+        registration_channel,
+        ):
+    dynamic = np.asarray([shift_y, shift_x], dtype=np.float32)
+    static = np.asarray(signal_to_control_offset, dtype=np.float32)
+    if registration_channel == 'control':
+        return dynamic + static, dynamic
+    if registration_channel == 'signal':
+        return dynamic, dynamic - static
+    raise ValueError('registration_channel must be \'signal\' or \'control\'')
+
+
+def register_pair(
+        signal,
+        control,
+        shift_y,
+        shift_x,
+        signal_to_control_offset=(0, 0),
+        *,
+        registration_channel='control',
+        ):
+    signal_correction, control_correction = _channel_corrections(
+        shift_y,
+        shift_x,
+        signal_to_control_offset,
+        registration_channel,
+        )
+    signal_registered, signal_bounds = warp_frame(signal, *signal_correction)
+    control_registered, control_bounds = warp_frame(control, *control_correction)
     return {
         'signal': signal_registered,
         'control': control_registered,
@@ -1923,20 +2070,36 @@ def register_pair_piecewise(
         shift_y,
         shift_x,
         field,
-        assessment,
-        signal_offset=(0, 0),
+        signal_to_control_offset=(0, 0),
+        *,
+        registration_channel='control',
+        focal_loss=False,
         ):
+    assessment = assess_tile_field(field, control.shape, focal_loss=focal_loss)
     if assessment['model_used'] == 'rigid':
         result = register_pair(
-            signal, control, shift_y, shift_x, signal_offset=signal_offset)
+            signal,
+            control,
+            shift_y,
+            shift_x,
+            signal_to_control_offset,
+            registration_channel=registration_channel,
+            )
         result['model_used'] = 'rigid'
         result['fallback_reason'] = assessment['fallback_reason']
+        result['assessment'] = assessment
         return result
 
-    control_registered, control_bounds, control_valid = warp_frame_piecewise(
-        control, field, (shift_y, shift_x))
+    signal_static, control_static = _channel_corrections(
+        0,
+        0,
+        signal_to_control_offset,
+        registration_channel,
+        )
     signal_registered, signal_bounds, signal_valid = warp_frame_piecewise(
-        signal, field, (shift_y, shift_x), signal_offset)
+        signal, field, (shift_y, shift_x), signal_static)
+    control_registered, control_bounds, control_valid = warp_frame_piecewise(
+        control, field, (shift_y, shift_x), control_static)
     return {
         'signal': signal_registered,
         'control': control_registered,
@@ -1946,4 +2109,1020 @@ def register_pair_piecewise(
         'control_valid': control_valid,
         'model_used': 'piecewise_rigid',
         'fallback_reason': 'accepted',
+        'assessment': assessment,
+        }
+
+
+def cross_validated_tile_residuals(tiles, field, shape):
+    evidence = (
+        {'accepted': tiles['accepted'], 'precision': tiles['precision']}
+        if 'accepted' in tiles else _tile_field_evidence(tiles)
+        )
+    accepted = evidence['accepted']
+    rigid_residual = np.hypot(
+        tiles['residual_y'][accepted], tiles['residual_x'][accepted])
+    piecewise_residual = np.empty(accepted.sum(), dtype=np.float32)
+    accepted_index = np.full(len(accepted), -1, dtype=int)
+    accepted_index[accepted] = np.arange(accepted.sum())
+
+    _, tile_row = np.unique(tiles['tile_y'], return_inverse=True)
+    _, tile_column = np.unique(tiles['tile_x'], return_inverse=True)
+    # 18 August 2026: four interleaved folds keep each test tile beside fitted evidence
+    folds = 2 * (tile_row % 2) + tile_column % 2
+    for fold in range(4):
+        test = accepted & (folds == fold)
+        training = accepted & (folds != fold)
+        training_evidence = {
+            'accepted': training,
+            'precision': evidence['precision'],
+            }
+        fitted = fit_tile_field(
+            tiles,
+            shape,
+            int(field['tile_size']),
+            spatial_penalty=float(field['spatial_penalty']),
+            magnitude_penalty=float(field['magnitude_penalty']),
+            evidence=training_evidence,
+            )
+        difference_y = fitted['predicted_y'][test] - tiles['residual_y'][test]
+        difference_x = fitted['predicted_x'][test] - tiles['residual_x'][test]
+        piecewise_residual[accepted_index[test]] = np.hypot(
+            difference_y, difference_x)
+    return rigid_residual, piecewise_residual
+
+
+def _mean_registered(frames):
+    frames = np.asarray(frames)
+    finite = np.isfinite(frames)
+    total = np.where(finite, frames, 0).sum(axis=0, dtype=np.float64)
+    count = finite.sum(axis=0)
+    return np.divide(
+        total,
+        count,
+        out=np.full(frames.shape[1:], np.nan, dtype=np.float64),
+        where=count > 0,
+        ).astype(np.float32)
+
+
+def _channel_residual(pairs):
+    residual = []
+    for indices in np.array_split(np.arange(len(pairs)), 4):
+        signal = _mean_registered([pairs[frame_i]['signal'] for frame_i in indices])
+        control = _mean_registered([pairs[frame_i]['control'] for frame_i in indices])
+        signal = np.where(np.isfinite(signal), signal, np.nanmedian(signal))
+        control = np.where(np.isfinite(control), control, np.nanmedian(control))
+        estimate = estimate_shift(control, signal, check_tiles=False)
+        if not estimate['out_of_range']:
+            residual.append(np.hypot(estimate['shift_y'], estimate['shift_x']))
+    return float(np.median(residual)) if residual else np.nan
+
+
+def compare_registration_models(
+        reference,
+        signal_frames,
+        control_frames,
+        rigid_estimates,
+        tile_results,
+        fields,
+        *,
+        signal_to_control_offset=(0, 0),
+        registration_channel='control',
+        focal_loss=None,
+        ):
+    n_frames = len(signal_frames)
+    if n_frames < 4:
+        raise ValueError('at least four calibration frames are required')
+    if not all(len(values) == n_frames for values in (
+            control_frames, rigid_estimates, tile_results, fields)):
+        raise ValueError('registration calibration inputs have different lengths')
+    focal_loss = (
+        np.zeros(n_frames, dtype=bool)
+        if focal_loss is None else np.asarray(focal_loss, dtype=bool)
+        )
+
+    rigid_pairs = []
+    piecewise_pairs = []
+    rigid_residuals = []
+    piecewise_residuals = []
+    named_fallback = []
+    for frame_i in range(n_frames):
+        estimate = rigid_estimates[frame_i]
+        rigid = register_pair(
+            signal_frames[frame_i],
+            control_frames[frame_i],
+            estimate['shift_y'],
+            estimate['shift_x'],
+            signal_to_control_offset,
+            registration_channel=registration_channel,
+            )
+        piecewise = register_pair_piecewise(
+            signal_frames[frame_i],
+            control_frames[frame_i],
+            estimate['shift_y'],
+            estimate['shift_x'],
+            fields[frame_i],
+            signal_to_control_offset,
+            registration_channel=registration_channel,
+            focal_loss=focal_loss[frame_i],
+            )
+        rigid_tile_residual, piecewise_tile_residual = (
+            cross_validated_tile_residuals(
+                tile_results[frame_i], fields[frame_i], reference.shape))
+        rigid_residuals.extend(rigid_tile_residual)
+        piecewise_residuals.extend(
+            rigid_tile_residual
+            if piecewise['model_used'] == 'rigid'
+            else piecewise_tile_residual)
+        rigid_pairs.append(rigid)
+        piecewise_pairs.append(piecewise)
+        named_fallback.append(piecewise['fallback_reason'] in {
+            'accepted',
+            'insufficient_tiles',
+            'focal_loss',
+            'field_overshoot',
+            'neighbour_disagreement',
+            'jacobian_limit',
+            })
+
+    def metrics(pairs, residuals):
+        registered = [pair[registration_channel] for pair in pairs]
+        valid_fraction = [
+            np.mean(np.isfinite(pair['signal']) & np.isfinite(pair['control']))
+            for pair in pairs]
+        return {
+            'gradient_ncc': float(np.nanmean([
+                _gradient_ncc(reference, frame) for frame in registered])),
+            'residual_p95_px': (
+                float(np.percentile(residuals, 95)) if residuals else np.nan),
+            'valid_fraction': float(np.mean(valid_fraction)),
+            'cross_channel_residual_px': _channel_residual(pairs),
+            }
+
+    rigid_metrics = metrics(rigid_pairs, rigid_residuals)
+    piecewise_metrics = metrics(piecewise_pairs, piecewise_residuals)
+    piecewise_metrics['accepted_or_fallback_fraction'] = float(np.mean(named_fallback))
+    decision = select_registration_model(rigid_metrics, piecewise_metrics)
+    return {
+        **decision,
+        'rigid': rigid_metrics,
+        'piecewise': piecewise_metrics,
+        }
+
+
+#%% full recording
+def _recording_frames(recording, frame_indices):
+    return {
+        **recording,
+        'frames': [recording['frames'][int(frame_i)] for frame_i in frame_indices],
+        'n_frames': len(frame_indices),
+        }
+
+
+def _sample_recording(recording, frame_indices, directory, include_signal=False):
+    shape = (len(frame_indices), *recording['shape'])
+    control = np.lib.format.open_memmap(
+        Path(directory) / 'control_sample.npy', mode='w+',
+        dtype=recording['dtype'], shape=shape)
+    signal = (
+        np.lib.format.open_memmap(
+            Path(directory) / 'signal_sample.npy', mode='w+',
+            dtype=recording['dtype'], shape=shape)
+        if include_signal else None)
+    for sample_i, pair in enumerate(read_tiffs(
+            _recording_frames(recording, frame_indices))):
+        if signal is not None:
+            signal[sample_i] = pair['signal']
+        control[sample_i] = pair['control']
+    if signal is not None:
+        signal.flush()
+    control.flush()
+    return signal, control
+
+
+def _load_calibration_frames(recording, frame_indices):
+    shape = (len(frame_indices), *recording['shape'])
+    signal = np.empty(shape, dtype=recording['dtype'])
+    control = np.empty(shape, dtype=recording['dtype'])
+    for frame_i, pair in enumerate(read_tiffs(
+            _recording_frames(recording, frame_indices))):
+        signal[frame_i] = pair['signal']
+        control[frame_i] = pair['control']
+    return signal, control
+
+
+def _registration_calibration(
+        recording,
+        reference,
+        registration_model,
+        registration_channel,
+        ):
+    calibration_indices = np.linspace(
+        0, max(3, recording['n_frames'] // 2 - 1),
+        min(100, max(4, recording['n_frames'] // 2)), dtype=int)
+    signal_frames, control_frames = _load_calibration_frames(
+        recording, calibration_indices)
+    motion_frames = (
+        control_frames if registration_channel == 'control' else signal_frames)
+    estimates = _estimate_shifts(_prepare_reference(reference), motion_frames)
+    aligned = [
+        register_pair(
+            signal, control, estimate['shift_y'], estimate['shift_x'],
+            registration_channel=registration_channel)
+        for signal, control, estimate in zip(
+            signal_frames, control_frames, estimates)
+        ]
+    channel_offset = estimate_channel_offset(
+        [pair['signal'] for pair in aligned],
+        [pair['control'] for pair in aligned],
+        )
+    signal_to_control_offset = (
+        channel_offset['shift_y'], channel_offset['shift_x'])
+
+    if registration_model == 'rigid':
+        return {
+            'selected_model': 'rigid',
+            'requested_model': registration_model,
+            'calibration_indices': calibration_indices,
+            'channel_offset': channel_offset,
+            'model_comparison': None,
+            'tile_reference': None,
+            }
+
+    # 19 August 2026: 80 px and penalty 10 are the settings carried by the
+    # ten-source piecewise benchmark into the production path
+    tile_size = min(80, min(reference.shape))
+    tile_reference = _prepare_tile_reference(reference, tile_size)
+    tile_results = []
+    fields = []
+    for frame, estimate in zip(motion_frames, estimates):
+        tiles = _estimate_tile_shifts(
+            tile_reference,
+            frame,
+            (estimate['shift_y'], estimate['shift_x']),
+            )
+        evidence = _tile_field_evidence(tiles)
+        field = fit_tile_field(
+            tiles,
+            reference.shape,
+            tile_size,
+            spatial_penalty=10,
+            magnitude_penalty=1,
+            evidence=evidence,
+            )
+        tile_results.append(tiles)
+        fields.append(field)
+    comparison = compare_registration_models(
+        reference,
+        signal_frames,
+        control_frames,
+        estimates,
+        tile_results,
+        fields,
+        signal_to_control_offset=signal_to_control_offset,
+        registration_channel=registration_channel,
+        )
+    selected_model = (
+        comparison['selected_model']
+        if registration_model == 'auto' else 'piecewise_rigid')
+    return {
+        'selected_model': selected_model,
+        'requested_model': registration_model,
+        'calibration_indices': calibration_indices,
+        'channel_offset': channel_offset,
+        'model_comparison': comparison,
+        'tile_reference': tile_reference,
+        }
+
+
+def _control_local_references(
+        control_reference,
+        registration_reference,
+        signal_sample,
+        control_sample,
+        sample_indices,
+        timestamps,
+        sampling_frequency_hz,
+        registration_channel,
+        channel_offset,
+        ):
+    motion_sample = (
+        control_sample if registration_channel == 'control' else signal_sample)
+    estimates = _estimate_shifts(
+        _prepare_reference(registration_reference), motion_sample)
+    signal_to_control_offset = (
+        channel_offset['shift_y'], channel_offset['shift_x'])
+    control_estimates = []
+    for estimate in estimates:
+        _, control_correction = _channel_corrections(
+            estimate['shift_y'],
+            estimate['shift_x'],
+            signal_to_control_offset,
+            registration_channel,
+            )
+        control_estimates.append({
+            **estimate,
+            'shift_y': float(control_correction[0]),
+            'shift_x': float(control_correction[1]),
+            })
+    sample_times = sample_indices / sampling_frequency_hz
+    sampled = make_local_references(
+        control_reference,
+        control_sample,
+        control_estimates,
+        sampling_frequency_hz,
+        timestamps=sample_times,
+        )
+    full_window = np.floor(
+        (timestamps - sample_times[0]) / 60).astype(np.int64)
+    # uniform reference sampling gives every one-minute interval at least one frame
+    reference_index = np.searchsorted(sampled['window'], full_window)
+    return {
+        **sampled,
+        'reference_index': reference_index.astype(np.int32),
+        }
+
+
+def _add_recording_tables(
+        module,
+        recording,
+        session_time_source,
+        pixel_size_um,
+        calibration,
+        ):
+    metadata = DynamicTable(
+        name='recording_metadata',
+        description='recording-level values used for preprocessing',
+        )
+    columns = {
+        'sampling_frequency_hz': 'paired observations per second',
+        'multiplexed': 'whether signal and control pages alternate in one TIFF',
+        'signal_channel': 'one-based signal position within each TIFF pair',
+        'control_channel': 'one-based control position within each TIFF pair',
+        'signal_label': 'signal-channel label',
+        'control_label': 'control-channel label',
+        'pixel_size_um': 'pixel width and height in micrometres; NaN when unknown',
+        'source_dtype': 'dtype of the raw TIFF pages',
+        'session_start_time_source': 'source used for the required NWB session time',
+        'session_start_time_raw': 'unparsed source value',
+        'session_start_time_timezone': 'timezone applied to the source value',
+        }
+    for name, description in columns.items():
+        metadata.add_column(name=name, description=description)
+    metadata.add_row(
+        sampling_frequency_hz=recording['sampling_frequency_hz'],
+        multiplexed=recording['multiplexed'],
+        signal_channel=recording['signal_channel'],
+        control_channel=recording['control_channel'],
+        signal_label=recording['signal_label'] or '',
+        control_label=recording['control_label'] or '',
+        pixel_size_um=np.nan if pixel_size_um is None else pixel_size_um,
+        source_dtype=str(recording['dtype']),
+        session_start_time_source=session_time_source['source'],
+        session_start_time_raw=session_time_source['raw_value'],
+        session_start_time_timezone=session_time_source['timezone'],
+        )
+    module.add(metadata)
+
+    source_tiffs = DynamicTable(
+        name='source_tiffs',
+        description='raw TIFF files forming the indexed recording',
+        )
+    source_tiffs.add_column(name='path', description='absolute TIFF path')
+    source_tiffs.add_column(
+        name='channel_role', description='signal, control, or signal/control')
+    source_tiffs.add_column(name='n_pages', description='number of TIFF pages')
+    source_tiffs.add_column(name='sha256', description='SHA-256 digest of the TIFF bytes')
+    signal_paths = set(recording['signal_tiffs'])
+    control_paths = set(recording['control_tiffs'])
+    for path in dict.fromkeys(recording['signal_tiffs'] + recording['control_tiffs']):
+        roles = []
+        if path in signal_paths:
+            roles.append('signal')
+        if path in control_paths:
+            roles.append('control')
+        with tifffile.TiffFile(path) as tiff:
+            n_pages = len(tiff.pages)
+        digest = hashlib.sha256()
+        with path.open('rb') as file:
+            while block := file.read(1024 ** 2):
+                digest.update(block)
+        source_tiffs.add_row(
+            path=str(path.resolve()),
+            channel_role='/'.join(roles),
+            n_pages=n_pages,
+            sha256=digest.hexdigest(),
+            )
+    module.add(source_tiffs)
+
+    frame_table = DynamicTable(
+        name='recording_index',
+        description='TIFF pages for each paired frame',
+        id=np.arange(recording['n_frames']),
+        )
+    frame_columns = {
+        'frame': ('zero-based paired frame in the source recording', [
+            frame['frame'] for frame in recording['frames']]),
+        'signal_tiff': ('absolute path of the signal TIFF', [
+            str(frame['signal_tiff'].resolve()) for frame in recording['frames']]),
+        'signal_page': ('zero-based signal page within that TIFF', [
+            frame['signal_page'] for frame in recording['frames']]),
+        'control_tiff': ('absolute path of the control TIFF', [
+            str(frame['control_tiff'].resolve()) for frame in recording['frames']]),
+        'control_page': ('zero-based control page within that TIFF', [
+            frame['control_page'] for frame in recording['frames']]),
+        }
+    for name, (description, data) in frame_columns.items():
+        frame_table.add_column(name=name, description=description, data=data)
+    module.add(frame_table)
+
+    offset = calibration['channel_offset']
+    channel_alignment = DynamicTable(
+        name='channel_alignment',
+        description='static signal-to-control translation',
+        )
+    for name, description in (
+            ('dy_px', 'applied signal-to-control correction along y'),
+            ('dx_px', 'applied signal-to-control correction along x'),
+            ('candidate_dy_px', 'median candidate correction along y'),
+            ('candidate_dx_px', 'median candidate correction along x'),
+            ('max_disagreement_px', 'largest quartile disagreement from the candidate'),
+            ('gradient_ncc_before', 'mean gradient NCC before alignment'),
+            ('gradient_ncc_after', 'mean gradient NCC after alignment'),
+            ('accepted', 'whether the candidate met both acceptance boundaries'),
+            ):
+        channel_alignment.add_column(name=name, description=description)
+    channel_alignment.add_row(
+        dy_px=offset['shift_y'],
+        dx_px=offset['shift_x'],
+        candidate_dy_px=offset['candidate_y'],
+        candidate_dx_px=offset['candidate_x'],
+        max_disagreement_px=offset['max_disagreement_px'],
+        gradient_ncc_before=offset['gradient_ncc_before'],
+        gradient_ncc_after=offset['gradient_ncc_after'],
+        accepted=offset['accepted'],
+        )
+    module.add(channel_alignment)
+
+    model = DynamicTable(
+        name='registration_model',
+        description='requested model and calibration decision',
+        )
+    for name, description in (
+            ('requested_model', 'rigid, piecewise or auto'),
+            ('selected_model', 'model used for the recording'),
+            ('calibration_frames', 'number of time-balanced calibration frames'),
+            ('comparison', 'JSON-encoded candidate metrics, thresholds and decisions'),
+            ):
+        model.add_column(name=name, description=description)
+    comparison = calibration['model_comparison']
+    model.add_row(
+        requested_model=calibration['requested_model'],
+        selected_model=calibration['selected_model'],
+        calibration_frames=len(calibration['calibration_indices']),
+        comparison=(
+            '' if comparison is None else json.dumps(
+                comparison, default=lambda value: value.item())),
+        )
+    module.add(model)
+
+
+def _new_preprocessing_file(
+        partial_path,
+        recording,
+        session_start_time,
+        session_time_source,
+        pixel_size_um,
+        control_reference,
+        registration_reference,
+        local_references,
+        calibration,
+        registration_channel,
+        ):
+    n_frames = recording['n_frames']
+    height, width = recording['shape']
+    timestamps = np.arange(n_frames, dtype=float) / recording['sampling_frequency_hz']
+    nwbfile = NWBFile(
+        session_description='FibreSight preprocessed recording',
+        identifier=f'fibre-sight-{partial_path.stem}-{session_start_time.isoformat()}',
+        session_start_time=session_start_time,
+        timestamps_reference_time=session_start_time,
+        )
+    module = nwbfile.create_processing_module(
+        name='preprocessing',
+        description='registered movies and the measurements used to create them',
+        )
+    paired_frames = TimeSeries(
+        name='paired_frames',
+        data=np.arange(n_frames, dtype=np.int64),
+        unit='frame',
+        timestamps=timestamps,
+        description='source frame number and paired-observation time',
+        )
+    module.add(paired_frames)
+    # 19 August 2026: NWB image axes are x, y; TIFF and NumPy images are row-y, column-x
+    for channel in ('signal', 'control'):
+        empty = np.empty((0, width, height), dtype=np.int16)
+        module.add(ImageSeries(
+            name=f'registered_{channel}',
+            data=H5DataIO(
+                empty,
+                chunks=(1, width, height),
+                maxshape=(None, width, height),
+                compression='gzip',
+                compression_opts=1,
+                shuffle=True,
+                fletcher32=True,
+            ),
+            unit='counts',
+            format='raw',
+            dimension=(width, height),
+            num_samples=np.uint64(n_frames),
+            timestamps=paired_frames,
+            description=f'registered {channel} movie; zero denotes pixels outside the valid area',
+            ))
+
+    images = [GrayscaleImage(
+        name='control_reference',
+        data=control_reference.T,
+        description='two-pass control-channel reference',
+        )]
+    if registration_channel == 'signal':
+        images.append(GrayscaleImage(
+            name='signal_reference',
+            data=registration_reference.T,
+            description='two-pass signal-channel registration reference',
+            ))
+    images.extend(GrayscaleImage(
+        name=f'local_control_reference_{reference_i:03d}',
+        data=reference.T,
+        description='control reference for one 60 s interval',
+        ) for reference_i, reference in enumerate(local_references['images']))
+    module.add(Images(
+        name='registration_references',
+        images=images,
+        description='canonical and local images used for registration QC',
+        ))
+    _add_recording_tables(
+        module,
+        recording,
+        session_time_source,
+        pixel_size_um,
+        calibration,
+        )
+
+    with NWBHDF5IO(partial_path, 'w') as io:
+        io.write(nwbfile)
+    with h5py.File(partial_path, 'r+') as file:
+        for channel in ('signal', 'control'):
+            file[f'processing/preprocessing/registered_{channel}/data'].resize(
+                (n_frames, width, height))
+
+
+def _int16_registered(frame):
+    valid = np.isfinite(frame)
+    rounded = np.rint(frame[valid])
+    limits = np.iinfo(np.int16)
+    if np.any((rounded < limits.min) | (rounded > limits.max)):
+        raise ValueError('registered intensity exceeds the int16 storage range')
+    stored = np.zeros(frame.shape, dtype=np.int16)
+    stored[valid] = rounded.astype(np.int16)
+    return stored
+
+
+def _add_full_registration(
+        partial_path,
+        recording,
+        estimates,
+        quality,
+        signal_bounds,
+        control_bounds,
+        piecewise_results,
+        ):
+    with NWBHDF5IO(partial_path, 'a') as io:
+        nwbfile = io.read()
+        module = nwbfile.processing['preprocessing']
+        paired_frames = module['paired_frames']
+        translations = np.asarray([
+            [estimate['shift_y'], estimate['shift_x']]
+            for estimate in estimates
+            ], dtype=np.float32)
+        module.add(TimeSeries(
+            name='rigid_translation',
+            data=translations,
+            unit='pixels',
+            timestamps=paired_frames,
+            description='applied registration-channel translation in dy_px, dx_px order',
+            ))
+
+        bounds = DynamicTable(
+            name='registered_valid_bounds',
+            description=(
+                'enclosing half-open y/x rectangles after the stored x/y image is returned '
+                'to row/column matrix order; rigid bounds are exact and piecewise edges follow '
+                'the stored spline field'),
+            id=np.arange(recording['n_frames']),
+            )
+        for channel, channel_bounds in (
+                ('signal', signal_bounds), ('control', control_bounds)):
+            for coordinate_i, coordinate in enumerate(('y0', 'y1', 'x0', 'x1')):
+                bounds.add_column(
+                    name=f'{channel}_{coordinate}',
+                    description=f'{channel} valid {coordinate} (px)',
+                    data=channel_bounds[:, coordinate_i],
+                    )
+        module.add(bounds)
+
+        if piecewise_results is not None:
+            table = DynamicTable(
+                name='piecewise_registration',
+                description='per-frame field acceptance and rigid fallback',
+                id=np.arange(recording['n_frames']),
+                )
+            descriptions = {
+                'model_used': 'piecewise_rigid or rigid',
+                'fallback_reason': 'accepted or named field rejection reason',
+                'global_shift_y_px': 'field-wide local adjustment along y',
+                'global_shift_x_px': 'field-wide local adjustment along x',
+                'accepted_tile_fraction': 'fraction of tiles retained for the field fit',
+                'field_rms_px': 'RMS local displacement in pixels',
+                'field_max_px': 'maximum local displacement in pixels',
+                'neighbour_difference_max_px': 'maximum adjacent-tile difference in pixels',
+                'jacobian_min': 'minimum field Jacobian determinant',
+                'jacobian_max': 'maximum field Jacobian determinant',
+                }
+            for name, description in descriptions.items():
+                table.add_column(
+                    name=name,
+                    description=description,
+                    data=piecewise_results[name],
+                    )
+            module.add(table)
+            module.add(TimeSeries(
+                name='piecewise_spline_coefficients',
+                data=np.stack([
+                    piecewise_results['coefficient_y'],
+                    piecewise_results['coefficient_x'],
+                    ], axis=1),
+                unit='pixels',
+                timestamps=paired_frames,
+                description='cubic B-spline coefficients in y, x order',
+                ))
+            spline_grid = DynamicTable(
+                name='piecewise_spline_grid',
+                description='control-point coordinates for the stored spline coefficients',
+                )
+            for name, description in (
+                    ('y_index', 'coefficient-array y index'),
+                    ('x_index', 'coefficient-array x index'),
+                    ('y_px', 'control-point row'),
+                    ('x_px', 'control-point column'),
+                    ):
+                spline_grid.add_column(name=name, description=description)
+            for y_i, y in enumerate(piecewise_results['control_y']):
+                for x_i, x in enumerate(piecewise_results['control_x']):
+                    spline_grid.add_row(y_index=y_i, x_index=x_i, y_px=y, x_px=x)
+            module.add(spline_grid)
+            module.add(TimeSeries(
+                name='piecewise_accepted_tiles',
+                data=piecewise_results['accepted_tiles'],
+                unit='boolean',
+                timestamps=paired_frames,
+                description='tile acceptance mask used for each field fit',
+                ))
+            module.add(TimeSeries(
+                name='piecewise_tile_peak_ratio',
+                data=piecewise_results['tile_peak_ratio'],
+                unit='dimensionless',
+                timestamps=paired_frames,
+                description='local highest to second-highest peak ratio',
+                ))
+            grid = DynamicTable(
+                name='piecewise_tile_grid',
+                description='fixed tile centres used for local translation estimates',
+                )
+            grid.add_column(name='y_px', description='tile-centre row')
+            grid.add_column(name='x_px', description='tile-centre column')
+            for y, x in zip(
+                    piecewise_results['tile_y'], piecewise_results['tile_x']):
+                grid.add_row(y_px=y, x_px=x)
+            module.add(grid)
+        add_quality_control_to_nwb(nwbfile, quality)
+        io.write(nwbfile)
+
+
+def _spot_check_preprocessed(path, expected_frames, recording):
+    with NWBHDF5IO(path, 'r') as io:
+        nwbfile = io.read()
+        module = nwbfile.processing['preprocessing']
+        sampling_frequency = module['recording_metadata']['sampling_frequency_hz'][0]
+        if sampling_frequency != recording['sampling_frequency_hz']:
+            raise AssertionError('stored sampling frequency changed')
+        for frame_i, expected in expected_frames.items():
+            for channel in ('signal', 'control'):
+                stored = np.asarray(
+                    module[f'registered_{channel}'].data[frame_i]).T
+                if not np.array_equal(stored, expected[channel]):
+                    raise AssertionError(
+                        f'{channel} frame {frame_i} changed after NWB writing')
+    return nwbfile.session_start_time
+
+
+def preprocess_recording(
+        tiff_paths,
+        output_path,
+        signal_channel,
+        control_channel,
+        multiplexed,
+        sampling_frequency_hz,
+        *,
+        signal_label=None,
+        control_label=None,
+        control_tiff_paths=None,
+        registration_model='auto',
+        registration_channel='control',
+        pixel_size_um=None,
+        session_start_time=None,
+        ):
+    output_path = Path(output_path)
+    partial_path = output_path.with_suffix('.partial.nwb')
+    if output_path.exists():
+        raise FileExistsError(f'output already exists: {output_path}')
+    if partial_path.exists():
+        raise FileExistsError(f'partial output already exists: {partial_path}')
+    if registration_model not in {'rigid', 'piecewise', 'auto'}:
+        raise ValueError('registration_model must be rigid, piecewise or auto')
+    if registration_channel not in {'signal', 'control'}:
+        raise ValueError('registration_channel must be signal or control')
+
+    start = perf_counter()
+    recording = index_tiffs(
+        tiff_paths,
+        signal_channel=signal_channel,
+        control_channel=control_channel,
+        sampling_frequency_hz=sampling_frequency_hz,
+        multiplexed=multiplexed,
+        control_tiffs=control_tiff_paths,
+        signal_label=signal_label,
+        control_label=control_label,
+        )
+    if session_start_time is None:
+        session_start_time, session_time_source = read_session_start_time(
+            recording['signal_tiffs'][0])
+    else:
+        session_time_source = {
+            'source': 'user-supplied',
+            'raw_value': session_start_time.isoformat(),
+            'timezone': str(session_start_time.tzinfo),
+            }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sample_indices = np.linspace(
+        0, recording['n_frames'] - 1,
+        min(1000, recording['n_frames']), dtype=int)
+    with tempfile.TemporaryDirectory(
+            prefix='fibre sight reference ', dir=output_path.parent) as sample_dir:
+        signal_sample, control_sample = _sample_recording(
+            recording,
+            sample_indices,
+            sample_dir,
+            include_signal=registration_channel == 'signal',
+            )
+        control_reference_info = make_reference(control_sample)
+        control_reference = control_reference_info['image']
+        if registration_channel == 'signal':
+            registration_reference = make_reference(signal_sample)['image']
+        else:
+            registration_reference = control_reference
+        calibration = _registration_calibration(
+            recording,
+            registration_reference,
+            registration_model,
+            registration_channel,
+            )
+        timestamps = (
+            np.arange(recording['n_frames'], dtype=float)
+            / recording['sampling_frequency_hz'])
+        local_references = _control_local_references(
+            control_reference,
+            registration_reference,
+            signal_sample,
+            control_sample,
+            sample_indices,
+            timestamps,
+            recording['sampling_frequency_hz'],
+            registration_channel,
+            calibration['channel_offset'],
+            )
+
+        _new_preprocessing_file(
+            partial_path,
+            recording,
+            session_start_time,
+            session_time_source,
+            pixel_size_um,
+            control_reference,
+            registration_reference,
+            local_references,
+            calibration,
+            registration_channel,
+            )
+
+        n_frames = recording['n_frames']
+        estimates = []
+        signal_bounds = np.empty((n_frames, 4), dtype=np.int32)
+        control_bounds = np.empty((n_frames, 4), dtype=np.int32)
+        quality_fields = _new_quality_fields(
+            n_frames, timestamps, recording['sampling_frequency_hz'])
+        # fixed reference derivatives are shared by every frame and both NCC measurements
+        reference_detail = _high_frequency_image(control_reference)
+        reference_gradient = _gradient_image(control_reference)
+        previous_control = None
+        prepared_reference = _prepare_reference(registration_reference)
+        selected_model = calibration['selected_model']
+        tile_reference = calibration['tile_reference']
+        signal_to_control_offset = (
+            calibration['channel_offset']['shift_y'],
+            calibration['channel_offset']['shift_x'])
+        piecewise_results = None
+        if selected_model == 'piecewise_rigid':
+            n_tiles = len(tile_reference['tile_y'])
+            control_y, control_x = _spline_grid(
+                recording['shape'], tile_reference['tile_size'])
+            piecewise_results = {
+                'model_used': np.empty(n_frames, dtype='<U16'),
+                'fallback_reason': np.empty(n_frames, dtype='<U24'),
+                'global_shift_y_px': np.empty(n_frames, dtype=np.float32),
+                'global_shift_x_px': np.empty(n_frames, dtype=np.float32),
+                'accepted_tile_fraction': np.empty(n_frames, dtype=np.float32),
+                'field_rms_px': np.empty(n_frames, dtype=np.float32),
+                'field_max_px': np.empty(n_frames, dtype=np.float32),
+                'neighbour_difference_max_px': np.empty(n_frames, dtype=np.float32),
+                'jacobian_min': np.empty(n_frames, dtype=np.float32),
+                'jacobian_max': np.empty(n_frames, dtype=np.float32),
+                'coefficient_y': np.empty(
+                    (n_frames, len(control_y), len(control_x)), dtype=np.float32),
+                'coefficient_x': np.empty(
+                    (n_frames, len(control_y), len(control_x)), dtype=np.float32),
+                'accepted_tiles': np.empty((n_frames, n_tiles), dtype=bool),
+                'tile_peak_ratio': np.empty((n_frames, n_tiles), dtype=np.float32),
+                'tile_y': tile_reference['tile_y'],
+                'tile_x': tile_reference['tile_x'],
+                'control_y': control_y,
+                'control_x': control_x,
+                }
+
+        spot_indices = set(np.random.default_rng(42).choice(
+            n_frames, min(5, n_frames), replace=False)) | {0, n_frames - 1}
+        expected_frames = {}
+        # 32 frames amortise HDF5 writes and hold about 32 MiB for both channels
+        frame_batch_size = 32
+        estimate_frame = partial(_estimate_shift, prepared_reference)
+        with h5py.File(partial_path, 'r+') as file:
+            signal_data = file['processing/preprocessing/registered_signal/data']
+            control_data = file['processing/preprocessing/registered_control/data']
+            frame_i = 0
+            frame_iter = iter(read_tiffs(recording))
+            # NumPy, SciPy and OpenCV release the GIL here; four workers match the benchmark ceiling
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                while pairs := list(islice(frame_iter, frame_batch_size)):
+                    estimates_batch = list(pool.map(
+                        estimate_frame,
+                        [pair[registration_channel] for pair in pairs]))
+                    estimates.extend(estimates_batch)
+                    batch_start = frame_i
+
+                    if selected_model == 'piecewise_rigid':
+                        registered_batch = []
+                        for batch_i, (pair, estimate) in enumerate(
+                                zip(pairs, estimates_batch)):
+                            result_i = batch_start + batch_i
+                            tiles = _estimate_tile_shifts(
+                                tile_reference,
+                                pair[registration_channel],
+                                (estimate['shift_y'], estimate['shift_x']),
+                                )
+                            evidence = _tile_field_evidence(tiles)
+                            field = fit_tile_field(
+                                tiles,
+                                recording['shape'],
+                                tile_reference['tile_size'],
+                                spatial_penalty=10,
+                                magnitude_penalty=1,
+                                evidence=evidence,
+                                )
+                            registered = register_pair_piecewise(
+                                pair['signal'],
+                                pair['control'],
+                                estimate['shift_y'],
+                                estimate['shift_x'],
+                                field,
+                                signal_to_control_offset,
+                                registration_channel=registration_channel,
+                                )
+                            registered_batch.append(registered)
+                            assessment = registered['assessment']
+                            for name in (
+                                    'model_used', 'fallback_reason',
+                                    'accepted_tile_fraction', 'field_rms_px',
+                                    'field_max_px', 'neighbour_difference_max_px',
+                                    'jacobian_min', 'jacobian_max'):
+                                piecewise_results[name][result_i] = assessment[name]
+                            use_field = registered['model_used'] == 'piecewise_rigid'
+                            piecewise_results['global_shift_y_px'][result_i] = (
+                                field['global_shift_y'] if use_field else 0)
+                            piecewise_results['global_shift_x_px'][result_i] = (
+                                field['global_shift_x'] if use_field else 0)
+                            piecewise_results['coefficient_y'][result_i] = (
+                                field['coefficient_y'] if use_field else 0)
+                            piecewise_results['coefficient_x'][result_i] = (
+                                field['coefficient_x'] if use_field else 0)
+                            piecewise_results['accepted_tiles'][result_i] = field['accepted']
+                            piecewise_results['tile_peak_ratio'][result_i] = tiles['peak_ratio']
+                    else:
+                        registration_jobs = [pool.submit(
+                            register_pair,
+                            pair['signal'],
+                            pair['control'],
+                            estimate['shift_y'],
+                            estimate['shift_x'],
+                            signal_to_control_offset,
+                            registration_channel=registration_channel,
+                            ) for pair, estimate in zip(pairs, estimates_batch)]
+                        registered_batch = [job.result() for job in registration_jobs]
+
+                    stored_signal_batch = np.empty(
+                        (len(pairs), *recording['shape']), dtype=np.int16)
+                    stored_control_batch = np.empty_like(stored_signal_batch)
+                    quality_jobs = []
+                    previous_for_quality = previous_control
+                    for batch_i, (pair, estimate, registered) in enumerate(
+                            zip(pairs, estimates_batch, registered_batch)):
+                        result_i = batch_start + batch_i
+                        stored_signal = _int16_registered(registered['signal'])
+                        stored_control = _int16_registered(registered['control'])
+                        stored_signal_batch[batch_i] = stored_signal
+                        stored_control_batch[batch_i] = stored_control
+                        signal_bounds[result_i] = registered['signal_bounds']
+                        control_bounds[result_i] = registered['control_bounds']
+                        quality_jobs.append(pool.submit(
+                            _measure_registered_quality,
+                            quality_fields,
+                            result_i,
+                            pair['control'],
+                            registered['control'],
+                            estimate,
+                            control_reference,
+                            reference_detail,
+                            reference_gradient,
+                            local_references,
+                            previous_for_quality,
+                            ))
+                        previous_for_quality = registered['control']
+                        if result_i in spot_indices:
+                            expected_frames[result_i] = {
+                                'signal': stored_signal.copy(),
+                                'control': stored_control.copy(),
+                                }
+                    frame_i += len(pairs)
+                    signal_data[batch_start:frame_i] = stored_signal_batch.swapaxes(1, 2)
+                    control_data[batch_start:frame_i] = stored_control_batch.swapaxes(1, 2)
+                    for job in quality_jobs:
+                        job.result()
+                    previous_control = previous_for_quality
+            file.flush()
+
+        quality = _finish_quality(
+            quality_fields,
+            estimates,
+            recording['sampling_frequency_hz'],
+            local_references=local_references,
+            )
+        _add_full_registration(
+            partial_path,
+            recording,
+            estimates,
+            quality,
+            signal_bounds,
+            control_bounds,
+            piecewise_results,
+            )
+
+    validation_errors = [str(error) for error in validate(path=partial_path)]
+    if validation_errors:
+        raise AssertionError(f'NWB validation failed: {validation_errors}')
+    _spot_check_preprocessed(partial_path, expected_frames, recording)
+    with partial_path.open('rb') as file:
+        os.fsync(file.fileno())
+    os.replace(partial_path, output_path)
+    return {
+        'output_path': output_path,
+        'n_frames': recording['n_frames'],
+        'selected_model': calibration['selected_model'],
+        'focal_loss_episodes': len(quality['focal_loss_episodes']),
+        'validation_errors': validation_errors,
+        'wall_time_s': perf_counter() - start,
+        'file_size_bytes': output_path.stat().st_size,
+        'session_start_time': session_start_time,
+        'session_time_source': session_time_source,
+        'reference_fallback': bool(control_reference_info['reference_fallback']),
         }
