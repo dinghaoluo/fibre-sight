@@ -2,6 +2,7 @@
 Created on 15 August 2026
 Modified on 16 August 2026
 Modified on 17 August 2026 to move the benchmark out of the repository root
+Modified on 18 August 2026
 
 make and run the multi-image registration benchmark
 
@@ -37,10 +38,30 @@ CAIMAN_PYTHON = PROJECT_ROOT / 'workspace' / 'dev' / 'envs' / 'caiman-1.12.2' / 
 PYFLOWREG_PYTHON = PROJECT_ROOT / 'workspace' / 'dev' / 'envs' / 'pyflowreg-0.1.0a9' / 'bin' / 'python'
 
 SOURCES = (
-    'demo_train_01_ref_mat_ch2.npy',
-    'demo_train_02_ref_mat_ch2.npy',
-    'demo_test_ref_mat_ch2.npy',
+    'lab-fibresight-demo-train-01.npy',
+    'lab-fibresight-demo-train-02.npy',
+    'lab-fibresight-demo-test.npy',
+    'allen-vis-two-photon-01.npy',
+    'allen-vis-two-photon-02.npy',
+    'dandi-jgcamp8f-soma.npy',
+    'dandi-jgcamp8s-soma.npy',
+    'dandi-olfactory-bulb.npy',
+    'labmate-tdtomato-soma.npy',
+    'labmate-gcamp-soma.npy',
     )
+SOURCE_ANATOMY = {
+    'lab-fibresight-demo-train-01.npy': 'fibre',
+    'lab-fibresight-demo-train-02.npy': 'fibre',
+    'lab-fibresight-demo-test.npy': 'fibre',
+    'allen-vis-two-photon-01.npy': 'somatic',
+    'allen-vis-two-photon-02.npy': 'somatic',
+    'dandi-jgcamp8f-soma.npy': 'somatic',
+    'dandi-jgcamp8s-soma.npy': 'somatic',
+    'dandi-olfactory-bulb.npy': 'mesoscale',
+    'labmate-tdtomato-soma.npy': 'somatic',
+    'labmate-gcamp-soma.npy': 'somatic',
+    }
+BASE_SOURCES = SOURCES[:3]
 RECIPES = ('ordinary_motion', 'large_motion', 'local_deformation', 'focal_change')
 PHOTON_COUNTS = (30, 65, 150)
 BLEACHING_LEVELS = (0, 0.2, 0.5)
@@ -54,6 +75,27 @@ METHODS = (
     'patchwarp_affine',
     'pyflowreg_piecewise',
     )
+TILE_METHODS = {
+    'fibresight_tiles_64_w0': {'tile_size': 64, 'whitening': 0},
+    'fibresight_tiles_64_w0_5': {'tile_size': 64, 'whitening': 0.5},
+    'fibresight_tiles_80_w0': {'tile_size': 80, 'whitening': 0},
+    'fibresight_tiles_128_w0': {'tile_size': 128, 'whitening': 0},
+    'fibresight_tiles_128_to_64_w0': {
+        'tile_size': 64, 'coarse_tile_size': 128, 'whitening': 0},
+    'fibresight_tiles_80_to_64_w0': {
+        'tile_size': 64, 'coarse_tile_size': 80, 'whitening': 0},
+    }
+FIELD_METHODS = {
+    'fibresight_piecewise': {},
+    'fibresight_field_80_w0': {
+        'tile_size': 80,
+        'whitening': 0,
+        'field_penalties': (0.1, 1, 10, 100),
+        'field_magnitude': 1,
+        'refine_penalty': 10,
+        'field_residual_limit': 0.28,
+        },
+    }
 WHITENING_METHODS = ('fibresight_whitening_0_5', 'fibresight_whitening_1')
 PHOTON_METHODS = (*METHODS, *WHITENING_METHODS)
 METHOD_RESOURCES = {
@@ -67,6 +109,8 @@ METHOD_RESOURCES = {
     'pyflowreg_piecewise': ('processes', 4, 1),
     'fibresight_whitening_0_5': ('threads', 4, 1),
     'fibresight_whitening_1': ('threads', 4, 1),
+    'fibresight_field_80_w0': ('threads', 4, 1),
+    'fibresight_piecewise': ('threads', 4, 1),
     }
 RIGID_METHODS = (
     'fibresight_rigid', 'suite2p_rigid', 'caiman_rigid', 'patchwarp_rigid')
@@ -91,26 +135,43 @@ METHOD_NAMES = {
     'pyflowreg_piecewise': 'PyFlowReg piecewise',
     'fibresight_whitening_0_5': 'FibreSight w=0.5',
     'fibresight_whitening_1': 'FibreSight w=1',
+    'fibresight_piecewise': 'FibreSight piecewise',
     }
 METHOD_COLOURS = {
-    'fibresight_rigid': '#0072B2',
+    # 18 August 2026: the GUI charcoal stays fixed; piecewise uses a lighter shade
+    'fibresight_rigid': '#1A1A1C',
     'suite2p_rigid': '#D55E00',
     'suite2p_piecewise': '#E69F00',
     'caiman_rigid': '#009E73',
     'caiman_piecewise': '#CC79A7',
     'patchwarp_rigid': '#882255',
     'patchwarp_affine': '#44AA99',
-    'pyflowreg_piecewise': '#F0E442',
-    'fibresight_whitening_0_5': '#56B4E9',
-    'fibresight_whitening_1': '#6A3D9A',
+    'pyflowreg_piecewise': '#0072B2',
+    'fibresight_whitening_0_5': '#6A6864',
+    'fibresight_whitening_1': '#AAA7A0',
+    'fibresight_piecewise': '#66636D',
     }
+
+
+def _method_tick_label(method):
+    if method == 'patchwarp_affine':
+        return 'PatchWarp\naffine*'
+    return METHOD_NAMES[method].replace(' ', '\n', 1)
+
+
+def _add_patchwarp_note(figure):
+    figure.get_layout_engine().set(rect=(0, 0.08, 1, 1))
+    figure.text(
+        0.5, 0.012, '* 8x8 grid with 4x4 retry on failure',
+        ha='center', fontsize=8,
+        )
 
 
 def benchmark_cases(root=SUITE_ROOT):
     cases = []
     for source_i, source in enumerate(SOURCES):
         for recipe_i, recipe in enumerate(RECIPES):
-            source_name = source.removesuffix('_ref_mat_ch2.npy')
+            source_name = source
             sequence = np.random.SeedSequence([42, source_i, recipe_i])
             cases.append({
                 'case': f'{source_name}/{recipe}',
@@ -125,8 +186,8 @@ def benchmark_cases(root=SUITE_ROOT):
 
 def focal_cases(root=FOCAL_ROOT):
     cases = []
-    for source_i, source in enumerate(SOURCES):
-        source_name = source.removesuffix('_ref_mat_ch2.npy')
+    for source_i, source in enumerate(BASE_SOURCES):
+        source_name = source
         sequence = np.random.SeedSequence([42, source_i, 4])
         cases.append({
             'case': f'{source_name}/optical_defocus',
@@ -141,8 +202,8 @@ def focal_cases(root=FOCAL_ROOT):
 
 def photon_cases(root=INTENSITY_ROOT):
     cases = []
-    for source_i, source in enumerate(SOURCES):
-        source_name = source.removesuffix('_ref_mat_ch2.npy')
+    for source_i, source in enumerate(BASE_SOURCES):
+        source_name = source
         for recipe_i, recipe in enumerate(RECIPES):
             seed = int(np.random.SeedSequence(
                 [42, source_i, recipe_i]).generate_state(1, dtype=np.uint32)[0])
@@ -162,8 +223,8 @@ def photon_cases(root=INTENSITY_ROOT):
 
 def bleaching_cases(root=INTENSITY_ROOT):
     cases = []
-    for source_i, source in enumerate(SOURCES):
-        source_name = source.removesuffix('_ref_mat_ch2.npy')
+    for source_i, source in enumerate(BASE_SOURCES):
+        source_name = source
         seed = int(np.random.SeedSequence(
             [42, source_i, 0]).generate_state(1, dtype=np.uint32)[0])
         for bleaching in BLEACHING_LEVELS:
@@ -202,7 +263,7 @@ def check_suite(root=SUITE_ROOT):
             raise FileNotFoundError(f'incomplete benchmark case: {case_name}')
         with np.load(truth_path) as truth:
             matches = (
-                str(truth['source']) == 'examples/' + case['source']
+                str(truth['source']) == 'benchmarking/sources/' + case['source']
                 and str(truth['recipe']) == case['recipe']
                 and int(truth['seed']) == case['seed']
                 and int(truth['n_frames']) == tifffile.memmap(movie_path).shape[0]
@@ -403,7 +464,7 @@ def plot_truth(root=SUITE_ROOT):
             if source_i == 0:
                 z_axis.legend(frameon=False, fontsize=8, loc='lower right')
         if recipe_i == 0:
-            axis.set_title(case['source'].removesuffix('_ref_mat_ch2.npy'))
+            axis.set_title(case['source'])
         if source_i == 0:
             recipe = case['recipe']
             axis.set_ylabel(f'{recipe}\ndisplacement (px)')
@@ -490,7 +551,7 @@ def make_review_movie(
                 255 * (corrected - low) / (high - low), 0, 255).astype(np.uint8)
 
             canvas = np.full((stream.height, stream.width, 3), 24, dtype=np.uint8)
-            source = case['source'].removesuffix('_ref_mat_ch2.npy')
+            source = case['source']
             recipe = case['recipe']
             title = f'{source}  {recipe}'
             cv2.putText(
@@ -554,6 +615,26 @@ def _run_method(method, root):
         benchmark.run_caiman(root, piecewise=method.endswith('piecewise'))
 
 
+def _run_tile_method(method, root):
+    benchmark.run_fibresight_tile_evidence(
+        root,
+        name=method,
+        **TILE_METHODS[method],
+        save_surfaces=method == 'fibresight_tiles_64_w0',
+        )
+
+
+def _run_field_method(method, root):
+    if method == 'fibresight_piecewise':
+        benchmark.run_fibresight_piecewise(root)
+        return
+    benchmark.run_fibresight_tile_evidence(
+        root,
+        name=method,
+        **FIELD_METHODS[method],
+        )
+
+
 def _run_reference(method, root):
     if method == 'fibresight_rigid':
         benchmark.run_fibresight_references(root)
@@ -580,9 +661,10 @@ def _method_command(method, root):
         python = FIBRESIGHT_PYTHON
     else:
         python = CAIMAN_PYTHON
+    step = 'field' if method in FIELD_METHODS else 'method'
     return [
         str(python), '-m', 'benchmarking.registration_benchmark_suite',
-        'method', method, str(root),
+        step, method, str(root),
         ]
 
 
@@ -814,6 +896,362 @@ def run_suite(root=SUITE_ROOT):
                 file.flush()
 
 
+def run_piecewise_suite(root=SUITE_ROOT):
+    root = Path(root)
+    cases = benchmark_cases(root)
+    method = 'fibresight_field_80_w0'
+    resource_path = root / 'piecewise_resources.csv'
+    completed = set()
+    if resource_path.exists():
+        completed = {
+            row['case'] for row in _read_rows(resource_path)
+            if int(row['exit_code']) == 0}
+    fields = [
+        'case_order', 'case', 'source', 'recipe', 'seed', 'method',
+        'version', 'allocated_cores', 'worker_type', 'workers',
+        'native_threads_per_worker', 'wall_seconds', 'user_cpu_seconds',
+        'system_cpu_seconds', 'average_cores', 'peak_process_rss_bytes',
+        'peak_tree_rss_bytes', 'peak_tree_threads', 'exit_code',
+        'patchwarp_grid', 'patchwarp_grid_attempts',
+        ]
+    with resource_path.open('a' if completed else 'w', newline='') as file:
+        writer = DictWriter(file, fieldnames=fields)
+        if not completed:
+            writer.writeheader()
+        for case_i, case in enumerate(cases, start=1):
+            if case['case'] in completed:
+                continue
+            case_name = case['case']
+            print(f'{case_i:02d}/{len(cases)}  {case_name}  FibreSight piecewise')
+            resources = measure_method(method, case, root)
+            writer.writerow({
+                **{name: case[name] for name in (
+                    'case_order', 'case', 'source', 'recipe', 'seed')},
+                'method': method,
+                **resources,
+                })
+            file.flush()
+            if resources['exit_code']:
+                raise RuntimeError(f'FibreSight piecewise failed for {case_name}')
+            benchmark.measure_tile_fields(case['root'], [method])
+
+
+def measure_piecewise_suite(root=SUITE_ROOT):
+    root = Path(root)
+    methods = {
+        'fibresight_piecewise', 'suite2p_piecewise', 'caiman_piecewise',
+        'patchwarp_affine', 'pyflowreg_piecewise',
+        }
+    rows = []
+    for case in benchmark_cases(root):
+        benchmark.measure_tile_fields(case['root'], ['fibresight_field_80_w0'])
+        for path in (
+                case['root'] / 'piecewise_metrics.csv',
+                case['root'] / 'metrics.csv',
+                ):
+            rows.extend({
+                'case_order': case['case_order'],
+                'case': case['case'],
+                'source': case['source'],
+                'recipe': case['recipe'],
+                **row,
+                } for row in _read_rows(path) if row['method'] in methods)
+    with (root / 'piecewise_suite_metrics.csv').open('w', newline='') as file:
+        writer = DictWriter(file, fieldnames=rows[0])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def measure_auto_suite(root=SUITE_ROOT):
+    import tifffile
+    from fibre_sight.preprocessing import (
+        _gradient_ncc,
+        select_registration_model,
+        warp_frame,
+        warp_frame_piecewise,
+        )
+
+    root = Path(root)
+    rows = []
+    for case in benchmark_cases(root):
+        movie = tifffile.memmap(case['root'] / 'control.tif')
+        with np.load(case['root'] / 'fibresight_rigid.npz') as saved:
+            rigid = {name: saved[name] for name in saved.files}
+        with np.load(case['root'] / 'fibresight_field_80_w0.npz') as saved:
+            piecewise = {name: saved[name] for name in saved.files}
+        sample = np.linspace(0, len(movie) // 2 - 1, 100, dtype=int)
+        rigid_ncc = []
+        piecewise_ncc = []
+        rigid_valid = []
+        piecewise_valid = []
+        for frame_i in sample:
+            rigid_frame, rigid_bounds = warp_frame(
+                movie[frame_i], -rigid['shift_y'][frame_i], -rigid['shift_x'][frame_i])
+            rigid_ncc.append(_gradient_ncc(rigid['reference'], rigid_frame))
+            y0, y1, x0, x1 = rigid_bounds
+            rigid_valid.append((y1 - y0) * (x1 - x0) / rigid_frame.size)
+            if piecewise['model_used'][frame_i] == 'rigid':
+                piecewise_frame = rigid_frame
+                piecewise_mask = np.isfinite(rigid_frame)
+            else:
+                field = {
+                    'global_shift_y': -piecewise['piecewise_global_y'][frame_i],
+                    'global_shift_x': -piecewise['piecewise_global_x'][frame_i],
+                    'coefficient_y': -piecewise['piecewise_coefficient_y'][frame_i],
+                    'coefficient_x': -piecewise['piecewise_coefficient_x'][frame_i],
+                    'control_y': piecewise['field_control_y'],
+                    'control_x': piecewise['field_control_x'],
+                    'tile_size': piecewise['tile_size'],
+                    }
+                piecewise_frame, _, piecewise_mask = warp_frame_piecewise(
+                    movie[frame_i], field,
+                    (-rigid['shift_y'][frame_i], -rigid['shift_x'][frame_i]))
+            piecewise_ncc.append(_gradient_ncc(
+                rigid['reference'], piecewise_frame))
+            piecewise_valid.append(np.mean(piecewise_mask))
+
+        with (case['root'] / 'metrics.csv').open() as file:
+            metric_rows = list(DictReader(file))
+        with (case['root'] / 'piecewise_metrics.csv').open() as file:
+            metric_rows.extend(DictReader(file))
+        rigid_p95 = next(float(row['p95_error_px']) for row in metric_rows
+            if row['method'] == 'fibresight_rigid' and row['group'] == 'calibration')
+        piecewise_p95 = next(float(row['p95_error_px']) for row in metric_rows
+            if row['method'] == 'fibresight_piecewise' and row['group'] == 'calibration')
+        decision = select_registration_model(
+            {
+                'gradient_ncc': float(np.nanmean(rigid_ncc)),
+                'residual_p95_px': rigid_p95,
+                'valid_fraction': float(np.mean(rigid_valid)),
+                'cross_channel_residual_px': 0,
+                },
+            {
+                'gradient_ncc': float(np.nanmean(piecewise_ncc)),
+                'residual_p95_px': piecewise_p95,
+                'valid_fraction': float(np.mean(piecewise_valid)),
+                'cross_channel_residual_px': 0,
+                'accepted_or_fallback_fraction': 1,
+                },
+            )
+        selected = decision['selected_model']
+        selected_method = (
+            'fibresight_piecewise' if selected == 'piecewise_rigid'
+            else 'fibresight_rigid')
+        selected_p95 = next(float(row['p95_error_px']) for row in metric_rows
+            if row['method'] == selected_method
+            and row['group'] == 'heldout')
+        rows.append({
+            **{name: case[name] for name in (
+                'case_order', 'case', 'source', 'recipe')},
+            'selected_model': selected,
+            'heldout_p95_error_px': selected_p95,
+            **decision['comparison'],
+            **{f'passed_{name}': value for name, value in decision['passed'].items()},
+            })
+    with (root / 'piecewise_auto.csv').open('w', newline='') as file:
+        writer = DictWriter(file, fieldnames=rows[0])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def summarise_piecewise_suite(
+        root=SUITE_ROOT,
+        intensity_root=INTENSITY_ROOT,
+        figure_root=EXAMPLE_ROOT,
+        ):
+    import matplotlib.pyplot as plt
+    from scipy.stats import wilcoxon
+
+    root = Path(root)
+    intensity_root = Path(intensity_root)
+    piecewise_metrics = _read_rows(root / 'piecewise_suite_metrics.csv')
+    model_selection = _read_rows(root / 'piecewise_auto.csv')
+    methods = (
+        'fibresight_piecewise', 'suite2p_piecewise', 'caiman_piecewise',
+        'patchwarp_affine', 'pyflowreg_piecewise')
+    fibresight = _case_values(
+        piecewise_metrics, 'fibresight_piecewise', 'p95_error_px', group='heldout')
+    fibresight_sources = _source_values(
+        piecewise_metrics, 'fibresight_piecewise', 'p95_error_px', group='heldout')
+    comparisons = []
+    for method in methods[1:]:
+        competitor = _case_values(
+            piecewise_metrics, method, 'p95_error_px', group='heldout')
+        fibresight_cases, competitor_cases = _paired_values(
+            fibresight, competitor)
+        advantage = competitor_cases - fibresight_cases
+        competitor_sources = _source_values(
+            piecewise_metrics, method, 'p95_error_px', group='heldout')
+        fibresight_source_values, competitor_source_values = _paired_values(
+            fibresight_sources, competitor_sources)
+        mean, low, high = _mean_ci(
+            competitor_source_values - fibresight_source_values)
+        wilcoxon_result = wilcoxon(fibresight_cases, competitor_cases)
+        comparisons.append({
+            'comparison': method,
+            'n_cases': len(advantage),
+            'n_sources': len(fibresight_source_values),
+            'fibresight_wins': int(np.sum(advantage > 0)),
+            'mean_advantage_px': float(mean),
+            'ci_low_px': float(low),
+            'ci_high_px': float(high),
+            'wilcoxon_p_raw': float(wilcoxon_result.pvalue),
+            'wilcoxon_p_bonferroni': min(
+                1, 4 * float(wilcoxon_result.pvalue)),
+            })
+    with (root / 'piecewise_comparisons.csv').open('w', newline='') as file:
+        writer = DictWriter(file, fieldnames=comparisons[0])
+        writer.writeheader()
+        writer.writerows(comparisons)
+
+    benchmark._format_benchmark_plots()
+    figure, axes = plt.subplots(1, 2, figsize=(11, 4.2), constrained_layout=True)
+    heldout_errors = {
+        method: {
+            row['case']: float(row['p95_error_px'])
+            for row in piecewise_metrics
+            if row['method'] == method and row['group'] == 'heldout'
+            }
+        for method in methods}
+    common_cases = sorted(set.intersection(
+        *(set(values) for values in heldout_errors.values())))
+    for case in common_cases:
+        axes[0].plot(
+            range(len(methods)),
+            [heldout_errors[method][case] for method in methods],
+            color='0.82', linewidth=0.7)
+    for method_i, method in enumerate(methods):
+        values = list(heldout_errors[method].values())
+        axes[0].scatter(
+            np.full(len(values), method_i), values, s=18,
+            color=METHOD_COLOURS[method], alpha=0.7, zorder=2)
+        axes[0].scatter(
+            method_i, np.mean(values), marker='D', s=42,
+            color=METHOD_COLOURS[method], edgecolor='white', zorder=3)
+    axes[0].set_xticks(
+        range(len(methods)),
+        [_method_tick_label(method) for method in methods],
+        rotation=25, ha='center', rotation_mode='anchor')
+    axes[0].set_ylabel('held-out p95 error (px)')
+    axes[0].set_title('piecewise registration')
+    # 18 August 2026: keep the useful range visible and mark clipped cases at 10 px
+    plot_limit = 10
+    off_scale_y = plot_limit - 0.15
+    axes[0].set_ylim(0, plot_limit)
+    short_names = {
+        'suite2p_piecewise': 'Suite2p',
+        'caiman_piecewise': 'CaImAn',
+        'patchwarp_affine': 'PatchWarp*',
+        'pyflowreg_piecewise': 'PyFlowReg',
+        }
+    axes[0].text(
+        0.37, 0.96, 'Bonferroni-corrected Wilcoxon p',
+        transform=axes[0].transAxes, fontsize=7.5, va='top')
+    for comparison_i, row in enumerate(comparisons):
+        method = row['comparison']
+        p_value = float(row['wilcoxon_p_bonferroni'])
+        axes[0].text(
+            0.37, 0.90 - 0.055 * comparison_i,
+            f'{short_names[method]}: p = {p_value:.2g}',
+            color=METHOD_COLOURS[method], fontsize=7.5,
+            transform=axes[0].transAxes, va='top')
+    for method_i, method in enumerate(methods):
+        off_scale_values = sorted(
+            value for value in heldout_errors[method].values()
+            if value > plot_limit)
+        if not off_scale_values:
+            continue
+        off_scale_x = method_i + np.linspace(
+            -0.06, 0.06, len(off_scale_values))
+        axes[0].scatter(
+            off_scale_x, np.full(len(off_scale_values), off_scale_y),
+            marker='^', s=28,
+            facecolor='white', edgecolor=METHOD_COLOURS[method], zorder=4,
+            )
+        axes[0].annotate(
+            ', '.join(f'{value:.1f}' for value in off_scale_values) + ' px',
+            xy=(method_i, off_scale_y), xytext=(0, -11),
+            textcoords='offset points', ha='center', va='top', fontsize=7,
+            color=METHOD_COLOURS[method],
+            )
+
+    selection_by_case = {row['case']: row for row in model_selection}
+    cases = sorted(fibresight)
+    selected_models = [selection_by_case[case]['selected_model'] for case in cases]
+    heldout_error = [
+        float(selection_by_case[case]['heldout_p95_error_px']) for case in cases]
+    axes[1].scatter(
+        range(len(cases)), heldout_error,
+        c=[
+            METHOD_COLOURS['fibresight_piecewise']
+            if model == 'piecewise_rigid' else METHOD_COLOURS['fibresight_rigid']
+            for model in selected_models],
+        s=30)
+    axes[1].scatter(
+        [], [], color=METHOD_COLOURS['fibresight_piecewise'],
+        label='piecewise-rigid selected')
+    axes[1].scatter(
+        [], [], color=METHOD_COLOURS['fibresight_rigid'], label='rigid selected')
+    source_abbreviations = {
+        'lab-fibresight-demo-train-01.npy': 'FS train 01',
+        'lab-fibresight-demo-train-02.npy': 'FS train 02',
+        'lab-fibresight-demo-test.npy': 'FS test',
+        'allen-vis-two-photon-01.npy': 'Allen 01',
+        'allen-vis-two-photon-02.npy': 'Allen 02',
+        'dandi-jgcamp8f-soma.npy': 'jGCaMP8f',
+        'dandi-jgcamp8s-soma.npy': 'jGCaMP8s',
+        'dandi-olfactory-bulb.npy': 'olfactory',
+        'labmate-tdtomato-soma.npy': 'tdTomato',
+        'labmate-gcamp-soma.npy': 'GCaMP',
+        }
+    sources = list(dict.fromkeys(case.split('/')[0] for case in cases))
+    source_centres = [
+        np.mean([case_i for case_i, case in enumerate(cases)
+                 if case.startswith(f'{source}/')])
+        for source in sources]
+    axes[1].set_xticks(
+        source_centres,
+        [source_abbreviations[source] for source in sources],
+        rotation=35, ha='center', rotation_mode='anchor')
+    for source_i in range(1, len(sources)):
+        axes[1].axvline(4 * source_i - 0.5, color='0.90', linewidth=0.7)
+    axes[1].set_xlabel('source image (four recipes per source)')
+    axes[1].set_ylabel('held-out p95 error (px)')
+    axes[1].set_title('automatic model selection')
+    axes[1].legend(frameon=False, fontsize=8)
+    _add_patchwarp_note(figure)
+    figure.savefig(
+        figure_root / 'registration_benchmark_piecewise.png',
+        dpi=180, bbox_inches='tight')
+    plt.close(figure)
+
+    photon_rows = (
+        _read_rows(intensity_root / 'piecewise_photon_metrics.csv')
+        + _read_rows(intensity_root / 'photon_metrics.csv'))
+    figure, axis = plt.subplots(figsize=(6.8, 4.3), constrained_layout=True)
+    for method in methods:
+        medians = []
+        for photons in PHOTON_COUNTS:
+            values = [
+                float(row['p95_error_px']) for row in photon_rows
+                if row['method'] == method and row['group'] == 'heldout'
+                and int(float(row['control_photons'])) == photons]
+            medians.append(np.median(values))
+        axis.plot(
+            PHOTON_COUNTS, medians, marker='o', linewidth=1.6,
+            color=METHOD_COLOURS[method], label=METHOD_NAMES[method])
+    axis.set_xscale('log')
+    axis.set_xticks(PHOTON_COUNTS, [str(value) for value in PHOTON_COUNTS])
+    axis.tick_params(axis='x', which='minor', bottom=False, labelbottom=False)
+    axis.set_xlabel('control-channel photon count')
+    axis.set_ylabel('median held-out p95 error (px)')
+    axis.set_title('piecewise registration across photon counts')
+    axis.legend(frameon=False, fontsize=8)
+    figure.savefig(figure_root / 'registration_benchmark_piecewise_noise.png', dpi=180)
+    plt.close(figure)
+    summarise_source_groups(root, figure_root)
+
+
 def run_intensity_suite(root=INTENSITY_ROOT, n_frames=2000):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -936,14 +1374,99 @@ def run_intensity_suite(root=INTENSITY_ROOT, n_frames=2000):
             (case_root / '.complete').touch()
 
 
+def run_piecewise_intensity_suite(root=INTENSITY_ROOT, n_frames=2000):
+    root = Path(root)
+    resource_path = root / 'piecewise_photon_resources.csv'
+    metric_path = root / 'piecewise_photon_metrics.csv'
+    completed = {
+        row['case'] for row in _read_rows(resource_path)
+        if int(row['field_exit_code']) == 0
+        } if resource_path.exists() else set()
+    resource_fields = [
+        'case_order', 'case', 'source', 'recipe', 'seed', 'control_photons',
+        'bleaching', 'rigid_wall_seconds', 'field_wall_seconds',
+        'total_wall_seconds', 'peak_process_rss_bytes', 'peak_tree_threads',
+        'rigid_exit_code', 'field_exit_code',
+        ]
+    metric_fields = [
+        'case_order', 'case', 'source', 'recipe', 'seed', 'control_photons',
+        'bleaching', 'method', 'group', 'n', 'eligible_n', 'valid_fraction',
+        'median_error_px', 'p95_error_px', 'over_1px_fraction',
+        'offset_y_px', 'offset_x_px', 'seconds',
+        ]
+    with (
+            resource_path.open('a' if completed else 'w', newline='') as resource_file,
+            metric_path.open('a' if completed else 'w', newline='') as metric_file,
+            ):
+        resource_writer = DictWriter(resource_file, fieldnames=resource_fields)
+        metric_writer = DictWriter(metric_file, fieldnames=metric_fields)
+        if not completed:
+            resource_writer.writeheader()
+            metric_writer.writeheader()
+        for case_i, case in enumerate(photon_cases(root), start=1):
+            if case['case'] in completed:
+                continue
+            case_root = case['root']
+            case_name = case['case']
+            print(f'{case_i:02d}/36  {case_name}  FibreSight piecewise')
+            benchmark.make_benchmark(
+                root=case_root,
+                n_frames=n_frames,
+                seed=case['seed'],
+                source=case['source'],
+                recipe=case['recipe'],
+                control_photons=case['control_photons'],
+                bleaching=case['bleaching'],
+                save_signal=False,
+                )
+            rigid = measure_method('fibresight_rigid', case, root)
+            field = measure_method('fibresight_piecewise', case, root)
+            resource_writer.writerow({
+                **{name: case[name] for name in (
+                    'case_order', 'case', 'source', 'recipe', 'seed',
+                    'control_photons', 'bleaching')},
+                'rigid_wall_seconds': rigid['wall_seconds'],
+                'field_wall_seconds': field['wall_seconds'],
+                'total_wall_seconds': rigid['wall_seconds'] + field['wall_seconds'],
+                'peak_process_rss_bytes': max(
+                    rigid['peak_process_rss_bytes'], field['peak_process_rss_bytes']),
+                'peak_tree_threads': max(
+                    rigid['peak_tree_threads'], field['peak_tree_threads']),
+                'rigid_exit_code': rigid['exit_code'],
+                'field_exit_code': field['exit_code'],
+                })
+            resource_file.flush()
+            if rigid['exit_code'] or field['exit_code']:
+                raise RuntimeError(f'FibreSight piecewise failed for {case_name}')
+            benchmark.measure(
+                case_root, ['fibresight_piecewise'], compare_references=False)
+            metric_writer.writerows({
+                **{name: case[name] for name in metric_fields[:7]},
+                **row,
+                } for row in _read_rows(case_root / 'metrics.csv'))
+            metric_file.flush()
+            for path in (
+                    case_root / 'control.tif', case_root / 'truth.npz',
+                    case_root / 'fibresight_rigid.npz',
+                    case_root / 'fibresight_piecewise.npz',
+                    case_root / 'metrics.csv',
+                    case_root / 'piecewise_metrics.csv',
+                    case_root / 'field_metrics.csv',
+                    case_root / 'field_selection.csv',
+                    case_root / 'field_confidence.csv',
+                    ):
+                path.unlink(missing_ok=True)
+
+
 def run_reference_suite(root=SUITE_ROOT):
     root = Path(root)
-    for case_i, case in enumerate(benchmark_cases(root), start=1):
+    cases = benchmark_cases(root)
+    for case_i, case in enumerate(cases, start=1):
         for method in REFERENCE_METHODS:
             if (case['root'] / REFERENCE_FILES[method]).exists():
                 continue
             case_name = case['case']
-            print(f'{case_i:02d}/12  {case_name}  {method}')
+            print(f'{case_i:02d}/{len(cases)}  {case_name}  {method}')
             log_root = case['root'] / 'logs'
             log_root.mkdir(parents=True, exist_ok=True)
             with (log_root / f'{method}_reference_convergence.txt').open('w') as log:
@@ -981,19 +1504,22 @@ def measure_suite(root=SUITE_ROOT):
         'reference_metrics.csv': 'suite_reference_metrics.csv',
         'reference_frc.csv': 'suite_reference_frc.csv',
         'method_reference_convergence.csv': 'suite_reference_convergence.csv',
-        }
+    }
     rows = {name: [] for name in outputs}
     for case in benchmark_cases(root):
         case_name = case['case']
-        print(f'measuring {case_name}')
-        benchmark.measure(case['root'], METHODS)
-        with np.load(case['root'] / 'truth.npz') as saved:
-            truth = {name: saved[name] for name in saved.files}
-        benchmark.measure_reference_convergence(case['root'], truth)
+        metrics_path = case['root'] / 'metrics.csv'
+        if not metrics_path.exists():
+            print(f'measuring {case_name}')
+            benchmark.measure(case['root'], METHODS, compare_references=False)
         for name in outputs:
-            rows[name].extend(_case_rows(case['root'] / name, case))
+            path = case['root'] / name
+            if path.exists():
+                rows[name].extend(_case_rows(path, case))
 
     for name, output in outputs.items():
+        if not rows[name]:
+            continue
         with (root / output).open('w', newline='') as file:
             writer = DictWriter(file, fieldnames=rows[name][0])
             writer.writeheader()
@@ -1094,17 +1620,216 @@ def _paired_plot(axis, rows, methods, metric, **conditions):
             method_i, np.nanmean(values[:, method_i]), marker='D', s=42,
             color=METHOD_COLOURS[method], edgecolor='white', linewidth=0.7, zorder=3,
             )
-    labels = [METHOD_NAMES[method].replace(' ', '\n', 1) for method in methods]
-    if 'patchwarp_affine' in methods:
-        labels[methods.index('patchwarp_affine')] = 'PatchWarp\naffine\n(8 to 4 on failure)'
+    labels = [_method_tick_label(method) for method in methods]
     if len(methods) > 5:
         # 16 August 2026: rotate six or more method labels so they remain legible
-        axis.set_xticks(x, labels, rotation=35, ha='right')
+        axis.set_xticks(
+            x, labels, rotation=35, ha='center', rotation_mode='anchor')
         axis.tick_params(axis='x', labelsize=7)
     else:
         axis.set_xticks(x, labels)
     axis.grid(axis='y', color='0.90', linewidth=0.6)
     axis.spines[['top', 'right']].set_visible(False)
+
+
+def summarise_source_groups(root=SUITE_ROOT, figure_root=EXAMPLE_ROOT):
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from scipy.ndimage import sobel
+
+    root = Path(root)
+    figure_root = Path(figure_root)
+    rigid_rows = _read_rows(root / 'suite_metrics.csv')
+    piecewise_rows = _read_rows(root / 'piecewise_suite_metrics.csv')
+
+    source_info = {}
+    for source in SOURCES:
+        image = benchmark._normalise(np.load(benchmark.SOURCE_ROOT / source)) ** 2
+        gradient = np.hypot(sobel(image, axis=0), sobel(image, axis=1))
+        source_info[source] = {
+            'anatomy': SOURCE_ANATOMY[source],
+            'image_side_px': image.shape[0],
+            'latent_gradient_magnitude': float(np.mean(gradient)),
+            }
+    gradient_split = np.median([
+        values['latent_gradient_magnitude'] for values in source_info.values()])
+    for values in source_info.values():
+        # the synthetic latent image uses this same percentile scaling before photon noise
+        # 18 August 2026: the median gives two equal descriptive groups for ten sources
+        values['gradient_group'] = (
+            'lower five'
+            if values['latent_gradient_magnitude'] <= gradient_split
+            else 'higher five'
+            )
+
+    comparisons = (
+        (
+            'rigid', rigid_rows, 'fibresight_rigid',
+            ('suite2p_rigid', 'caiman_rigid', 'patchwarp_rigid'),
+            ),
+        (
+            'piecewise', piecewise_rows, 'fibresight_piecewise',
+            ('suite2p_piecewise', 'caiman_piecewise',
+             'patchwarp_affine', 'pyflowreg_piecewise'),
+            ),
+        )
+    source_rows = []
+    source_scores = {}
+    for model, rows, fibresight_method, methods in comparisons:
+        for method in (fibresight_method, *methods):
+            scores = _source_values(
+                rows, method, 'p95_error_px', group='heldout')
+            source_scores[(model, method)] = scores
+            for source, score in scores.items():
+                source_rows.append({
+                    'model': model,
+                    'method': method,
+                    'source': source,
+                    **source_info[source],
+                    'gradient_split': float(gradient_split),
+                    'source_mean_p95_error_px': float(score),
+                    })
+    with (root / 'source_group_metrics.csv').open('w', newline='') as file:
+        writer = DictWriter(file, fieldnames=source_rows[0])
+        writer.writeheader()
+        writer.writerows(source_rows)
+
+    properties = (
+        ('anatomy', ('fibre', 'somatic', 'mesoscale')),
+        ('gradient_group', ('lower five', 'higher five')),
+        ('image_side_px', (128, 256, 512)),
+        )
+    group_rows = []
+    for model, _, fibresight_method, methods in comparisons:
+        fibresight = source_scores[(model, fibresight_method)]
+        for method in methods:
+            competitor = source_scores[(model, method)]
+            for property_name, groups in properties:
+                for group in groups:
+                    names = [
+                        source for source in SOURCES
+                        if source_info[source][property_name] == group
+                        and source in fibresight and source in competitor
+                        ]
+                    fibresight_values = np.asarray([
+                        fibresight[source] for source in names])
+                    competitor_values = np.asarray([
+                        competitor[source] for source in names])
+                    advantage = competitor_values - fibresight_values
+                    group_rows.append({
+                        'model': model,
+                        'property': property_name,
+                        'group': group,
+                        'comparison': method,
+                        'n_sources': len(names),
+                        'sources': ';'.join(names),
+                        'fibresight_mean_p95_error_px': float(
+                            fibresight_values.mean()) if len(names) else np.nan,
+                        'comparison_mean_p95_error_px': float(
+                            competitor_values.mean()) if len(names) else np.nan,
+                        'mean_advantage_px': float(
+                            advantage.mean()) if len(names) else np.nan,
+                        'minimum_advantage_px': float(
+                            advantage.min()) if len(names) else np.nan,
+                        'maximum_advantage_px': float(
+                            advantage.max()) if len(names) else np.nan,
+                        })
+    with (root / 'source_group_comparisons.csv').open('w', newline='') as file:
+        writer = DictWriter(file, fieldnames=group_rows[0])
+        writer.writeheader()
+        writer.writerows(group_rows)
+
+    benchmark._format_benchmark_plots()
+    figure, axes = plt.subplots(
+        2, 3, figsize=(14.5, 8.8), constrained_layout=True)
+    panel_names = {
+        'anatomy': 'anatomy',
+        'gradient_group': 'latent gradient information',
+        'image_side_px': 'stored image side (px)',
+        }
+    # 18 August 2026: fixed ranges keep near-zero comparisons legible; clipped values stay labelled
+    row_limits = {'rigid': (-0.25, 1.60), 'piecewise': (-0.25, 5.30)}
+    for row_i, (model, _, fibresight_method, methods) in enumerate(comparisons):
+        fibresight = source_scores[(model, fibresight_method)]
+        lower, upper = row_limits[model]
+        offsets = np.linspace(-0.24, 0.24, len(methods))
+        for column_i, (property_name, groups) in enumerate(properties):
+            axis = axes[row_i, column_i]
+            axis.axhline(
+                0, color=METHOD_COLOURS[fibresight_method], linewidth=1.0)
+            for method_i, method in enumerate(methods):
+                competitor = source_scores[(model, method)]
+                for group_i, group in enumerate(groups):
+                    names = [
+                        source for source in SOURCES
+                        if source_info[source][property_name] == group
+                        and source in fibresight and source in competitor
+                        ]
+                    if not names:
+                        continue
+                    advantage = np.asarray([
+                        competitor[source] - fibresight[source] for source in names])
+                    position = group_i + offsets[method_i]
+                    jitter = np.linspace(-0.025, 0.025, len(advantage))
+                    visible = np.clip(advantage, lower, upper)
+                    axis.scatter(
+                        position + jitter, visible, s=14,
+                        color=METHOD_COLOURS[method], alpha=0.35)
+                    mean = float(advantage.mean())
+                    axis.errorbar(
+                        position, mean,
+                        yerr=[[mean - max(float(advantage.min()), lower)],
+                              [min(float(advantage.max()), upper) - mean]],
+                        fmt='D', markersize=5, capsize=3,
+                        color=METHOD_COLOURS[method], zorder=3,
+                        )
+                    if advantage.max() > upper:
+                        axis.scatter(
+                            position, upper - 0.04, marker='^', s=34,
+                            facecolor='white', edgecolor=METHOD_COLOURS[method],
+                            zorder=4)
+                        axis.annotate(
+                            f'{advantage.max():.1f}',
+                            (position, upper - 0.04), xytext=(0, -11),
+                            textcoords='offset points', ha='center', fontsize=6.5,
+                            color=METHOD_COLOURS[method])
+            axis.set_xticks(range(len(groups)), [str(group) for group in groups])
+            axis.set_ylim(lower, upper)
+            axis.set_title(f'{model}: {panel_names[property_name]}')
+            axis.grid(axis='y', color='0.90', linewidth=0.6)
+            axis.spines[['top', 'right']].set_visible(False)
+            if column_i == 0:
+                axis.set_ylabel('competitor minus FibreSight p95 error (px)')
+
+    legend_methods = (
+        'suite2p_rigid', 'caiman_rigid', 'patchwarp_rigid',
+        'suite2p_piecewise', 'caiman_piecewise',
+        'patchwarp_affine', 'pyflowreg_piecewise',
+        )
+    handles = [
+        Line2D(
+            [], [], marker='D', linestyle='none', markersize=5,
+            color=METHOD_COLOURS[method],
+            label=('PatchWarp affine*' if method == 'patchwarp_affine'
+                   else METHOD_NAMES[method]),
+            )
+        for method in legend_methods]
+    figure.legend(
+        handles=handles[:3], loc='upper center', ncol=3,
+        bbox_to_anchor=(0.5, 0.995), frameon=False, fontsize=8)
+    figure.legend(
+        handles=handles[3:], loc='upper center', ncol=4,
+        bbox_to_anchor=(0.5, 0.965), frameon=False, fontsize=8)
+    _add_patchwarp_note(figure)
+    figure.get_layout_engine().set(rect=(0, 0.08, 1, 0.86))
+    figure.text(
+        0.5, 0.045,
+        'positive values mean lower FibreSight error; diamonds and bars show the mean and observed range; open triangles mark clipped values',
+        ha='center', fontsize=8)
+    figure.savefig(
+        figure_root / 'registration_benchmark_source_groups.png',
+        dpi=180, bbox_inches='tight')
+    plt.close(figure)
 
 
 def plot_accuracy(metrics, comparisons, path):
@@ -1114,7 +1839,8 @@ def plot_accuracy(metrics, comparisons, path):
 
     figure, axes = plt.subplots(1, 3, figsize=(14.5, 4.5), constrained_layout=True)
     _paired_plot(axes[0], metrics, RIGID_METHODS, 'p95_error_px', group='heldout')
-    axes[0].set_title('held-out error across 12 cases')
+    case_count = len({row['case'] for row in metrics if row['group'] == 'heldout'})
+    axes[0].set_title(f'held-out error across {case_count} cases')
     axes[0].set_ylabel('95th-percentile error (px)')
 
     compared = [
@@ -1141,7 +1867,7 @@ def plot_accuracy(metrics, comparisons, path):
         ]
     axes[1].set_xticks(x, comparison_labels)
     axes[1].set_title('paired source mean advantage (95% t CI)')
-    axes[1].set_ylabel('competitor error minus\nFibreSight error (px)')
+    axes[1].set_ylabel('competitor error minus FibreSight error (px)')
     axes[1].text(
         0.48, 0.72, 'Bonferroni-corrected Wilcoxon p',
         transform=axes[1].transAxes, fontsize=8.5,
@@ -1152,7 +1878,7 @@ def plot_accuracy(metrics, comparisons, path):
         suffix = ' (n.s.)' if corrected_p >= 0.05 else ''
         axes[1].text(
             0.48, 0.66 - 0.06 * row_i,
-            f'{METHOD_NAMES[method]}: p = {corrected_p:.4f}{suffix}',
+            f'{METHOD_NAMES[method]}: p = {corrected_p:.3g}{suffix}',
             color=METHOD_COLOURS[method],
             transform=axes[1].transAxes, fontsize=8.5,
             )
@@ -1165,6 +1891,7 @@ def plot_accuracy(metrics, comparisons, path):
         )
     axes[2].set_title('rigid methods on local deformation')
     axes[2].set_ylabel('95th-percentile error (px)')
+    axes[2].set_ylim(bottom=0)
     figure.savefig(path, dpi=180, bbox_inches='tight')
     plt.close(figure)
 
@@ -1174,12 +1901,23 @@ def plot_deformation(metrics, path):
 
     benchmark._format_benchmark_plots()
     figure, axis = plt.subplots(figsize=(9.5, 5.2), constrained_layout=True)
+    rigid_then_piecewise = (
+        *RIGID_METHODS,
+        'suite2p_piecewise', 'caiman_piecewise',
+        'patchwarp_affine', 'pyflowreg_piecewise',
+        )
     _paired_plot(
-        axis, metrics, METHODS, 'p95_error_px',
+        axis, metrics, rigid_then_piecewise, 'p95_error_px',
         group='nonrigid', recipe='local_deformation',
         )
+    axis.axvline(3.5, color='0.65', linewidth=0.8)
+    axis.text(0.25, 0.98, 'rigid', transform=axis.transAxes, ha='center', va='top')
+    axis.text(
+        0.75, 0.98, 'piecewise', transform=axis.transAxes,
+        ha='center', va='top')
     axis.set_title('motivation for non-rigid registration')
     axis.set_ylabel('95th-percentile error (px)')
+    _add_patchwarp_note(figure)
     figure.savefig(path, dpi=180, bbox_inches='tight')
     plt.close(figure)
 
@@ -1288,6 +2026,11 @@ def plot_resources(resource_rows, reference_rows, path):
         _paired_plot(axis, rows, methods, metric)
         axis.set_title(title)
         axis.set_ylabel(ylabel)
+        if metric in ('wall_seconds', 'cpu_seconds'):
+            # 18 August 2026: the 512 px cases span two orders of magnitude
+            axis.set_yscale('log')
+            axis.set_ylabel('seconds (log scale)')
+    _add_patchwarp_note(figure)
     figure.savefig(path, dpi=180, bbox_inches='tight')
     plt.close(figure)
 
@@ -1336,6 +2079,34 @@ def plot_noise_sweep(rows, path):
         axis.tick_params(axis='x', which='minor', labelbottom=False)
         axis.grid(color='0.90', linewidth=0.6)
         axis.spines[['top', 'right']].set_visible(False)
+        if recipe == 'focal_change':
+            pyflowreg = [
+                _sweep_values(
+                    rows, 'pyflowreg_piecewise', 'control_photons', photons,
+                    recipe=recipe).mean()
+                for photons in PHOTON_COUNTS
+                ]
+            axis.set_ylim(0, 3)
+            for photons, value in zip(PHOTON_COUNTS, pyflowreg):
+                if value <= 3:
+                    continue
+                axis.plot(
+                    photons, 2.95, marker='o', linestyle='none',
+                    markerfacecolor='none',
+                    markeredgecolor=METHOD_COLOURS['pyflowreg_piecewise'],
+                    clip_on=False,
+                    )
+                axis.annotate(
+                    f'{value:.1f} px',
+                    xy=(photons, 2.95), xytext=(0, -20),
+                    textcoords='offset points', ha='center', fontsize=7,
+                    color=METHOD_COLOURS['pyflowreg_piecewise'],
+                    arrowprops={
+                        'arrowstyle': '->',
+                        'color': METHOD_COLOURS['pyflowreg_piecewise'],
+                        'linewidth': 0.8,
+                        },
+                    )
     axes[0, 0].legend(frameon=False, fontsize=7)
 
     for method in METHODS:
@@ -1711,7 +2482,7 @@ def _plot_focal_candidates(results, path):
         onset_delay = row['onset_delay_s']
         delay = (
             f'{onset_delay:+.2f} s' if np.isfinite(onset_delay) else 'no onset')
-        source = row['source'].removesuffix('_ref_mat_ch2.npy')
+        source = row['source']
         peak_sigma = row['peak_sigma_px']
         peak_loss = row['peak_contrast_loss']
         status = row['status']
@@ -1781,7 +2552,7 @@ def measure_focal_suite(
             timestamps=timestamps,
             )
         detected = quality['recommended_state'] == 'focal_loss'
-        source_name = case['source'].removesuffix('_ref_mat_ch2.npy')
+        source_name = case['source']
         for split, start, stop in (
                 ('calibration', 0, half), ('heldout', half, len(movie))):
             counts = _focal_counts(truth, detected, start, stop)
@@ -2028,6 +2799,9 @@ def summarise_suite(root=SUITE_ROOT, figure_root=EXAMPLE_ROOT):
     references = _read_rows(root / 'suite_reference_metrics.csv')
     frc = _read_rows(root / 'suite_reference_frc.csv')
     convergence = _read_rows(root / 'suite_reference_convergence.csv')
+    base_references = [row for row in references if row['source'] in BASE_SOURCES]
+    base_frc = [row for row in frc if row['source'] in BASE_SOURCES]
+    base_convergence = [row for row in convergence if row['source'] in BASE_SOURCES]
     resources = _read_rows(root / 'resources.csv')
     resources = [row for row in resources if int(row['exit_code']) == 0]
     for row in resources:
@@ -2042,7 +2816,7 @@ def summarise_suite(root=SUITE_ROOT, figure_root=EXAMPLE_ROOT):
         ('accuracy', 'local_deformation_nonrigid', metrics, METHODS,
          ('median_error_px', 'p95_error_px'),
          {'group': 'nonrigid', 'recipe': 'local_deformation'}),
-        ('reference', 'all', references, REFERENCE_METHODS,
+        ('reference', 'all', base_references, REFERENCE_METHODS,
          ('gradient_ncc', 'adjusted_rmse', 'ssim', 'heldout_p95_error_px'), {}),
         ('resources', 'all', resources, METHODS,
          ('wall_seconds', 'cpu_seconds', 'average_cores', 'peak_tree_rss_gib'), {}),
@@ -2064,7 +2838,7 @@ def summarise_suite(root=SUITE_ROOT, figure_root=EXAMPLE_ROOT):
     comparison_groups = (
         ('accuracy', 'heldout', metrics,
          (('median_error_px', False), ('p95_error_px', False)), {'group': 'heldout'}),
-        ('reference', 'all', references,
+        ('reference', 'all', base_references,
          (('gradient_ncc', True), ('adjusted_rmse', False),
           ('ssim', True), ('heldout_p95_error_px', False)), {}),
         )
@@ -2138,10 +2912,10 @@ def summarise_suite(root=SUITE_ROOT, figure_root=EXAMPLE_ROOT):
     plot_deformation(
         metrics, figure_root / 'registration_benchmark_deformation.png')
     plot_references(
-        references, frc, convergence,
+        base_references, base_frc, base_convergence,
         figure_root / 'registration_benchmark_references.png')
     plot_resources(
-        resources, references, figure_root / 'registration_benchmark_resources.png')
+        resources, base_references, figure_root / 'registration_benchmark_resources.png')
 
 
 #%% command line
@@ -2153,8 +2927,12 @@ def main():
             'run-intensity', 'summarise-intensity',
             'make-real', 'run-real', 'measure-real',
             'make-focal', 'run-focal', 'measure-focal',
+            'run-piecewise', 'measure-piecewise',
+            'measure-auto',
+            'summarise-piecewise',
+            'run-piecewise-intensity',
             'quality', 'review-rigid',
-            'method', 'reference',
+            'method', 'reference', 'tile', 'measure-tile', 'field', 'measure-field',
             ])
     parser.add_argument('method', nargs='?')
     parser.add_argument('case_root', nargs='?', type=Path)
@@ -2196,10 +2974,28 @@ def main():
         run_focal_suite(focal_root)
     elif args.step == 'measure-focal':
         measure_focal_suite(focal_root)
+    elif args.step == 'run-piecewise':
+        run_piecewise_suite(suite_root)
+    elif args.step == 'measure-piecewise':
+        measure_piecewise_suite(suite_root)
+    elif args.step == 'measure-auto':
+        measure_auto_suite(suite_root)
+    elif args.step == 'summarise-piecewise':
+        summarise_piecewise_suite(suite_root, INTENSITY_ROOT)
+    elif args.step == 'run-piecewise-intensity':
+        run_piecewise_intensity_suite(intensity_root, args.frames)
     elif args.step == 'quality':
         measure_quality_suite(suite_root)
     elif args.step == 'method':
         _run_method(args.method, args.case_root)
+    elif args.step == 'tile':
+        _run_tile_method(args.method, args.case_root)
+    elif args.step == 'measure-tile':
+        benchmark.measure_tile_evidence(suite_root)
+    elif args.step == 'field':
+        _run_field_method(args.method, args.case_root)
+    elif args.step == 'measure-field':
+        benchmark.measure_tile_fields(suite_root)
     else:
         _run_reference(args.method, args.case_root)
 

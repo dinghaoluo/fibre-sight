@@ -26,7 +26,7 @@ from fibre_sight.predict_rois import predict_roi_dict
 #%% test
 class ExamplePredictionTests(unittest.TestCase):
     def test_bundled_example_prediction(self):
-        image_path = PROJECT_ROOT / 'examples' / 'demo_test_ref_mat_ch2.npy'
+        image_path = PROJECT_ROOT / 'benchmarking' / 'sources' / 'lab-fibresight-demo-test.npy'
         image = np.load(image_path)
 
         with tempfile.TemporaryDirectory() as temp_dir:

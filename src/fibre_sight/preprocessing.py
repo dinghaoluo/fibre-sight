@@ -1,8 +1,8 @@
 '''
 Created on 14 August 2026
-Modified on 17 August 2026
+Modified on 18 August 2026
 
-read paired TIFF frames, correct rigid movement, and record registration QC
+read paired TIFF frames, correct rigid and piecewise movement, and record registration QC
 
 @author: Dinghao Luo
 '''
@@ -16,6 +16,7 @@ import re
 import cv2
 import numpy as np
 from scipy import fft, ndimage as ndi
+from scipy.interpolate import RegularGridInterpolator
 from scipy.signal.windows import tukey
 import tifffile
 
@@ -332,6 +333,717 @@ def estimate_shift(
     return _estimate_shift(prepared, frame, upsample=upsample, whitening=whitening)
 
 
+#%% local registration
+def _tile_grid(shape, tile_size=64, stride=None):
+    stride = tile_size // 2 if stride is None else stride
+    starts_y = np.arange(0, shape[0] - tile_size + 1, stride, dtype=int)
+    starts_x = np.arange(0, shape[1] - tile_size + 1, stride, dtype=int)
+    if starts_y[-1] != shape[0] - tile_size:
+        starts_y = np.r_[starts_y, shape[0] - tile_size]
+    if starts_x[-1] != shape[1] - tile_size:
+        starts_x = np.r_[starts_x, shape[1] - tile_size]
+    tile_y, tile_x = np.meshgrid(starts_y, starts_x, indexing='ij')
+    return {
+        'start_y': tile_y.ravel(),
+        'start_x': tile_x.ravel(),
+        'tile_y': (tile_y + (tile_size - 1) / 2).ravel(),
+        'tile_x': (tile_x + (tile_size - 1) / 2).ravel(),
+        'n_y': len(starts_y),
+        'n_x': len(starts_x),
+        'tile_size': int(tile_size),
+        'stride': int(stride),
+        }
+
+
+def _prepare_tile_reference(reference, tile_size=64, stride=None):
+    reference = np.asarray(reference, dtype=np.float32)
+    grid = _tile_grid(reference.shape, tile_size, stride)
+    reference_image = _registration_image(reference)
+    taper = _taper((tile_size, tile_size))
+    reference_fft = []
+    structure = []
+    for y0, x0 in zip(grid['start_y'], grid['start_x']):
+        tile = reference_image[y0:y0 + tile_size, x0:x0 + tile_size]
+        reference_fft.append(fft.fftn(tile * taper))
+        smooth = cv2.GaussianBlur(tile, (5, 5), 1, borderType=cv2.BORDER_REFLECT)
+        gradient_y, gradient_x = np.gradient(smooth)
+        structure.append([
+            np.mean(gradient_y * gradient_y),
+            np.mean(gradient_y * gradient_x),
+            np.mean(gradient_x * gradient_x),
+            ])
+    return {
+        **grid,
+        'reference_fft': np.asarray(reference_fft, dtype=np.complex64),
+        'structure': np.asarray(structure, dtype=np.float32),
+        'shape': reference.shape,
+        }
+
+
+def _surface_entropy(surface):
+    surface = np.asarray(surface, dtype=np.float64)
+    scale = 1.4826 * np.median(np.abs(surface - np.median(surface)))
+    scale = max(scale, np.finfo(np.float64).eps)
+    probability = np.exp(np.clip((surface - surface.max()) / scale, -30, 0))
+    probability /= probability.sum()
+    return float(-np.sum(probability * np.log(probability)) / np.log(surface.size))
+
+
+def _peak_curvature(surface, peak=None):
+    peak_y, peak_x = (
+        np.unravel_index(np.argmax(surface), surface.shape) if peak is None else peak)
+    if peak_y in (0, surface.shape[0] - 1) or peak_x in (0, surface.shape[1] - 1):
+        return np.full(3, np.nan, dtype=np.float32)
+    centre = surface[peak_y, peak_x]
+    curvature_yy = 2 * centre - surface[peak_y - 1, peak_x] - surface[peak_y + 1, peak_x]
+    curvature_xx = 2 * centre - surface[peak_y, peak_x - 1] - surface[peak_y, peak_x + 1]
+    curvature_yx = -0.25 * (
+        surface[peak_y + 1, peak_x + 1]
+        - surface[peak_y + 1, peak_x - 1]
+        - surface[peak_y - 1, peak_x + 1]
+        + surface[peak_y - 1, peak_x - 1]
+        )
+    return np.asarray([curvature_yy, curvature_yx, curvature_xx], dtype=np.float32)
+
+
+def _tile_surface(
+        reference_fft,
+        tile,
+        search_radius,
+        upsample,
+        whitening,
+        selection_radius=None,
+        ):
+    product = reference_fft * fft.fftn(tile).conj()
+    if whitening:
+        magnitude = np.abs(product)
+        product /= np.maximum(magnitude, np.finfo(magnitude.dtype).eps) ** whitening
+    correlation = np.abs(fft.ifftn(product))
+    shifts = np.arange(-search_radius, search_radius + 1)
+    surface = correlation[np.ix_(shifts % tile.shape[0], shifts % tile.shape[1])]
+    selected = surface
+    if selection_radius is not None:
+        selected = np.where(
+            (np.abs(shifts[:, None]) <= selection_radius)
+            & (np.abs(shifts[None, :]) <= selection_radius),
+            surface,
+            -np.inf,
+            )
+    peak_y, peak_x = np.unravel_index(np.argmax(selected), selected.shape)
+    residual = np.asarray([
+        shifts[peak_y],
+        shifts[peak_x],
+        ], dtype=float)
+    region_size = int(np.ceil(upsample * 1.5))
+    centre = np.trunc(region_size / 2)
+    offsets = centre - residual * upsample
+    local = _local_dft(
+        product.conj(), region_size, upsample, offsets).conj()
+    local_peak = np.unravel_index(np.argmax(np.abs(local)), local.shape)
+    residual += (np.asarray(local_peak) - centre) / upsample
+    away_from_peak = (
+        (np.abs(np.arange(surface.shape[0])[:, None] - peak_y) > 1)
+        | (np.abs(np.arange(surface.shape[1])[None, :] - peak_x) > 1)
+        )
+    second_peak = surface[away_from_peak].max()
+    peak_ratio = surface[peak_y, peak_x] / second_peak if second_peak else np.nan
+    boundary_radius = search_radius if selection_radius is None else selection_radius
+    return {
+        'surface': surface.astype(np.float32),
+        'residual': residual,
+        'peak_ratio': float(peak_ratio),
+        'entropy': _surface_entropy(surface),
+        'curvature': _peak_curvature(surface, (peak_y, peak_x)),
+        'search_boundary': (
+            abs(shifts[peak_y]) == boundary_radius
+            or abs(shifts[peak_x]) == boundary_radius
+            ),
+        }
+
+
+def _neighbour_residual(residual, n_y, n_x):
+    field = np.asarray(residual, dtype=np.float32).reshape(n_y, n_x, 2)
+    padded = np.pad(field, ((1, 1), (1, 1), (0, 0)), mode='edge')
+    result = np.empty((n_y, n_x), dtype=np.float32)
+    for y in range(n_y):
+        for x in range(n_x):
+            neighbours = padded[y:y + 3, x:x + 3].reshape(-1, 2)
+            neighbours = np.delete(neighbours, 4, axis=0)
+            centre = np.median(neighbours, axis=0)
+            spread = np.median(np.linalg.norm(neighbours - centre, axis=1)) + 0.1
+            result[y, x] = np.linalg.norm(field[y, x] - centre) / spread
+    return result.ravel()
+
+
+def _shift_registration_image(frame, shift):
+    frame = _registration_image(frame)
+    matrix = np.array([[1, 0, shift[1]], [0, 1, shift[0]]], dtype=np.float32)
+    return cv2.warpAffine(
+        frame,
+        matrix,
+        (frame.shape[1], frame.shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT,
+        )
+
+
+def _estimate_tile_shifts_from_image(
+        prepared,
+        frame_image,
+        *,
+        search_radius=3,
+        upsample=10,
+        whitening=0,
+        prediction=None,
+        selection_radius=None,
+        ):
+    if prediction is None:
+        prediction = np.zeros((len(prepared['tile_y']), 2), dtype=np.float32)
+    taper = _taper((prepared['tile_size'], prepared['tile_size']))
+    surfaces = []
+    residual = []
+    peak_ratio = []
+    entropy = []
+    curvature = []
+    search_boundary = []
+    for tile_i, (y0, x0, reference_fft) in enumerate(zip(
+            prepared['start_y'], prepared['start_x'], prepared['reference_fft'])):
+        predicted_y, predicted_x = prediction[tile_i]
+        # 17 August 2026: exact crops avoid another interpolation in the single-scale pass
+        if predicted_y == 0 and predicted_x == 0:
+            tile = frame_image[
+                y0:y0 + prepared['tile_size'],
+                x0:x0 + prepared['tile_size'],
+                ]
+        else:
+            tile = cv2.getRectSubPix(
+                frame_image,
+                (prepared['tile_size'], prepared['tile_size']),
+                (
+                    float(prepared['tile_x'][tile_i] - predicted_x),
+                    float(prepared['tile_y'][tile_i] - predicted_y),
+                    ),
+                )
+        result = _tile_surface(
+            reference_fft,
+            tile * taper,
+            search_radius,
+            upsample,
+            whitening,
+            selection_radius,
+            )
+        surfaces.append(result['surface'])
+        residual.append(result['residual'])
+        peak_ratio.append(result['peak_ratio'])
+        entropy.append(result['entropy'])
+        curvature.append(result['curvature'])
+        search_boundary.append(result['search_boundary'])
+    incremental = np.asarray(residual, dtype=np.float32)
+    residual = prediction + incremental
+    curvature = np.asarray(curvature, dtype=np.float32)
+    structure = prepared['structure']
+    return {
+        'tile_y': prepared['tile_y'].copy(),
+        'tile_x': prepared['tile_x'].copy(),
+        'residual_y': residual[:, 0],
+        'residual_x': residual[:, 1],
+        'predicted_residual_y': prediction[:, 0],
+        'predicted_residual_x': prediction[:, 1],
+        'incremental_residual_y': incremental[:, 0],
+        'incremental_residual_x': incremental[:, 1],
+        'peak_ratio': np.asarray(peak_ratio, dtype=np.float32),
+        'surface': np.asarray(surfaces, dtype=np.float32),
+        'surface_entropy': np.asarray(entropy, dtype=np.float32),
+        'curvature_yy': curvature[:, 0],
+        'curvature_yx': curvature[:, 1],
+        'curvature_xx': curvature[:, 2],
+        'structure_yy': structure[:, 0],
+        'structure_yx': structure[:, 1],
+        'structure_xx': structure[:, 2],
+        'neighbour_residual': _neighbour_residual(
+            residual, prepared['n_y'], prepared['n_x']),
+        'search_boundary': np.asarray(search_boundary, dtype=bool),
+        'search_radius': np.int16(search_radius),
+        'selection_radius': np.int16(
+            search_radius if selection_radius is None else selection_radius),
+        'upsample': np.int16(upsample),
+        'whitening': np.float32(whitening),
+        }
+
+
+def _estimate_tile_shifts(
+        prepared,
+        frame,
+        rigid_shift,
+        *,
+        search_radius=3,
+        upsample=10,
+        whitening=0,
+        ):
+    result = _estimate_tile_shifts_from_image(
+        prepared,
+        _shift_registration_image(frame, rigid_shift),
+        search_radius=search_radius,
+        upsample=upsample,
+        whitening=whitening,
+        )
+    result['rigid_shift_y'] = np.float32(rigid_shift[0])
+    result['rigid_shift_x'] = np.float32(rigid_shift[1])
+    return result
+
+
+def _interpolate_tile_field(source, residual, target):
+    source_y = source['tile_y'].reshape(source['n_y'], source['n_x'])[:, 0]
+    source_x = source['tile_x'].reshape(source['n_y'], source['n_x'])[0]
+    # 17 August 2026: extrapolation amplified noisy edge estimates; edge tiles use the nearest coarse value
+    points = np.column_stack([
+        np.clip(target['tile_y'], source_y[0], source_y[-1]),
+        np.clip(target['tile_x'], source_x[0], source_x[-1]),
+        ])
+    return RegularGridInterpolator(
+        (source_y, source_x),
+        residual.reshape(source['n_y'], source['n_x']),
+        )(points).astype(np.float32)
+
+
+def _estimate_tile_shifts_coarse_to_fine(
+        coarse,
+        fine,
+        frame,
+        rigid_shift,
+        *,
+        search_radius=3,
+        fine_radius=1,
+        upsample=10,
+        whitening=0,
+        ):
+    frame_image = _shift_registration_image(frame, rigid_shift)
+    coarse_result = _estimate_tile_shifts_from_image(
+        coarse,
+        frame_image,
+        search_radius=search_radius,
+        upsample=upsample,
+        whitening=whitening,
+        )
+    prediction = np.column_stack([
+        _interpolate_tile_field(coarse, coarse_result['residual_y'], fine),
+        _interpolate_tile_field(coarse, coarse_result['residual_x'], fine),
+        ])
+    # 17 August 2026: the surface stays 7 x 7; the coarse pass confines its fine peak to +/-1 px
+    # each fine tile returns to the rigid image, which avoids another resampling step
+    result = _estimate_tile_shifts_from_image(
+        fine,
+        frame_image,
+        search_radius=search_radius,
+        upsample=upsample,
+        whitening=whitening,
+        prediction=prediction,
+        selection_radius=fine_radius,
+        )
+    result['rigid_shift_y'] = np.float32(rigid_shift[0])
+    result['rigid_shift_x'] = np.float32(rigid_shift[1])
+    result['coarse'] = coarse_result
+    return result
+
+
+def estimate_tile_shifts(
+        reference,
+        frame,
+        rigid_shift,
+        *,
+        tile_size=64,
+        stride=None,
+        search_radius=3,
+        upsample=10,
+        whitening=0,
+        ):
+    prepared = _prepare_tile_reference(reference, tile_size, stride)
+    return _estimate_tile_shifts(
+        prepared,
+        frame,
+        rigid_shift,
+        search_radius=search_radius,
+        upsample=upsample,
+        whitening=whitening,
+        )
+
+
+def estimate_tile_shifts_coarse_to_fine(
+        reference,
+        frame,
+        rigid_shift,
+        *,
+        coarse_tile_size=128,
+        tile_size=64,
+        stride=None,
+        search_radius=3,
+        fine_radius=1,
+        upsample=10,
+        whitening=0,
+        ):
+    coarse = _prepare_tile_reference(
+        reference, coarse_tile_size, coarse_tile_size // 2)
+    fine = _prepare_tile_reference(reference, tile_size, stride)
+    return _estimate_tile_shifts_coarse_to_fine(
+        coarse,
+        fine,
+        frame,
+        rigid_shift,
+        search_radius=search_radius,
+        fine_radius=fine_radius,
+        upsample=upsample,
+        whitening=whitening,
+        )
+
+
+#%% local field
+def _surface_precision(surfaces):
+    # 17 August 2026: full-surface covariance carries ambiguity and direction in one quantity
+    shifts = np.arange(-(surfaces.shape[-1] // 2), surfaces.shape[-1] // 2 + 1)
+    shift_y, shift_x = np.meshgrid(shifts, shifts, indexing='ij')
+    coordinates = np.column_stack([shift_y.ravel(), shift_x.ravel()])
+    precision = []
+    for surface in surfaces:
+        values = np.asarray(surface, dtype=np.float64).ravel()
+        scale = 1.4826 * np.median(np.abs(values - np.median(values)))
+        scale = max(scale, np.finfo(np.float64).eps)
+        probability = np.exp(np.clip((values - values.max()) / scale, -30, 0))
+        probability /= probability.sum()
+        centre = probability @ coordinates
+        difference = coordinates - centre
+        covariance = (difference * probability[:, None]).T @ difference
+        precision.append(np.linalg.inv(covariance + 0.01 * np.eye(2)))
+    return np.asarray(precision, dtype=np.float32)
+
+
+def _cubic_bspline(distance):
+    distance = np.abs(np.asarray(distance, dtype=np.float64))
+    basis = np.zeros_like(distance)
+    central = distance < 1
+    outer = (distance >= 1) & (distance < 2)
+    basis[central] = (
+        2 / 3 - distance[central] ** 2 + distance[central] ** 3 / 2)
+    basis[outer] = (2 - distance[outer]) ** 3 / 6
+    return basis
+
+
+def _spline_grid(shape, spacing):
+    control_y = np.arange(-spacing, shape[0] + 2 * spacing, spacing, dtype=float)
+    control_x = np.arange(-spacing, shape[1] + 2 * spacing, spacing, dtype=float)
+    return control_y, control_x
+
+
+def _spline_basis(sample_y, sample_x, control_y, control_x, spacing):
+    basis_y = _cubic_bspline(
+        (np.asarray(sample_y)[:, None] - control_y[None]) / spacing)
+    basis_x = _cubic_bspline(
+        (np.asarray(sample_x)[:, None] - control_x[None]) / spacing)
+    return np.einsum('iy,ix->iyx', basis_y, basis_x).reshape(len(basis_y), -1)
+
+
+def _spline_penalty(n_y, n_x, magnitude=0.01):
+    identity_y = np.eye(n_y)
+    identity_x = np.eye(n_x)
+    first_y = np.diff(identity_y, axis=0)
+    first_x = np.diff(identity_x, axis=0)
+    second_y = np.diff(identity_y, n=2, axis=0)
+    second_x = np.diff(identity_x, n=2, axis=0)
+    dyy = np.kron(second_y, identity_x)
+    dxx = np.kron(identity_y, second_x)
+    dyx = np.kron(first_y, first_x)
+    return (
+        dyy.T @ dyy
+        + 2 * dyx.T @ dyx
+        + dxx.T @ dxx
+        + magnitude * np.eye(n_y * n_x)
+        )
+
+
+def _tile_field_evidence(tiles, accepted=None):
+    precision = _surface_precision(tiles['surface'])
+    if accepted is None:
+        # 17 August 2026: 2 is the normalised-median PIV limit; it stays fixed for held-out work
+        accepted = (
+            (tiles['neighbour_residual'] <= 2)
+            & ~tiles['search_boundary']
+            & (tiles['peak_ratio'] >= 1)
+            )
+    scale = (
+        np.median(np.trace(precision[accepted], axis1=1, axis2=2))
+        if accepted.any() else 1)
+    return {
+        'accepted': np.asarray(accepted, dtype=bool),
+        'precision': precision / scale,
+        }
+
+
+def fit_tile_field(
+        tiles,
+        shape,
+        tile_size,
+        *,
+        spatial_penalty=1,
+        magnitude_penalty=0.01,
+        accepted=None,
+        evidence=None,
+        ):
+    residual = np.column_stack([tiles['residual_y'], tiles['residual_x']])
+    evidence = _tile_field_evidence(tiles, accepted) if evidence is None else evidence
+    accepted = evidence['accepted']
+    precision = evidence['precision']
+
+    control_y, control_x = _spline_grid(shape, tile_size)
+    basis = _spline_basis(
+        tiles['tile_y'], tiles['tile_x'], control_y, control_x, tile_size)
+    n_coefficients = basis.shape[1]
+    n_parameters = 2 + 2 * n_coefficients
+    parameters = np.zeros(n_parameters, dtype=np.float64)
+    if np.mean(accepted) >= 0.60:
+        normal = np.zeros((n_parameters, n_parameters), dtype=np.float64)
+        target = np.zeros(n_parameters, dtype=np.float64)
+        for tile_i in np.flatnonzero(accepted):
+            design = np.zeros((2, n_parameters), dtype=np.float64)
+            design[0, 0] = 1
+            design[1, 1] = 1
+            design[0, 2:2 + n_coefficients] = basis[tile_i]
+            design[1, 2 + n_coefficients:] = basis[tile_i]
+            weight = precision[tile_i]
+            normal += design.T @ weight @ design
+            target += design.T @ weight @ residual[tile_i]
+
+        # 17 August 2026: bending scales with inverse control-point area
+        # magnitude shrinkage leaves shared movement with the unpenalised global adjustment
+        penalty = (
+            spatial_penalty
+            * _spline_penalty(
+                len(control_y), len(control_x), magnitude=magnitude_penalty)
+            / tile_size ** 2
+            )
+        normal[2:2 + n_coefficients, 2:2 + n_coefficients] += penalty
+        normal[2 + n_coefficients:, 2 + n_coefficients:] += penalty
+        parameters = np.linalg.solve(normal, target)
+    global_shift = parameters[:2]
+    coefficient_y = parameters[2:2 + n_coefficients]
+    coefficient_x = parameters[2 + n_coefficients:]
+    predicted = np.column_stack([
+        global_shift[0] + basis @ coefficient_y,
+        global_shift[1] + basis @ coefficient_x,
+        ])
+    return {
+        'global_shift_y': np.float32(global_shift[0]),
+        'global_shift_x': np.float32(global_shift[1]),
+        'coefficient_y': coefficient_y.reshape(len(control_y), len(control_x)).astype(np.float32),
+        'coefficient_x': coefficient_x.reshape(len(control_y), len(control_x)).astype(np.float32),
+        'control_y': control_y.astype(np.float32),
+        'control_x': control_x.astype(np.float32),
+        'tile_y': tiles['tile_y'].copy(),
+        'tile_x': tiles['tile_x'].copy(),
+        'predicted_y': predicted[:, 0].astype(np.float32),
+        'predicted_x': predicted[:, 1].astype(np.float32),
+        'accepted': np.asarray(accepted, dtype=bool),
+        'precision_yy': precision[:, 0, 0],
+        'precision_yx': precision[:, 0, 1],
+        'precision_xx': precision[:, 1, 1],
+        'spatial_penalty': np.float32(spatial_penalty),
+        'magnitude_penalty': np.float32(magnitude_penalty),
+        'tile_size': np.int16(tile_size),
+        }
+
+
+def refine_tile_field(
+        tiles,
+        shape,
+        tile_size,
+        *,
+        spatial_penalty=10,
+        magnitude_penalty=1,
+        residual_limit=0.28,
+        evidence=None,
+        initial=None,
+        ):
+    evidence = _tile_field_evidence(tiles) if evidence is None else evidence
+    if initial is None:
+        initial = fit_tile_field(
+            tiles,
+            shape,
+            tile_size,
+            spatial_penalty=spatial_penalty,
+            magnitude_penalty=magnitude_penalty,
+            evidence=evidence,
+            )
+    difference = np.column_stack([
+        initial['predicted_y'] - tiles['residual_y'],
+        initial['predicted_x'] - tiles['residual_x'],
+        ])
+    field_residual = np.sqrt(np.einsum(
+        'ni,nij,nj->n', difference, evidence['precision'], difference))
+    refined_evidence = {
+        'accepted': evidence['accepted'] & (field_residual <= residual_limit),
+        'precision': evidence['precision'],
+        }
+    refined = fit_tile_field(
+        tiles,
+        shape,
+        tile_size,
+        spatial_penalty=spatial_penalty,
+        magnitude_penalty=magnitude_penalty,
+        evidence=refined_evidence,
+        )
+    refined['field_residual'] = field_residual.astype(np.float32)
+    refined['residual_limit'] = np.float32(residual_limit)
+    return refined
+
+
+def evaluate_tile_field(field, sample_y, sample_x):
+    basis = _spline_basis(
+        np.asarray(sample_y).ravel(),
+        np.asarray(sample_x).ravel(),
+        field['control_y'],
+        field['control_x'],
+        int(field['tile_size']),
+        )
+    shift_y = field['global_shift_y'] + basis @ field['coefficient_y'].ravel()
+    shift_x = field['global_shift_x'] + basis @ field['coefficient_x'].ravel()
+    return shift_y.reshape(np.shape(sample_y)), shift_x.reshape(np.shape(sample_x))
+
+
+def tile_field_image(field, shape):
+    sample_y = np.arange(shape[0])
+    sample_x = np.arange(shape[1])
+    basis_y = _cubic_bspline(
+        (sample_y[:, None] - field['control_y'][None]) / int(field['tile_size']))
+    basis_x = _cubic_bspline(
+        (sample_x[:, None] - field['control_x'][None]) / int(field['tile_size']))
+    shift_y = (
+        field['global_shift_y']
+        + basis_y @ field['coefficient_y'] @ basis_x.T)
+    shift_x = (
+        field['global_shift_x']
+        + basis_y @ field['coefficient_x'] @ basis_x.T)
+    return shift_y.astype(np.float32), shift_x.astype(np.float32)
+
+
+def assess_tile_field(field, shape, *, focal_loss=False):
+    shift_y, shift_x = tile_field_image(field, shape)
+    dy_dy, dy_dx = np.gradient(shift_y)
+    dx_dy, dx_dx = np.gradient(shift_x)
+    # 17 August 2026: sampling uses p-u(p); its Jacobian carries the same minus sign
+    jacobian = (1 - dy_dy) * (1 - dx_dx) - dy_dx * dx_dy
+    tile_y = field['tile_y']
+    tile_x = field['tile_x']
+    n_y = len(np.unique(tile_y))
+    n_x = len(np.unique(tile_x))
+    neighbour_difference = np.nan
+    if n_y >= 3 and n_x >= 3:
+        predicted = np.stack([
+            field['predicted_y'].reshape(n_y, n_x),
+            field['predicted_x'].reshape(n_y, n_x),
+            ], axis=-1)
+        neighbour_difference = max(
+            np.linalg.norm(np.diff(predicted, axis=0), axis=-1).max(),
+            np.linalg.norm(np.diff(predicted, axis=1), axis=-1).max(),
+            )
+    maximum = float(np.hypot(shift_y, shift_x).max())
+    accepted_fraction = float(np.mean(field['accepted']))
+    reason = 'accepted'
+    if n_y < 3 or n_x < 3 or accepted_fraction < 0.60:
+        reason = 'insufficient_tiles'
+    elif focal_loss:
+        reason = 'focal_loss'
+    elif maximum > 3:
+        reason = 'field_overshoot'
+    elif neighbour_difference > 3:
+        reason = 'neighbour_disagreement'
+    elif jacobian.min() < 0.80 or jacobian.max() > 1.25:
+        reason = 'jacobian_limit'
+    return {
+        'model_used': 'piecewise_rigid' if reason == 'accepted' else 'rigid',
+        'fallback_reason': reason,
+        'accepted_tile_fraction': accepted_fraction,
+        'field_rms_px': float(np.sqrt(np.mean(shift_y ** 2 + shift_x ** 2))),
+        'field_max_px': maximum,
+        'neighbour_difference_max_px': float(neighbour_difference),
+        'jacobian_min': float(jacobian.min()),
+        'jacobian_max': float(jacobian.max()),
+        }
+
+
+def field_coordinates(field, shape, rigid_shift=(0, 0), static_offset=(0, 0)):
+    residual_y, residual_x = tile_field_image(field, shape)
+    y, x = np.indices(shape, dtype=np.float32)
+    correction_y = rigid_shift[0] + residual_y + static_offset[0]
+    correction_x = rigid_shift[1] + residual_x + static_offset[1]
+    source_y = y - correction_y
+    source_x = x - correction_x
+    valid = (
+        (source_y >= 0) & (source_y <= shape[0] - 1)
+        & (source_x >= 0) & (source_x <= shape[1] - 1)
+        )
+    rows, columns = np.nonzero(valid)
+    bounds = (
+        int(rows.min()), int(rows.max() + 1),
+        int(columns.min()), int(columns.max() + 1),
+        )
+    return source_y, source_x, valid, bounds
+
+
+def warp_frame_piecewise(frame, field, rigid_shift=(0, 0), static_offset=(0, 0)):
+    source_y, source_x, valid, bounds = field_coordinates(
+        field, frame.shape, rigid_shift, static_offset)
+    registered = cv2.remap(
+        np.asarray(frame, dtype=np.float32),
+        source_x,
+        source_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=np.nan,
+        )
+    registered[~valid] = np.nan
+    return registered, bounds, valid
+
+
+def select_registration_model(rigid, piecewise):
+    thresholds = {
+        'gradient_ncc_gain': 0.01,
+        'residual_p95_gain_px': 0.15,
+        'valid_fraction_loss': 0.02,
+        'cross_channel_worsening_px': 0.05,
+        'accepted_or_fallback_fraction': 0.95,
+        }
+    comparison = {
+        'gradient_ncc_gain': (
+            piecewise['gradient_ncc'] - rigid['gradient_ncc']),
+        'residual_p95_gain_px': (
+            rigid['residual_p95_px'] - piecewise['residual_p95_px']),
+        'valid_fraction_loss': (
+            rigid['valid_fraction'] - piecewise['valid_fraction']),
+        'cross_channel_worsening_px': (
+            piecewise['cross_channel_residual_px']
+            - rigid['cross_channel_residual_px']),
+        'accepted_or_fallback_fraction': piecewise['accepted_or_fallback_fraction'],
+        }
+    passed = {
+        'gradient_ncc': (
+            comparison['gradient_ncc_gain'] >= thresholds['gradient_ncc_gain']),
+        'residual_p95': (
+            comparison['residual_p95_gain_px'] >= thresholds['residual_p95_gain_px']),
+        'valid_fraction': (
+            comparison['valid_fraction_loss'] <= thresholds['valid_fraction_loss']),
+        'cross_channel': (
+            comparison['cross_channel_worsening_px']
+            <= thresholds['cross_channel_worsening_px']),
+        'fallback_coverage': (
+            comparison['accepted_or_fallback_fraction']
+            >= thresholds['accepted_or_fallback_fraction']),
+        }
+    return {
+        'selected_model': 'piecewise_rigid' if all(passed.values()) else 'rigid',
+        'comparison': comparison,
+        'thresholds': thresholds,
+        'passed': passed,
+        }
+
+
 def _valid_bounds(shape, shift_y, shift_x):
     y0 = max(0, int(np.ceil(shift_y)))
     y1 = min(shape[0], int(np.floor(shape[0] - 1 + shift_y)) + 1)
@@ -412,8 +1124,11 @@ def make_reference(
         max_tile_disagreement=1.0,
         ):
     n_frames = len(frames)
-    if n_frames < min_frames:
-        raise ValueError(f'at least {min_frames} frames are required for the reference')
+    if n_frames < 50:
+        raise ValueError('at least 50 frames are required for the reference')
+
+    target_frames = min(min_frames, n_frames)
+    fallback = target_frames < min_frames
 
     sample_indices = np.linspace(0, n_frames - 1, min(max_frames, n_frames), dtype=int)
     first_frame = np.asarray(frames[int(sample_indices[0])])
@@ -436,11 +1151,17 @@ def make_reference(
             saturation[frame_i] = np.mean((frame == limits.min) | (frame == limits.max))
 
     informative = (mad > 0) & (saturation <= 0.01)
-    if informative.sum() < min_frames:
-        raise ValueError(f'fewer than {min_frames} informative frames remain')
+    if informative.sum() < target_frames:
+        if informative.sum() < 50:
+            raise ValueError('fewer than 50 informative frames remain')
+        target_frames = int(informative.sum())
+        fallback = True
     informative &= gradient >= 0.1 * np.median(gradient[informative])
-    if informative.sum() < min_frames:
-        raise ValueError(f'fewer than {min_frames} informative frames remain')
+    if informative.sum() < target_frames:
+        if informative.sum() < 50:
+            raise ValueError('fewer than 50 informative frames remain')
+        target_frames = int(informative.sum())
+        fallback = True
 
     candidates = np.flatnonzero(informative)
     anchor_candidates = candidates[
@@ -456,6 +1177,8 @@ def make_reference(
     anchor = anchor_candidates[np.argmax(np.median(similarity, axis=1))]
 
     first_shifts = np.full((len(sample_indices), 2), np.nan, dtype=np.float32)
+    first_peak_ratio = np.full(len(sample_indices), np.nan, dtype=np.float32)
+    first_out_of_range = np.zeros(len(sample_indices), dtype=bool)
     first_accepted = np.zeros(len(sample_indices), dtype=bool)
     first_reference = _prepare_reference(
         frames[int(sample_indices[anchor])], check_tiles=False)
@@ -464,11 +1187,22 @@ def make_reference(
     estimates = _estimate_shifts(first_reference, sampled_frames, whitening=whitening)
     for frame_i, estimate in zip(candidates, estimates):
         first_shifts[frame_i] = estimate['shift_y'], estimate['shift_x']
+        first_peak_ratio[frame_i] = estimate['peak_ratio']
+        first_out_of_range[frame_i] = estimate['out_of_range']
         first_accepted[frame_i] = (
             estimate['peak_ratio'] >= min_peak_ratio and not estimate['out_of_range']
             )
-    if first_accepted.sum() < min_frames:
-        raise ValueError(f'fewer than {min_frames} frames align with the first reference')
+    if first_accepted.sum() < target_frames:
+        # 18 August 2026: weak-texture references get one relaxed peak-ratio pass
+        # the second pass still records confidence
+        relaxed_peak_ratio = max(1.02, min_peak_ratio - 0.07)
+        first_accepted = (
+            first_peak_ratio >= relaxed_peak_ratio
+            ) & ~first_out_of_range
+        if first_accepted.sum() < 50:
+            raise ValueError('fewer than 50 frames align with the first reference')
+        target_frames = min(target_frames, int(first_accepted.sum()))
+        fallback = True
     sampled_frames = (frames[int(frame_i)] for frame_i in sample_indices)
     provisional = _registered_mean(
         sampled_frames, first_shifts, first_accepted, shape)
@@ -476,6 +1210,7 @@ def make_reference(
     shifts = np.full((len(sample_indices), 2), np.nan, dtype=np.float32)
     peak_ratio = np.full(len(sample_indices), np.nan, dtype=np.float32)
     tile_disagreement = np.full(len(sample_indices), np.nan, dtype=np.float32)
+    second_out_of_range = np.zeros(len(sample_indices), dtype=bool)
     aligned = np.zeros(len(sample_indices), dtype=bool)
     second_reference = _prepare_reference(provisional)
     sampled_frames = (
@@ -485,13 +1220,23 @@ def make_reference(
         shifts[frame_i] = estimate['shift_y'], estimate['shift_x']
         peak_ratio[frame_i] = estimate['peak_ratio']
         tile_disagreement[frame_i] = estimate['tile_disagreement']
+        second_out_of_range[frame_i] = estimate['out_of_range']
         aligned[frame_i] = (
             estimate['peak_ratio'] >= min_peak_ratio
             and estimate['tile_disagreement'] <= max_tile_disagreement
             and not estimate['out_of_range']
             )
-    if aligned.sum() < min_frames:
-        raise ValueError(f'fewer than {min_frames} frames align with the provisional reference')
+    if aligned.sum() < target_frames:
+        # 18 August 2026: the provisional image can inherit weak texture from the first pass
+        aligned = (
+            (peak_ratio >= max(1.02, min_peak_ratio - 0.07))
+            & (tile_disagreement <= max(2.0, max_tile_disagreement * 2))
+            & ~second_out_of_range
+            )
+        if aligned.sum() < 50:
+            raise ValueError('fewer than 50 frames align with the provisional reference')
+        target_frames = min(target_frames, int(aligned.sum()))
+        fallback = True
 
     bounds = np.asarray([
         _reference_bounds(shape, *shifts[frame_i])
@@ -531,15 +1276,15 @@ def make_reference(
 
     # 15 August 2026: 20 bins retain the recording span; synthetic focal changes ranked below the consensus
     accepted = np.zeros(len(sample_indices), dtype=bool)
-    time_bins = np.array_split(np.arange(len(sample_indices)), min(20, min_frames))
-    n_per_bin = np.full(len(time_bins), min_frames // len(time_bins))
-    n_per_bin[:min_frames % len(time_bins)] += 1
+    time_bins = np.array_split(np.arange(len(sample_indices)), min(20, target_frames))
+    n_per_bin = np.full(len(time_bins), target_frames // len(time_bins))
+    n_per_bin[:target_frames % len(time_bins)] += 1
     for frames_in_bin, n_keep in zip(time_bins, n_per_bin):
         frames_in_bin = frames_in_bin[aligned[frames_in_bin]]
         order = frames_in_bin[np.argsort(correlation[frames_in_bin])]
         accepted[order[-n_keep:]] = True
 
-    n_missing = min_frames - accepted.sum()
+    n_missing = target_frames - accepted.sum()
     if n_missing:
         remaining = np.flatnonzero(aligned & ~accepted)
         order = remaining[np.argsort(correlation[remaining])]
@@ -559,6 +1304,10 @@ def make_reference(
         'reference_correlation': correlation,
         'gradient_information': gradient,
         'saturation_fraction': saturation,
+        'reference_fallback': fallback,
+        'reference_target_frames': np.int64(target_frames),
+        'reference_aligned_count': np.int64(aligned.sum()),
+        'reference_accepted_count': np.int64(accepted.sum()),
         }
 
 
@@ -1165,4 +1914,36 @@ def register_pair(signal, control, shift_y, shift_x, signal_offset=(0, 0)):
         'control': control_registered,
         'signal_bounds': signal_bounds,
         'control_bounds': control_bounds,
+        }
+
+
+def register_pair_piecewise(
+        signal,
+        control,
+        shift_y,
+        shift_x,
+        field,
+        assessment,
+        signal_offset=(0, 0),
+        ):
+    if assessment['model_used'] == 'rigid':
+        result = register_pair(
+            signal, control, shift_y, shift_x, signal_offset=signal_offset)
+        result['model_used'] = 'rigid'
+        result['fallback_reason'] = assessment['fallback_reason']
+        return result
+
+    control_registered, control_bounds, control_valid = warp_frame_piecewise(
+        control, field, (shift_y, shift_x))
+    signal_registered, signal_bounds, signal_valid = warp_frame_piecewise(
+        signal, field, (shift_y, shift_x), signal_offset)
+    return {
+        'signal': signal_registered,
+        'control': control_registered,
+        'signal_bounds': signal_bounds,
+        'control_bounds': control_bounds,
+        'signal_valid': signal_valid,
+        'control_valid': control_valid,
+        'model_used': 'piecewise_rigid',
+        'fallback_reason': 'accepted',
         }

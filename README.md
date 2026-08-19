@@ -42,15 +42,15 @@ For MPS acceleration on Apple silicon, use a native arm64 Python interpreter; `p
 
 ## quick demo
 
-Three unlabelled 256 × 256 crops are included under `examples/`: two come from sessions in the training split, and `demo_test_ref_mat_ch2.npy` comes from one of the nine test sessions. The command below runs prediction on that test crop; the metrics in the [model card](MODEL_CARD.md) were calculated across the nine complete test sessions.
+Three unlabelled 256 × 256 crops are included under `benchmarking/sources/`: two come from sessions in the training split, and `lab-fibresight-demo-test.npy` comes from one of the nine test sessions. The command below runs prediction on that test crop; the metrics in the [model card](MODEL_CARD.md) were calculated across the nine complete test sessions.
 
 From the repository root:
 
 ```sh
-fibre-sight-predict --image examples/demo_test_ref_mat_ch2.npy --out workspace/output/demo_predicted_ROI_dict.npy
+fibre-sight-predict --image benchmarking/sources/lab-fibresight-demo-test.npy --out workspace/output/demo_predicted_ROI_dict.npy
 ```
 
-The command uses the bundled checkpoint, chooses the available compute device, prints the number of predicted ROIs, and creates `workspace/output/` when needed. To inspect the same crop in the GUI, start `fibre-sight`, select `examples/demo_test_ref_mat_ch2.npy` under `channel-2 image`, open `predict`, then click `predict`.
+The command uses the bundled checkpoint, chooses the available compute device, prints the number of predicted ROIs, and creates `workspace/output/` when needed. To inspect the same crop in the GUI, start `fibre-sight`, select `benchmarking/sources/lab-fibresight-demo-test.npy` under `channel-2 image`, open `predict`, then click `predict`.
 
 ## predict and curate
 
@@ -134,7 +134,7 @@ Each command accepts `--help`. The same tools can be run as modules, for example
 The prediction command uses the bundled checkpoint and its saved operating point by default:
 
 ```sh
-fibre-sight-predict --image examples/demo_test_ref_mat_ch2.npy --out workspace/output/demo_predicted_ROI_dict.npy
+fibre-sight-predict --image benchmarking/sources/lab-fibresight-demo-test.npy --out workspace/output/demo_predicted_ROI_dict.npy
 ```
 
 Training recipes are kept under `src/fibre_sight/configs/`. The [training guide](TRAINING.md) describes each recipe and how to write a new one.
@@ -159,6 +159,6 @@ GitHub's `Cite this repository` menu generates other citation formats from [`CIT
 
 ## repository scope
 
-This repository contains the active FibreSight workbench extracted from a larger analysis repository. The pretrained checkpoint contains model weights and inference metadata; full source images and hand-labelled ROI dictionaries remain private. The three arrays under `examples/` are the cropped, unlabelled references described above.
+This repository contains the active FibreSight workbench extracted from a larger analysis repository. The pretrained checkpoint contains model weights and inference metadata; full source images and hand-labelled ROI dictionaries remain private. The ten registration references under `benchmarking/sources/` are cropped, unlabelled arrays with same-stem PNGs and a separate provenance record.
 
 The source code, bundled checkpoint, and demonstration arrays are released under the [MIT License](LICENSE). Mononoki 1.006 by Matthias Tellen is bundled for the interface under the [SIL Open Font License 1.1](src/fibre_sight/assets/fonts/mononoki/LICENSE); its [font note](src/fibre_sight/assets/fonts/mononoki/README.md) records the upstream release.

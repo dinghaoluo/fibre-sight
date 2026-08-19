@@ -2,6 +2,7 @@
 Created on 14 August 2026
 Modified on 16 August 2026
 Modified on 17 August 2026 to move the benchmark out of the repository root
+Modified on 18 August 2026
 
 make and measure the motion-correction benchmark
 
@@ -26,13 +27,14 @@ import tifffile
 #%% paths
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE_ROOT = PROJECT_ROOT / 'examples'
+SOURCE_ROOT = PROJECT_ROOT / 'benchmarking' / 'sources'
 BENCHMARK_ROOT = PROJECT_ROOT / 'workspace' / 'registration-benchmark'
 BENCHMARK_FONT_ROOT = (
     PROJECT_ROOT / 'src' / 'fibre_sight' / 'assets' / 'fonts' / 'mononoki')
 EXAMPLE_REFERENCES = (
-    'demo_train_01_ref_mat_ch2.npy',
-    'demo_train_02_ref_mat_ch2.npy',
-    'demo_test_ref_mat_ch2.npy',
+    'lab-fibresight-demo-train-01.npy',
+    'lab-fibresight-demo-train-02.npy',
+    'lab-fibresight-demo-test.npy',
     )
 MOTION_RECIPES = ('ordinary_motion', 'large_motion', 'local_deformation', 'focal_change')
 # 15 August 2026: 50 and 200 expose early convergence; scored runs use 500 or 1000
@@ -407,7 +409,7 @@ def make_benchmark(
         root=BENCHMARK_ROOT,
         n_frames=2000,
         seed=42,
-        source='demo_train_02_ref_mat_ch2.npy',
+        source='lab-fibresight-demo-train-02.npy',
         recipe='ordinary_motion',
         control_photons=65,
         bleaching=0.18,
@@ -417,9 +419,9 @@ def make_benchmark(
     root.mkdir(parents=True, exist_ok=True)
     # 15 August 2026: write truth.npz last so an interrupted movie is incomplete
     (root / 'truth.npz').unlink(missing_ok=True)
-    control = np.load(EXAMPLE_ROOT / source)
+    control = np.load(SOURCE_ROOT / source)
     outer_names = [name for name in EXAMPLE_REFERENCES if name != source]
-    outer = [np.load(EXAMPLE_ROOT / name) for name in outer_names]
+    outer = [np.load(SOURCE_ROOT / name) for name in outer_names]
     below, above = outer
     planes = make_planes(control, below, above)
     truth_seed, control_seed, signal_seed, convergence_seed = np.random.SeedSequence(seed).spawn(4)
@@ -524,7 +526,7 @@ def make_benchmark(
         jacobian_min=jacobian_min,
         jacobian_max=jacobian_max,
         latent_reference=planes[2] ** 2,
-        source=f'examples/{source}',
+        source=f'benchmarking/sources/{source}',
         plane_sources=np.asarray([outer_names[0], source, outer_names[1]]),
         sampling_frequency_hz=np.float32(30),
         n_frames=np.int64(n_frames),
@@ -884,10 +886,504 @@ def run_fibresight(root=BENCHMARK_ROOT, whitening=0, name='fibresight_rigid'):
         reference_accepted=reference['accepted'],
         reference_correlation=reference['reference_correlation'],
         reference_input_frames=np.int64(n_reference),
+        reference_fallback=np.bool_(reference['reference_fallback']),
+        reference_target_frames=reference['reference_target_frames'],
+        reference_aligned_count=reference['reference_aligned_count'],
+        reference_accepted_count=reference['reference_accepted_count'],
         reference_seconds=np.float64(reference_seconds),
         registration_seconds=np.float64(registration_seconds),
         selected_whitening=np.float32(whitening),
         seconds=np.float64(reference_seconds + registration_seconds),
+        version=__version__,
+        git_commit=git_commit,
+        git_dirty=np.bool_(git_dirty),
+        )
+
+
+def run_fibresight_tile_evidence(
+        root=BENCHMARK_ROOT,
+        *,
+        name='fibresight_tiles_64_w0',
+        tile_size=64,
+        coarse_tile_size=None,
+        stride=None,
+        whitening=0,
+        search_radius=3,
+        fine_radius=1,
+        field_penalties=(),
+        field_magnitude=1,
+        refine_penalty=10,
+        field_residual_limit=0.28,
+        save_surfaces=False,
+        ):
+    import cv2
+    from fibre_sight import __version__
+    from fibre_sight.preprocessing import (
+        assess_tile_field,
+        _estimate_tile_shifts,
+        _estimate_tile_shifts_coarse_to_fine,
+        _prepare_tile_reference,
+        _spline_grid,
+        _tile_field_evidence,
+        fit_tile_field,
+        refine_tile_field,
+        )
+
+    cv2.setNumThreads(0)
+    root = Path(root)
+    movie = tifffile.memmap(root / 'control.tif')
+    with np.load(root / 'fibresight_rigid.npz') as saved:
+        reference = saved['reference']
+        rigid_y = saved['shift_y']
+        rigid_x = saved['shift_x']
+    prepared = _prepare_tile_reference(reference, tile_size, stride)
+    coarse_prepared = (
+        _prepare_tile_reference(reference, coarse_tile_size, coarse_tile_size // 2)
+        if coarse_tile_size is not None else None
+        )
+    n_frames = len(movie)
+    n_tiles = len(prepared['tile_y'])
+    local_y = np.empty((n_frames, n_tiles), dtype=np.float32)
+    local_x = np.empty_like(local_y)
+    predicted_y = np.empty_like(local_y)
+    predicted_x = np.empty_like(local_y)
+    incremental_y = np.empty_like(local_y)
+    incremental_x = np.empty_like(local_y)
+    peak_ratio = np.empty_like(local_y)
+    entropy = np.empty_like(local_y)
+    neighbour_residual = np.empty_like(local_y)
+    curvature = np.empty((n_frames, n_tiles, 3), dtype=np.float32)
+    search_boundary = np.empty((n_frames, n_tiles), dtype=bool)
+    surfaces = (
+        np.empty(
+            (n_frames // 2, n_tiles, 2 * search_radius + 1, 2 * search_radius + 1),
+            dtype=np.float32,
+            )
+        if save_surfaces else None
+        )
+    coarse_local_y = (
+        np.empty((n_frames, len(coarse_prepared['tile_y'])), dtype=np.float32)
+        if coarse_prepared is not None else None
+        )
+    coarse_local_x = np.empty_like(coarse_local_y) if coarse_local_y is not None else None
+    coarse_peak_ratio = np.empty_like(coarse_local_y) if coarse_local_y is not None else None
+    coarse_entropy = np.empty_like(coarse_local_y) if coarse_local_y is not None else None
+    coarse_neighbour_residual = np.empty_like(coarse_local_y) if coarse_local_y is not None else None
+    control_y, control_x = _spline_grid(reference.shape, tile_size)
+    field_shape = (
+        len(field_penalties), n_frames, len(control_y), len(control_x))
+    field_local_y = np.empty((len(field_penalties), n_frames, n_tiles), dtype=np.float32)
+    field_local_x = np.empty_like(field_local_y)
+    field_coefficient_y = np.empty(field_shape, dtype=np.float32)
+    field_coefficient_x = np.empty_like(field_coefficient_y)
+    field_global_y = np.empty((len(field_penalties), n_frames), dtype=np.float32)
+    field_global_x = np.empty_like(field_global_y)
+    field_accepted = np.empty((n_frames, n_tiles), dtype=bool)
+    field_precision = np.empty((n_frames, n_tiles, 3), dtype=np.float32)
+    refined_local_y = np.empty((n_frames, n_tiles), dtype=np.float32)
+    refined_local_x = np.empty_like(refined_local_y)
+    refined_coefficient_y = np.empty(field_shape[1:], dtype=np.float32)
+    refined_coefficient_x = np.empty_like(refined_coefficient_y)
+    refined_global_y = np.empty(n_frames, dtype=np.float32)
+    refined_global_x = np.empty_like(refined_global_y)
+    refined_accepted = np.empty((n_frames, n_tiles), dtype=bool)
+    refined_residual = np.empty((n_frames, n_tiles), dtype=np.float32)
+    piecewise_local_y = np.empty((n_frames, n_tiles), dtype=np.float32)
+    piecewise_local_x = np.empty_like(piecewise_local_y)
+    piecewise_coefficient_y = np.empty(field_shape[1:], dtype=np.float32)
+    piecewise_coefficient_x = np.empty_like(piecewise_coefficient_y)
+    piecewise_global_y = np.empty(n_frames, dtype=np.float32)
+    piecewise_global_x = np.empty_like(piecewise_global_y)
+    model_used = np.empty(n_frames, dtype='<U16')
+    fallback_reason = np.empty(n_frames, dtype='<U24')
+    accepted_tile_fraction = np.empty(n_frames, dtype=np.float32)
+    field_rms = np.empty(n_frames, dtype=np.float32)
+    field_max = np.empty(n_frames, dtype=np.float32)
+    neighbour_max = np.empty(n_frames, dtype=np.float32)
+    field_jacobian_min = np.empty(n_frames, dtype=np.float32)
+    field_jacobian_max = np.empty(n_frames, dtype=np.float32)
+    # 17 August 2026: 100 time-balanced frames keep calibration cheaper than another movie pass
+    calibration_frames = set(np.linspace(
+        0, n_frames // 2 - 1, min(100, n_frames // 2), dtype=int))
+    # 17 August 2026: interleaved folds leave each withheld tile beside training evidence
+    tile_fold = (
+        2 * (np.arange(prepared['n_y'])[:, None] % 2)
+        + np.arange(prepared['n_x'])[None, :] % 2
+        ).ravel()
+    field_cv_error = [[] for _ in field_penalties]
+
+    def estimate_frame(item):
+        frame_i, frame = item
+        # 17 August 2026: saved shifts describe movement; registration applies the opposite sign
+        rigid_correction = (-rigid_y[frame_i], -rigid_x[frame_i])
+        if coarse_prepared is None:
+            return _estimate_tile_shifts(
+                prepared,
+                frame,
+                rigid_correction,
+                search_radius=search_radius,
+                whitening=whitening,
+                )
+        return _estimate_tile_shifts_coarse_to_fine(
+            coarse_prepared,
+            prepared,
+            frame,
+            rigid_correction,
+            search_radius=search_radius,
+            fine_radius=fine_radius,
+            whitening=whitening,
+            )
+
+    start_time = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for frame_i, result in enumerate(pool.map(estimate_frame, enumerate(movie))):
+            # 17 August 2026: local_y/x retain the observed-movement sign used in truth.npz
+            local_y[frame_i] = -result['residual_y']
+            local_x[frame_i] = -result['residual_x']
+            predicted_y[frame_i] = -result['predicted_residual_y']
+            predicted_x[frame_i] = -result['predicted_residual_x']
+            incremental_y[frame_i] = -result['incremental_residual_y']
+            incremental_x[frame_i] = -result['incremental_residual_x']
+            peak_ratio[frame_i] = result['peak_ratio']
+            entropy[frame_i] = result['surface_entropy']
+            neighbour_residual[frame_i] = result['neighbour_residual']
+            curvature[frame_i, :, 0] = result['curvature_yy']
+            curvature[frame_i, :, 1] = result['curvature_yx']
+            curvature[frame_i, :, 2] = result['curvature_xx']
+            search_boundary[frame_i] = result['search_boundary']
+            if surfaces is not None and frame_i < len(surfaces):
+                surfaces[frame_i] = result['surface']
+            if coarse_prepared is not None:
+                coarse_result = result['coarse']
+                coarse_local_y[frame_i] = -coarse_result['residual_y']
+                coarse_local_x[frame_i] = -coarse_result['residual_x']
+                coarse_peak_ratio[frame_i] = coarse_result['peak_ratio']
+                coarse_entropy[frame_i] = coarse_result['surface_entropy']
+                coarse_neighbour_residual[frame_i] = coarse_result['neighbour_residual']
+            if field_penalties:
+                evidence = _tile_field_evidence(result)
+                selected_field = None
+                field_accepted[frame_i] = evidence['accepted']
+                field_precision[frame_i, :, 0] = evidence['precision'][:, 0, 0]
+                field_precision[frame_i, :, 1] = evidence['precision'][:, 0, 1]
+                field_precision[frame_i, :, 2] = evidence['precision'][:, 1, 1]
+                for penalty_i, penalty in enumerate(field_penalties):
+                    field = fit_tile_field(
+                        result,
+                        reference.shape,
+                        tile_size,
+                        spatial_penalty=penalty,
+                        magnitude_penalty=field_magnitude,
+                        evidence=evidence,
+                        )
+                    # 17 August 2026: field arrays retain the same observed-movement sign
+                    field_local_y[penalty_i, frame_i] = -field['predicted_y']
+                    field_local_x[penalty_i, frame_i] = -field['predicted_x']
+                    field_coefficient_y[penalty_i, frame_i] = -field['coefficient_y']
+                    field_coefficient_x[penalty_i, frame_i] = -field['coefficient_x']
+                    field_global_y[penalty_i, frame_i] = -field['global_shift_y']
+                    field_global_x[penalty_i, frame_i] = -field['global_shift_x']
+                    if penalty == refine_penalty:
+                        selected_field = field
+                    if frame_i in calibration_frames:
+                        for fold in range(4):
+                            fold_evidence = {
+                                'accepted': evidence['accepted'] & (tile_fold != fold),
+                                'precision': evidence['precision'],
+                                }
+                            withheld = evidence['accepted'] & (tile_fold == fold)
+                            predicted = fit_tile_field(
+                                result,
+                                reference.shape,
+                                tile_size,
+                                spatial_penalty=penalty,
+                                magnitude_penalty=field_magnitude,
+                                evidence=fold_evidence,
+                                )
+                            difference = np.column_stack([
+                                predicted['predicted_y'][withheld]
+                                - result['residual_y'][withheld],
+                                predicted['predicted_x'][withheld]
+                                - result['residual_x'][withheld],
+                                ])
+                            field_cv_error[penalty_i].extend(np.sqrt(np.einsum(
+                                'ni,nij,nj->n',
+                                difference,
+                                evidence['precision'][withheld],
+                                difference,
+                                )))
+                # the reassigned-peak fit stays in the benchmark as an ablation
+                refined = refine_tile_field(
+                    result,
+                    reference.shape,
+                    tile_size,
+                    spatial_penalty=refine_penalty,
+                    magnitude_penalty=field_magnitude,
+                    residual_limit=field_residual_limit,
+                    evidence=evidence,
+                    initial=selected_field,
+                    )
+                refined_local_y[frame_i] = -refined['predicted_y']
+                refined_local_x[frame_i] = -refined['predicted_x']
+                refined_coefficient_y[frame_i] = -refined['coefficient_y']
+                refined_coefficient_x[frame_i] = -refined['coefficient_x']
+                refined_global_y[frame_i] = -refined['global_shift_y']
+                refined_global_x[frame_i] = -refined['global_shift_x']
+                refined_accepted[frame_i] = refined['accepted']
+                refined_residual[frame_i] = refined['field_residual']
+                assessment = assess_tile_field(
+                    selected_field, reference.shape)
+                use_field = assessment['model_used'] == 'piecewise_rigid'
+                piecewise_local_y[frame_i] = (
+                    -selected_field['predicted_y'] if use_field else 0)
+                piecewise_local_x[frame_i] = (
+                    -selected_field['predicted_x'] if use_field else 0)
+                piecewise_coefficient_y[frame_i] = (
+                    -selected_field['coefficient_y'] if use_field else 0)
+                piecewise_coefficient_x[frame_i] = (
+                    -selected_field['coefficient_x'] if use_field else 0)
+                piecewise_global_y[frame_i] = (
+                    -selected_field['global_shift_y'] if use_field else 0)
+                piecewise_global_x[frame_i] = (
+                    -selected_field['global_shift_x'] if use_field else 0)
+                model_used[frame_i] = assessment['model_used']
+                fallback_reason[frame_i] = assessment['fallback_reason']
+                accepted_tile_fraction[frame_i] = assessment['accepted_tile_fraction']
+                field_rms[frame_i] = assessment['field_rms_px']
+                field_max[frame_i] = assessment['field_max_px']
+                neighbour_max[frame_i] = assessment['neighbour_difference_max_px']
+                field_jacobian_min[frame_i] = assessment['jacobian_min']
+                field_jacobian_max[frame_i] = assessment['jacobian_max']
+    seconds = time.perf_counter() - start_time
+    git_commit = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=PROJECT_ROOT, text=True).strip()
+    git_dirty = bool(subprocess.check_output(
+        ['git', 'status', '--porcelain'], cwd=PROJECT_ROOT, text=True))
+    output = {
+        'shift_y': rigid_y,
+        'shift_x': rigid_x,
+        'local_y': local_y,
+        'local_x': local_x,
+        'tile_y': prepared['tile_y'],
+        'tile_x': prepared['tile_x'],
+        'peak_ratio': peak_ratio,
+        'surface_entropy': entropy,
+        'neighbour_residual': neighbour_residual,
+        'curvature_yy': curvature[:, :, 0],
+        'curvature_yx': curvature[:, :, 1],
+        'curvature_xx': curvature[:, :, 2],
+        'structure_yy': prepared['structure'][:, 0],
+        'structure_yx': prepared['structure'][:, 1],
+        'structure_xx': prepared['structure'][:, 2],
+        'search_boundary': search_boundary,
+        'tile_size': np.int16(tile_size),
+        'stride': np.int16(prepared['stride']),
+        'search_radius': np.int16(search_radius),
+        'fine_radius': np.int16(
+            fine_radius if coarse_tile_size is not None else search_radius),
+        'selected_whitening': np.float32(whitening),
+        'coarse_tile_size': (
+            np.int16(coarse_tile_size) if coarse_tile_size is not None else np.int16(0)),
+        'predicted_y': predicted_y,
+        'predicted_x': predicted_x,
+        'incremental_y': incremental_y,
+        'incremental_x': incremental_x,
+        'registration_seconds': np.float64(seconds),
+        'seconds': np.float64(seconds),
+        'version': __version__,
+        'git_commit': git_commit,
+        'git_dirty': np.bool_(git_dirty),
+        }
+    if coarse_prepared is not None:
+        output.update({
+            'coarse_tile_y': coarse_prepared['tile_y'],
+            'coarse_tile_x': coarse_prepared['tile_x'],
+            'coarse_local_y': coarse_local_y,
+            'coarse_local_x': coarse_local_x,
+            'coarse_peak_ratio': coarse_peak_ratio,
+            'coarse_surface_entropy': coarse_entropy,
+            'coarse_neighbour_residual': coarse_neighbour_residual,
+            })
+    if field_penalties:
+        cv_p95 = np.asarray([
+            np.percentile(error, 95) for error in field_cv_error], dtype=np.float32)
+        best_cv = cv_p95.min()
+        selected_penalty = min(
+            penalty for penalty, score in zip(field_penalties, cv_p95)
+            if score <= best_cv + 0.01)
+        output.update({
+            'field_penalties': np.asarray(field_penalties, dtype=np.float32),
+            'field_local_y': field_local_y,
+            'field_local_x': field_local_x,
+            'field_coefficient_y': field_coefficient_y,
+            'field_coefficient_x': field_coefficient_x,
+            'field_global_y': field_global_y,
+            'field_global_x': field_global_x,
+            'field_control_y': control_y,
+            'field_control_x': control_x,
+            'field_accepted': field_accepted,
+            'field_precision_yy': field_precision[:, :, 0],
+            'field_precision_yx': field_precision[:, :, 1],
+            'field_precision_xx': field_precision[:, :, 2],
+            'field_magnitude_penalty': np.float32(field_magnitude),
+            'field_cv_p95': cv_p95,
+            'field_cv_frames': np.int16(len(calibration_frames)),
+            'field_cv_selected_penalty': np.float32(selected_penalty),
+            'refined_penalty': np.float32(refine_penalty),
+            'refined_residual_limit': np.float32(field_residual_limit),
+            'refined_local_y': refined_local_y,
+            'refined_local_x': refined_local_x,
+            'refined_coefficient_y': refined_coefficient_y,
+            'refined_coefficient_x': refined_coefficient_x,
+            'refined_global_y': refined_global_y,
+            'refined_global_x': refined_global_x,
+            'refined_accepted': refined_accepted,
+            'refined_field_residual': refined_residual,
+            'piecewise_local_y': piecewise_local_y,
+            'piecewise_local_x': piecewise_local_x,
+            'piecewise_coefficient_y': piecewise_coefficient_y,
+            'piecewise_coefficient_x': piecewise_coefficient_x,
+            'piecewise_global_y': piecewise_global_y,
+            'piecewise_global_x': piecewise_global_x,
+            'model_used': model_used,
+            'fallback_reason': fallback_reason,
+            'accepted_tile_fraction': accepted_tile_fraction,
+            'field_rms_px': field_rms,
+            'field_max_px': field_max,
+            'neighbour_difference_max_px': neighbour_max,
+            'field_jacobian_min': field_jacobian_min,
+            'field_jacobian_max': field_jacobian_max,
+            })
+    if surfaces is not None:
+        output['calibration_surfaces'] = surfaces
+    np.savez_compressed(root / f'{name}.npz', **output)
+
+
+def run_fibresight_piecewise(root=BENCHMARK_ROOT, name='fibresight_piecewise'):
+    import cv2
+    from fibre_sight import __version__
+    from fibre_sight.preprocessing import (
+        _estimate_tile_shifts,
+        _prepare_tile_reference,
+        _spline_grid,
+        _tile_field_evidence,
+        assess_tile_field,
+        evaluate_tile_field,
+        fit_tile_field,
+        )
+
+    cv2.setNumThreads(0)
+    root = Path(root)
+    movie = tifffile.memmap(root / 'control.tif')
+    with np.load(root / 'fibresight_rigid.npz') as saved:
+        reference = saved['reference']
+        rigid_y = saved['shift_y']
+        rigid_x = saved['shift_x']
+    prepared = _prepare_tile_reference(reference, 80)
+    control_y, control_x = _spline_grid(reference.shape, 80)
+    sample_y = np.linspace(32, reference.shape[0] - 33, 7).round().astype(int)
+    sample_x = np.linspace(32, reference.shape[1] - 33, 7).round().astype(int)
+    grid_y, grid_x = np.meshgrid(sample_y, sample_x, indexing='ij')
+    n_frames = len(movie)
+    local_y = np.empty((n_frames, 49), dtype=np.float32)
+    local_x = np.empty_like(local_y)
+    coefficient_y = np.empty((n_frames, len(control_y), len(control_x)), dtype=np.float32)
+    coefficient_x = np.empty_like(coefficient_y)
+    global_y = np.empty(n_frames, dtype=np.float32)
+    global_x = np.empty_like(global_y)
+    accepted_tiles = np.empty((n_frames, len(prepared['tile_y'])), dtype=bool)
+    model_used = np.empty(n_frames, dtype='<U16')
+    fallback_reason = np.empty(n_frames, dtype='<U24')
+    accepted_fraction = np.empty(n_frames, dtype=np.float32)
+    field_rms = np.empty(n_frames, dtype=np.float32)
+    field_max = np.empty(n_frames, dtype=np.float32)
+    neighbour_max = np.empty(n_frames, dtype=np.float32)
+    jacobian_min = np.empty(n_frames, dtype=np.float32)
+    jacobian_max = np.empty(n_frames, dtype=np.float32)
+
+    def estimate_frame(item):
+        frame_i, frame = item
+        return _estimate_tile_shifts(
+            prepared,
+            frame,
+            (-rigid_y[frame_i], -rigid_x[frame_i]),
+            )
+
+    start_time = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for frame_i, tiles in enumerate(pool.map(estimate_frame, enumerate(movie))):
+            evidence = _tile_field_evidence(tiles)
+            field = fit_tile_field(
+                tiles,
+                reference.shape,
+                80,
+                spatial_penalty=10,
+                magnitude_penalty=1,
+                evidence=evidence,
+                )
+            assessment = assess_tile_field(field, reference.shape)
+            use_field = assessment['model_used'] == 'piecewise_rigid'
+            if use_field:
+                predicted_y, predicted_x = evaluate_tile_field(
+                    field, grid_y, grid_x)
+                # 17 August 2026: saved fields retain the observed-movement sign used by truth.npz
+                local_y[frame_i] = -predicted_y.ravel()
+                local_x[frame_i] = -predicted_x.ravel()
+                coefficient_y[frame_i] = -field['coefficient_y']
+                coefficient_x[frame_i] = -field['coefficient_x']
+                global_y[frame_i] = -field['global_shift_y']
+                global_x[frame_i] = -field['global_shift_x']
+            else:
+                local_y[frame_i] = 0
+                local_x[frame_i] = 0
+                coefficient_y[frame_i] = 0
+                coefficient_x[frame_i] = 0
+                global_y[frame_i] = 0
+                global_x[frame_i] = 0
+            accepted_tiles[frame_i] = field['accepted']
+            model_used[frame_i] = assessment['model_used']
+            fallback_reason[frame_i] = assessment['fallback_reason']
+            accepted_fraction[frame_i] = assessment['accepted_tile_fraction']
+            field_rms[frame_i] = assessment['field_rms_px']
+            field_max[frame_i] = assessment['field_max_px']
+            neighbour_max[frame_i] = assessment['neighbour_difference_max_px']
+            jacobian_min[frame_i] = assessment['jacobian_min']
+            jacobian_max[frame_i] = assessment['jacobian_max']
+    seconds = time.perf_counter() - start_time
+    git_commit = subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=PROJECT_ROOT, text=True).strip()
+    git_dirty = bool(subprocess.check_output(
+        ['git', 'status', '--porcelain'], cwd=PROJECT_ROOT, text=True))
+    np.savez_compressed(
+        root / f'{name}.npz',
+        shift_y=rigid_y,
+        shift_x=rigid_x,
+        local_y=local_y,
+        local_x=local_x,
+        tile_y=grid_y.ravel(),
+        tile_x=grid_x.ravel(),
+        coefficient_y=coefficient_y,
+        coefficient_x=coefficient_x,
+        global_y=global_y,
+        global_x=global_x,
+        control_y=control_y,
+        control_x=control_x,
+        accepted_tiles=accepted_tiles,
+        model_used=model_used,
+        fallback_reason=fallback_reason,
+        accepted_tile_fraction=accepted_fraction,
+        field_rms_px=field_rms,
+        field_max_px=field_max,
+        neighbour_difference_max_px=neighbour_max,
+        jacobian_min=jacobian_min,
+        jacobian_max=jacobian_max,
+        tile_size=np.int16(80),
+        stride=np.int16(prepared['stride']),
+        search_radius=np.int16(3),
+        spatial_penalty=np.float32(10),
+        magnitude_penalty=np.float32(1),
+        registration_seconds=np.float64(seconds),
+        seconds=np.float64(seconds),
         version=__version__,
         git_commit=git_commit,
         git_dirty=np.bool_(git_dirty),
@@ -1375,12 +1871,21 @@ def measure_reference_convergence(root, truth):
     series = {}
     aligned = []
     for path, method in methods:
+        if not (root / path).exists():
+            continue
         with np.load(root / path) as saved:
             series[method] = {name: saved[name] for name in saved.files}
         aligned.extend(
             _align_reference(reference, latent)[0]
             for reference in series[method]['reference']
             )
+
+    methods = tuple((path, method) for path, method in methods if method in series)
+    if not series:
+        with (root / 'method_reference_convergence.csv').open('w', newline='') as file:
+            writer = DictWriter(file, fieldnames=('method', 'frames', 'seconds', 'gradient_ncc'))
+            writer.writeheader()
+        return []
 
     n_reference = max(series[method]['frame_count'].max() for method in series)
     bounds = truth['valid_bounds'][:n_reference]
@@ -1503,6 +2008,233 @@ def registration_errors(estimate_y, estimate_x, truth_y, truth_x, calibration, e
         estimate_x - offset_x - truth_x,
         )
     return error, float(offset_y), float(offset_x), estimable & np.isfinite(error)
+
+
+def _tile_metric_rows(name, result, truth):
+    tile_y = np.asarray(result['tile_y'])
+    tile_x = np.asarray(result['tile_x'])
+    n_frames = len(truth['shift_y'])
+    truth_y, truth_x = displacement_at(
+        truth,
+        np.arange(n_frames),
+        tile_y,
+        tile_x,
+        )
+    estimate_y = result['shift_y'][:, None] + result['local_y']
+    estimate_x = result['shift_x'][:, None] + result['local_x']
+    calibration = np.broadcast_to(
+        ((np.arange(n_frames) < n_frames // 2) & truth['estimable'])[:, None],
+        truth_y.shape,
+        )
+    estimable = np.broadcast_to(truth['estimable'][:, None], truth_y.shape)
+    error, offset_y, offset_x, valid = registration_errors(
+        estimate_y, estimate_x, truth_y, truth_x, calibration, estimable)
+    truth_local_y = truth_y - np.mean(truth_y, axis=1, keepdims=True)
+    truth_local_x = truth_x - np.mean(truth_x, axis=1, keepdims=True)
+    estimate_local_y = estimate_y - np.mean(estimate_y, axis=1, keepdims=True)
+    estimate_local_x = estimate_x - np.mean(estimate_x, axis=1, keepdims=True)
+    local_error = np.hypot(
+        estimate_local_y - truth_local_y,
+        estimate_local_x - truth_local_x,
+        )
+    scenario = np.broadcast_to(truth['scenario'][:, None], truth_y.shape)
+    half = np.broadcast_to(
+        (np.arange(n_frames) >= n_frames // 2)[:, None], truth_y.shape)
+    groups = [
+        ('calibration', ~half & estimable),
+        ('heldout', half & estimable),
+        ('heldout_nonrigid', half & estimable & (scenario == 'nonrigid')),
+        ('heldout_deformation_free', half & estimable & (scenario == 'rigid')),
+        ('focal_stress', ~estimable & (scenario == 'focal')),
+    ]
+    rows = []
+    for group, selected in groups:
+        eligible_n = int(selected.sum())
+        if eligible_n == 0:
+            continue
+        values = error[selected & valid]
+        local_values = local_error[selected & valid]
+        rows.append({
+            'method': name,
+            'group': group,
+            'n': len(values),
+            'median_error_px': float(np.median(values)) if len(values) else np.nan,
+            'p95_error_px': float(np.percentile(values, 95)) if len(values) else np.nan,
+            'over_1px_fraction': float(np.mean(values > 1)) if len(values) else np.nan,
+            'median_local_error_px': (
+                float(np.median(local_values)) if len(local_values) else np.nan),
+            'p95_local_error_px': (
+                float(np.percentile(local_values, 95)) if len(local_values) else np.nan),
+            'over_1px_local_fraction': (
+                float(np.mean(local_values > 1)) if len(local_values) else np.nan),
+            'valid_fraction': len(values) / eligible_n,
+            'offset_y_px': offset_y,
+            'offset_x_px': offset_x,
+            'mean_neighbour_residual': float(np.mean(
+                result['neighbour_residual'].reshape(-1)[selected.reshape(-1)]
+                )),
+            'search_boundary_fraction': float(np.mean(
+                result['search_boundary'].reshape(-1)[selected.reshape(-1)]
+                )),
+            'seconds': float(result['seconds']),
+            })
+    return rows
+
+
+def measure_tile_evidence(root=BENCHMARK_ROOT, names=None):
+    root = Path(root)
+    names = names or sorted(
+        path.stem for path in root.glob('fibresight_tiles_*.npz'))
+    with np.load(root / 'truth.npz') as saved:
+        truth = {name: saved[name] for name in saved.files}
+    rows = []
+    for name in names:
+        with np.load(root / f'{name}.npz') as saved:
+            result = {field: saved[field] for field in saved.files}
+        rows.extend(_tile_metric_rows(name, result, truth))
+    with (root / 'tile_metrics.csv').open('w', newline='') as file:
+        writer = DictWriter(file, fieldnames=rows[0])
+        writer.writeheader()
+        writer.writerows(rows)
+    return rows
+
+
+def measure_tile_fields(root=BENCHMARK_ROOT, names=None):
+    from fibre_sight.preprocessing import evaluate_tile_field
+
+    root = Path(root)
+    names = names or sorted(
+        path.stem for path in root.glob('fibresight_field_*.npz'))
+    with np.load(root / 'truth.npz') as saved:
+        truth = {name: saved[name] for name in saved.files}
+    rows = []
+    selections = []
+    confidence_rows = []
+    competitor_rows = []
+    for name in names:
+        with np.load(root / f'{name}.npz') as saved:
+            result = {field: saved[field] for field in saved.files}
+        for penalty_i, penalty in enumerate(result['field_penalties']):
+            fitted = {
+                **result,
+                'local_y': result['field_local_y'][penalty_i],
+                'local_x': result['field_local_x'][penalty_i],
+                }
+            rows.extend(_tile_metric_rows(
+                f'{name}_lambda_{penalty:g}', fitted, truth))
+        refined = {
+            **result,
+            'local_y': result['refined_local_y'],
+            'local_x': result['refined_local_x'],
+        }
+        rows.extend(_tile_metric_rows(f'{name}_refined', refined, truth))
+        applied = {
+            **result,
+            'local_y': result['piecewise_local_y'],
+            'local_x': result['piecewise_local_x'],
+            }
+        rows.extend(_tile_metric_rows('fibresight_piecewise', applied, truth))
+
+        height, width = truth['basis_y'].shape[1:]
+        sample_y = np.linspace(32, height - 33, 7).round().astype(int)
+        sample_x = np.linspace(32, width - 33, 7).round().astype(int)
+        grid_y, grid_x = np.meshgrid(sample_y, sample_x, indexing='ij')
+        standard_y = np.empty((len(result['shift_y']), 49), dtype=np.float32)
+        standard_x = np.empty_like(standard_y)
+        for frame_i in range(len(standard_y)):
+            field = {
+                'global_shift_y': result['piecewise_global_y'][frame_i],
+                'global_shift_x': result['piecewise_global_x'][frame_i],
+                'coefficient_y': result['piecewise_coefficient_y'][frame_i],
+                'coefficient_x': result['piecewise_coefficient_x'][frame_i],
+                'control_y': result['field_control_y'],
+                'control_x': result['field_control_x'],
+                'tile_size': result['tile_size'],
+                }
+            standard_y[frame_i], standard_x[frame_i] = [
+                value.ravel() for value in evaluate_tile_field(field, grid_y, grid_x)]
+        standard = {
+            'shift_y': result['shift_y'],
+            'shift_x': result['shift_x'],
+            'local_y': standard_y,
+            'local_x': standard_x,
+            'tile_y': grid_y.ravel(),
+            'tile_x': grid_x.ravel(),
+            'seconds': result['seconds'],
+            }
+        competitor_rows.extend(_metric_rows(
+            'fibresight_piecewise', standard, truth))
+
+        n_frames = len(truth['shift_y'])
+        truth_y, truth_x = displacement_at(
+            truth, np.arange(n_frames), result['tile_y'], result['tile_x'])
+        estimate_y = result['shift_y'][:, None] + result['local_y']
+        estimate_x = result['shift_x'][:, None] + result['local_x']
+        estimable = np.broadcast_to(truth['estimable'][:, None], truth_y.shape)
+        calibration_mask = np.broadcast_to(
+            ((np.arange(n_frames) < n_frames // 2) & truth['estimable'])[:, None],
+            truth_y.shape,
+            )
+        raw_error, _, _, valid = registration_errors(
+            estimate_y, estimate_x, truth_y, truth_x,
+            calibration_mask, estimable)
+        for group, selected in [
+                ('calibration', calibration_mask),
+                ('heldout', ~np.broadcast_to(
+                    (np.arange(n_frames) < n_frames // 2)[:, None], truth_y.shape)
+                    & estimable),
+                ]:
+            selected = selected & valid
+            bad = selected & (raw_error > 1)
+            clean = selected & (raw_error <= 1)
+            confidence_rows.append({
+                'method': name,
+                'group': group,
+                'error_over_1px_n': int(bad.sum()),
+                'error_over_1px_rejected_fraction': (
+                    float(np.mean(~result['refined_accepted'][bad]))
+                    if bad.any() else np.nan),
+                'clean_n': int(clean.sum()),
+                'clean_rejected_fraction': (
+                    float(np.mean(~result['refined_accepted'][clean]))
+                    if clean.any() else np.nan),
+                })
+        calibration = [
+            row for row in rows
+            if row['method'].startswith(f'{name}_lambda_')
+            and row['group'] == 'calibration'
+            ]
+        truth_selected = min(calibration, key=lambda row: row['p95_error_px'])['method']
+        for penalty_i, penalty in enumerate(result['field_penalties']):
+            method = f'{name}_lambda_{penalty:g}'
+            row = next(row for row in calibration if row['method'] == method)
+            selections.append({
+                'method': name,
+                'penalty': round(float(penalty), 6),
+                'calibration_p95_error_px': row['p95_error_px'],
+                'calibration_p95_local_error_px': row['p95_local_error_px'],
+                'spatial_cv_p95': float(result['field_cv_p95'][penalty_i]),
+                'selected_by_synthetic_truth': method == truth_selected,
+                'selected_by_spatial_cv': (
+                    penalty == result['field_cv_selected_penalty']),
+                })
+    with (root / 'field_metrics.csv').open('w', newline='') as file:
+        writer = DictWriter(file, fieldnames=rows[0])
+        writer.writeheader()
+        writer.writerows(rows)
+    with (root / 'field_selection.csv').open('w', newline='') as file:
+        writer = DictWriter(file, fieldnames=selections[0])
+        writer.writeheader()
+        writer.writerows(selections)
+    with (root / 'field_confidence.csv').open('w', newline='') as file:
+        writer = DictWriter(file, fieldnames=confidence_rows[0])
+        writer.writeheader()
+        writer.writerows(confidence_rows)
+    with (root / 'piecewise_metrics.csv').open('w', newline='') as file:
+        writer = DictWriter(file, fieldnames=competitor_rows[0])
+        writer.writeheader()
+        writer.writerows(competitor_rows)
+    return rows
 
 
 #%% reference comparison

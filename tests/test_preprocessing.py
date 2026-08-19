@@ -1,8 +1,8 @@
 '''
 Created on 14 August 2026
-Modified on 17 August 2026
+Modified on 18 August 2026
 
-check TIFF reading, rigid registration, and saved QC
+check TIFF reading, registration, and saved QC
 
 @author: Dinghao Luo
 '''
@@ -22,15 +22,22 @@ add_source_to_path()
 
 from fibre_sight.preprocessing import (
     add_quality_control_to_nwb,
+    assess_tile_field,
     estimate_channel_offset,
     estimate_shift,
+    estimate_tile_shifts,
+    estimate_tile_shifts_coarse_to_fine,
+    evaluate_tile_field,
     focal_loss_episodes,
     make_local_references,
     make_reference,
     measure_quality,
     read_tiffs,
+    refine_tile_field,
     register_pair,
+    register_pair_piecewise,
     rolling_axial_similarity,
+    select_registration_model,
     warp_frame,
     )
 
@@ -181,6 +188,141 @@ class PreprocessingTests(unittest.TestCase):
         expected_valid[y0:y1, x0:x1] = True
         np.testing.assert_array_equal(np.isfinite(registered), expected_valid)
         self.assertGreater(np.corrcoef(reference[expected_valid], registered[expected_valid])[0, 1], 0.99)
+
+    def test_tile_evidence_keeps_rigid_residual_near_zero(self):
+        reference = _image()
+        observed_shift = np.asarray([2.4, -3.7])
+        frame = ndi.shift(reference, observed_shift, order=1, mode='constant', cval=0)
+        rigid = estimate_shift(reference, frame, check_tiles=False)
+
+        result = estimate_tile_shifts(
+            reference,
+            frame,
+            (rigid['shift_y'], rigid['shift_x']),
+            tile_size=32,
+            stride=32,
+            )
+        residual = np.hypot(result['residual_y'], result['residual_x'])
+
+        self.assertLess(np.median(residual), 0.25)
+        self.assertLess(np.percentile(residual, 95), 0.5)
+
+    def test_coarse_to_fine_tiles_recover_smooth_local_movement(self):
+        reference = _image((256, 256))
+        y, x = np.indices(reference.shape, dtype=np.float32)
+        observed_y = 2 + 1.3 * np.sin(2 * np.pi * x / reference.shape[1])
+        observed_x = -2.5 + np.sin(2 * np.pi * y / reference.shape[0])
+        frame = ndi.map_coordinates(
+            reference,
+            [y - observed_y, x - observed_x],
+            order=1,
+            mode='constant',
+            ).astype(np.float32)
+        rigid = estimate_shift(reference, frame, check_tiles=False)
+
+        result = estimate_tile_shifts_coarse_to_fine(
+            reference,
+            frame,
+            (rigid['shift_y'], rigid['shift_x']),
+            )
+        expected_y = (
+            -2
+            - 1.3 * np.sin(2 * np.pi * result['tile_x'] / reference.shape[1])
+            - rigid['shift_y']
+            )
+        expected_x = (
+            2.5
+            - np.sin(2 * np.pi * result['tile_y'] / reference.shape[0])
+            - rigid['shift_x']
+            )
+        error = np.hypot(
+            result['residual_y'] - expected_y,
+            result['residual_x'] - expected_x,
+            )
+
+        self.assertLess(np.percentile(error, 95), 0.3)
+
+    def test_local_field_refinement_rejects_a_false_peak(self):
+        reference = _image((256, 256))
+        y, x = np.indices(reference.shape, dtype=np.float32)
+        observed_y = 1.2 * np.sin(2 * np.pi * x / reference.shape[1])
+        observed_x = np.sin(2 * np.pi * y / reference.shape[0])
+        frame = ndi.map_coordinates(
+            reference,
+            [y - observed_y, x - observed_x],
+            order=1,
+            mode='constant',
+            ).astype(np.float32)
+        rigid = estimate_shift(reference, frame, check_tiles=False)
+        tiles = estimate_tile_shifts(
+            reference,
+            frame,
+            (rigid['shift_y'], rigid['shift_x']),
+            )
+        bad_tile = len(tiles['tile_y']) // 2
+        tiles['residual_y'][bad_tile] += 5
+        tiles['residual_x'][bad_tile] -= 5
+
+        field = refine_tile_field(tiles, reference.shape, 64)
+        predicted_y, predicted_x = evaluate_tile_field(
+            field, tiles['tile_y'], tiles['tile_x'])
+        expected_y = (
+            -1.2 * np.sin(2 * np.pi * tiles['tile_x'] / reference.shape[1])
+            - rigid['shift_y']
+            )
+        expected_x = (
+            -np.sin(2 * np.pi * tiles['tile_y'] / reference.shape[0])
+            - rigid['shift_x']
+            )
+        error = np.hypot(predicted_y - expected_y, predicted_x - expected_x)
+
+        self.assertFalse(field['accepted'][bad_tile])
+        self.assertLess(np.percentile(error, 95), 0.3)
+
+        assessment = assess_tile_field(field, reference.shape)
+        registered = register_pair_piecewise(
+            frame,
+            frame,
+            rigid['shift_y'],
+            rigid['shift_x'],
+            field,
+            assessment,
+            )
+        valid = registered['control_valid']
+        np.testing.assert_array_equal(
+            registered['signal_valid'], registered['control_valid'])
+        np.testing.assert_array_equal(
+            np.isfinite(registered['control']), registered['control_valid'])
+        self.assertGreater(np.corrcoef(
+            reference[valid], registered['control'][valid])[0, 1], 0.98)
+
+        focal = assess_tile_field(field, reference.shape, focal_loss=True)
+        self.assertEqual(focal['fallback_reason'], 'focal_loss')
+        oversized = {**field, 'global_shift_y': np.float32(4)}
+        oversized = assess_tile_field(oversized, reference.shape)
+        self.assertEqual(oversized['fallback_reason'], 'field_overshoot')
+
+    def test_automatic_registration_requires_every_piecewise_gain(self):
+        rigid = {
+            'gradient_ncc': 0.80,
+            'residual_p95_px': 0.60,
+            'valid_fraction': 0.96,
+            'cross_channel_residual_px': 0.10,
+            }
+        piecewise = {
+            'gradient_ncc': 0.82,
+            'residual_p95_px': 0.40,
+            'valid_fraction': 0.95,
+            'cross_channel_residual_px': 0.12,
+            'accepted_or_fallback_fraction': 0.98,
+            }
+        selected = select_registration_model(rigid, piecewise)
+        self.assertEqual(selected['selected_model'], 'piecewise_rigid')
+
+        piecewise['gradient_ncc'] = 0.805
+        selected = select_registration_model(rigid, piecewise)
+        self.assertEqual(selected['selected_model'], 'rigid')
+        self.assertFalse(selected['passed']['gradient_ncc'])
 
     def test_two_pass_reference_recovers_the_unmoved_image(self):
         rng = np.random.default_rng(42)

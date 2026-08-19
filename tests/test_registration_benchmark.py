@@ -2,6 +2,7 @@
 Created on 14 August 2026
 Modified on 16 August 2026
 Modified on 17 August 2026 to follow the benchmark directory
+Modified on 18 August 2026
 
 check synthetic motion truth and benchmark errors
 
@@ -21,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from benchmarking.registration_benchmark import (
-    EXAMPLE_ROOT,
+    SOURCE_ROOT,
     EXAMPLE_REFERENCES,
     MOTION_RECIPES,
     _align_reference,
@@ -113,8 +114,8 @@ class RegistrationBenchmarkTests(unittest.TestCase):
         combinations = {(case['source'], case['recipe']) for case in cases}
 
         self.assertEqual(len(MOTION_RECIPES), 4)
-        self.assertEqual(len(combinations), 12)
-        self.assertEqual(len({case['seed'] for case in cases}), 12)
+        self.assertEqual(len(combinations), 40)
+        self.assertEqual(len({case['seed'] for case in cases}), 40)
         self.assertEqual(cases, benchmark_cases())
 
     def test_motion_recipes_cover_the_intended_recording_conditions(self):
@@ -201,9 +202,9 @@ class RegistrationBenchmarkTests(unittest.TestCase):
 
     def test_each_central_plane_comes_from_its_named_source(self):
         for source in EXAMPLE_REFERENCES:
-            control = np.load(EXAMPLE_ROOT / source)
+            control = np.load(SOURCE_ROOT / source)
             outer = [
-                np.load(EXAMPLE_ROOT / name)
+                np.load(SOURCE_ROOT / name)
                 for name in EXAMPLE_REFERENCES if name != source
                 ]
             planes = make_planes(control, *outer)
