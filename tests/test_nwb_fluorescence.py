@@ -9,6 +9,8 @@ check fluorescence extraction and dF/F calculation in NWB
 #%% imports
 from datetime import datetime, timezone
 import hashlib
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 import tempfile
 import unittest
@@ -28,10 +30,17 @@ add_source_to_path()
 from fibre_sight.api import (
     calculate_dff,
     extract_fluorescence,
+    list_dff_runs,
+    list_fluorescence_runs,
     load_dff_run,
     load_fluorescence_run,
     )
 from fibre_sight.fluorescence import _roi_and_surround_coordinates
+from fibre_sight.list_runs import (
+    TABLE_COLUMNS,
+    list_analysis_runs,
+    main as list_runs_main,
+    )
 from fibre_sight.nwb_segmentation import CONTROL_REFERENCE_PATH, _add_roi_run
 
 
@@ -354,6 +363,44 @@ class NWBFluorescenceTests(unittest.TestCase):
         self.assertEqual(result['validation_errors'], [])
         with self.assertRaisesRegex(ValueError, 'already exists'):
             calculate_dff(self.path, 'derived', 'extraction')
+
+    def test_analysis_runs_are_composed_and_listed(self):
+        extract_fluorescence(self.path, 'extraction', ROI_RUN)
+        calculate_dff(
+            self.path,
+            'derived',
+            'extraction',
+            baseline_window_s=0.5,
+            )
+
+        self.assertEqual(
+            [run['run_name'] for run in list_fluorescence_runs(self.path)],
+            ['extraction'],
+            )
+        self.assertEqual(
+            [run['run_name'] for run in list_dff_runs(self.path)],
+            ['derived'],
+            )
+        runs = list_analysis_runs(self.path)
+        self.assertEqual(
+            [(run['kind'], run['run_name']) for run in runs],
+            [('roi', ROI_RUN), ('fluorescence', 'extraction'), ('dff', 'derived')],
+            )
+        self.assertEqual(
+            [run['run_name'] for run in list_analysis_runs(
+                self.path, kind='roi', run_type='proposed')],
+            [ROI_RUN],
+            )
+
+        output = StringIO()
+        with patch(
+                'sys.argv',
+                ['fibre-sight-list-runs', str(self.path), '--kind', 'dff'],
+                ), redirect_stdout(output):
+            list_runs_main()
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[0], '\t'.join(TABLE_COLUMNS))
+        self.assertIn('dff\tderived', lines[1])
 
     @patch(
         'fibre_sight.fluorescence.validate',

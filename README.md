@@ -120,16 +120,23 @@ ROI dictionaries use a legacy pickled NumPy format. `scan labelled sessions` wri
 
 ## command-line tools
 
-Installing FibreSight adds four command-line tools alongside the GUI:
+Installing FibreSight adds five command-line tools alongside the GUI:
 
 ```text
 fibre-sight-build-manifest
 fibre-sight-train
 fibre-sight-predict
 fibre-sight-evaluate
+fibre-sight-list-runs
 ```
 
 Each command accepts `--help`. The same tools can be run as modules, for example `python -m fibre_sight.predict_rois --help`.
+
+To inspect the immutable ROI, fluorescence, and dF/F runs in an NWB file:
+
+```sh
+fibre-sight-list-runs workspace/dev/preprocessed_with_jumps_audited.nwb
+```
 
 The prediction command uses the bundled checkpoint and its saved operating point by default:
 

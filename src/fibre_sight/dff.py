@@ -127,6 +127,11 @@ def _dff_runs(nwbfile):
     return runs
 
 
+def list_dff_runs(nwb_path):
+    with NWBHDF5IO(Path(nwb_path), 'r') as io:
+        return list(_dff_runs(io.read()).values())
+
+
 def _check_new_dff_run(nwbfile, run_name):
     if not run_name or '/' in run_name:
         raise ValueError('run_name must be non-empty and cannot contain /')

@@ -20,8 +20,13 @@ from pynwb import NWBHDF5IO
 
 from ._device import get_device
 from ._repo import PACKAGE_ROOT
-from .dff import calculate_dff, load_dff_run
-from .fluorescence import extract_fluorescence, load_fluorescence_run
+from .dff import calculate_dff, list_dff_runs, load_dff_run
+from .fluorescence import (
+    extract_fluorescence,
+    list_fluorescence_runs,
+    load_fluorescence_run,
+    )
+from .list_runs import list_analysis_runs
 from .nwb_segmentation import (
     CONTROL_REFERENCE_PATH,
     _append_roi_run_transactionally,
