@@ -8,6 +8,7 @@ Modified on 23 June 2026 to bring the MSER editor and model workflow together
 Modified on 24 July 2026 to load packaged assets and the bundled model
 Modified on 25 July 2026 to separate the workbench tasks and reduce the control density
 Modified on 14 August 2026 to simplify the GUI workflow and tests
+Modified on 19 August 2026 to curate named NWB proposal runs
 
 labelling, training, prediction, and ROI curation in the FibreSight GUI
 
@@ -55,6 +56,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -97,6 +99,9 @@ from .api import (
     BUNDLED_MIN_SIZE,
     BUNDLED_THRESHOLD,
     ROIPredictor,
+    list_roi_runs,
+    load_roi_run,
+    save_curated_rois,
     )
 from .config import load_recipe, save_recipe
 from .gui_canvas import (
@@ -277,6 +282,8 @@ class FibreSightGUI(QMainWindow):
 
         self.ref_image = None
         self.image_path = None
+        self.nwb_path = None
+        self.source_proposal_run = None
         self.recname = None
         self.roi_dict = {}
         self.labelled = None
@@ -284,6 +291,7 @@ class FibreSightGUI(QMainWindow):
         self.fixed_ids = set()
         self.undo_stack = []
         self.probability = None
+        self.probability_max_size = None
         self.predictor = None
         self.process = None
         self.current_process_name = None
@@ -490,9 +498,18 @@ class FibreSightGUI(QMainWindow):
     def _build_prediction_widgets(self):
         self.image_line = QLineEdit()
         self.checkpoint_line = QLineEdit(str(BUNDLED_CHECKPOINT))
+        self.proposal_run_combo = QComboBox()
+        self.curated_run_line = QLineEdit()
+        self.proposal_run_combo.setAccessibleName('proposal run')
+        self.curated_run_line.setAccessibleName('curated run name')
+        self.curated_run_line.setPlaceholderText('new immutable run name')
         self.image_line.textChanged.connect(self.prediction_changed)
         self.image_line.editingFinished.connect(self.load_edited_channel_image)
         self.checkpoint_line.textChanged.connect(self.prediction_changed)
+        self.proposal_run_combo.currentIndexChanged.connect(
+            self.load_selected_proposal_run
+            )
+        self.curated_run_line.textChanged.connect(lambda _: self.refresh_status())
 
         # these stayed visible because they were the useful controls during tuning
         self.threshold_spin = QDoubleSpinBox()
@@ -778,6 +795,25 @@ class FibreSightGUI(QMainWindow):
                 ),
             self._path_row(self.checkpoint_line, self.browse_checkpoint),
             )
+        self.proposal_run_label = self.make_form_label(
+            'proposal run',
+            'immutable NWB proposal to inspect and curate',
+            self.proposal_run_combo,
+            )
+        self.curated_run_label = self.make_form_label(
+            'curated run',
+            'new immutable run name for edited ROIs',
+            self.curated_run_line,
+            )
+        resources_form.addRow(
+            self.proposal_run_label,
+            self.proposal_run_combo,
+            )
+        resources_form.addRow(
+            self.curated_run_label,
+            self.curated_run_line,
+            )
+        self.set_nwb_controls_visible(False)
         resources_layout.addLayout(resources_form)
 
         self.upper_controls = QWidget()
@@ -1406,7 +1442,7 @@ class FibreSightGUI(QMainWindow):
             QWidget#labelTab QLabel#sectionHeading {{
                 background: {theme['surface_alt']};
             }}
-            QLineEdit, QDoubleSpinBox, QSpinBox {{
+            QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {{
                 border: 1px solid {theme['border']};
                 border-radius: 2px;
                 padding: 3px 6px;
@@ -1415,15 +1451,16 @@ class FibreSightGUI(QMainWindow):
                 selection-background-color: {theme['selection']};
                 min-height: 23px;
             }}
-            QLineEdit:hover, QDoubleSpinBox:hover, QSpinBox:hover {{
+            QLineEdit:hover, QComboBox:hover, QDoubleSpinBox:hover, QSpinBox:hover {{
                 border-color: {theme['border_strong']};
                 background: {theme['surface']};
             }}
-            QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus {{
+            QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QSpinBox:focus {{
                 border-color: {theme['text']};
                 background: {theme['surface']};
             }}
-            QLineEdit:disabled, QDoubleSpinBox:disabled, QSpinBox:disabled {{
+            QLineEdit:disabled, QComboBox:disabled, QDoubleSpinBox:disabled,
+            QSpinBox:disabled {{
                 border-color: {theme['border']};
                 background: {theme['surface_alt']};
                 color: {theme['disabled']};
@@ -1626,6 +1663,7 @@ class FibreSightGUI(QMainWindow):
         text_widget_types = (
             QAbstractButton,
             QAbstractSpinBox,
+            QComboBox,
             QHeaderView,
             QLabel,
             QLineEdit,
@@ -1663,6 +1701,7 @@ class FibreSightGUI(QMainWindow):
     def clear_probability(self, redraw=True):
         needs_redraw = self.probability is not None or self.display_mode == 'confidence'
         self.probability = None
+        self.probability_max_size = None
         self.display_mode = 'image'
         blockers = [
             QSignalBlocker(self.image_view_button),
@@ -1978,9 +2017,9 @@ class FibreSightGUI(QMainWindow):
         start_path = self.image_line.text().strip() or str(WORKSPACE_ROOT)
         path, _ = QFileDialog.getOpenFileName(
             self,
-            'select channel-2 reference image',
+            'select channel-2 reference or NWB recording',
             start_path,
-            'NumPy images (*.npy)',
+            'Reference images and NWB recordings (*.npy *.nwb)',
             )
         if path:
             self.image_line.setText(path)
@@ -2257,14 +2296,22 @@ class FibreSightGUI(QMainWindow):
         if not path:
             return
 
+        image_path = Path(path)
+        if image_path.suffix.lower() == '.nwb':
+            self.load_nwb_recording(image_path)
+            return
+
         try:
-            image = squeeze_image(np.load(path))
+            image = squeeze_image(np.load(image_path))
         except Exception as exc:
             self.print_log(f'failed to load image: {exc}')
             return
 
+        self.nwb_path = None
+        self.source_proposal_run = None
+        self.set_nwb_controls_visible(False)
         self.ref_image = image
-        self.image_path = Path(path)
+        self.image_path = image_path
         self.recname = self.recording_name(self.image_path)
         self.roi_dict = {}
         self.labelled = np.zeros_like(self.ref_image, dtype=np.int32)
@@ -2282,6 +2329,106 @@ class FibreSightGUI(QMainWindow):
         self.plot_image()
         self.canvas.fit_to_image()
         self.refresh_status('channel-2 image loaded')
+
+    def set_nwb_controls_visible(self, visible):
+        for widget in (
+            self.proposal_run_label,
+            self.proposal_run_combo,
+            self.curated_run_label,
+            self.curated_run_line,
+            ):
+            widget.setVisible(visible)
+
+    def load_nwb_recording(self, nwb_path):
+        try:
+            proposal_runs = list_roi_runs(nwb_path, run_type='proposed')
+        except Exception as exc:
+            self.print_log(f'failed to read NWB proposal runs: {exc}')
+            self.refresh_status('NWB load failed')
+            return
+
+        self.nwb_path = Path(nwb_path)
+        self.source_proposal_run = None
+        self.image_path = self.nwb_path
+        self.recname = self.recording_name(self.nwb_path)
+        self.ref_image = None
+        self.roi_dict = {}
+        self.labelled = None
+        self.selected.clear()
+        self.fixed_ids.clear()
+        self.undo_stack.clear()
+        self.clear_probability(redraw=False)
+        self.set_nwb_controls_visible(True)
+
+        blocker = QSignalBlocker(self.proposal_run_combo)
+        self.proposal_run_combo.clear()
+        self.proposal_run_combo.addItem('select proposal run', None)
+        for proposal_run in proposal_runs:
+            run_name = proposal_run['run_name']
+            self.proposal_run_combo.addItem(run_name, run_name)
+        del blocker
+
+        self.curated_run_line.clear()
+        if len(proposal_runs) == 1:
+            self.proposal_run_combo.setCurrentIndex(1)
+            return
+
+        self.plot_image()
+        if proposal_runs:
+            self.refresh_status('select an NWB proposal run')
+        else:
+            self.print_log(f'no proposal runs found in {self.nwb_path}')
+            self.refresh_status('no NWB proposal runs found')
+
+    def load_selected_proposal_run(self, _index=None):
+        run_name = self.proposal_run_combo.currentData()
+        if self.nwb_path is None:
+            return
+        if run_name is None:
+            self.source_proposal_run = None
+            self.ref_image = None
+            self.roi_dict = {}
+            self.labelled = None
+            self.selected.clear()
+            self.fixed_ids.clear()
+            self.undo_stack.clear()
+            self.clear_probability(redraw=False)
+            self.plot_image()
+            self.refresh_status('select an NWB proposal run')
+            return
+
+        try:
+            loaded_run = load_roi_run(self.nwb_path, run_name)
+            labelled, _ = roi_dict_to_label(
+                loaded_run['roi_dict'],
+                loaded_run['reference'].shape,
+                )
+        except Exception as exc:
+            self.print_log(f'failed to load proposal run {run_name}: {exc}')
+            self.refresh_status('proposal run load failed')
+            return
+
+        self.source_proposal_run = run_name
+        self.ref_image = loaded_run['reference']
+        self.labelled = labelled
+        self.roi_dict = labels_to_roi_dict(labelled)
+        self.probability = loaded_run['probability']
+        recorded_max_size = int(loaded_run['provenance']['max_size'])
+        self.probability_max_size = (
+            None if recorded_max_size == -1 else recorded_max_size
+            )
+        self.threshold_spin.setValue(float(loaded_run['provenance']['threshold']))
+        self.min_size_spin.setValue(int(loaded_run['provenance']['min_size']))
+        self.selected.clear()
+        self.fixed_ids.clear()
+        self.undo_stack.clear()
+        self.set_display_mode('image')
+        self.reset_display_range(redraw=False)
+        self.canvas.fit_to_image()
+        self.print_log(
+            f'loaded proposal run {run_name} from {self.nwb_path}'
+            )
+        self.refresh_status('NWB proposal loaded')
 
     def load_model(self):
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -2366,6 +2513,7 @@ class FibreSightGUI(QMainWindow):
         self.roi_dict = roi_dict
         self.labelled = labelled
         self.probability = probability
+        self.probability_max_size = self.predictor.max_size
         self.selected.clear()
         self.fixed_ids.clear()
 
@@ -2389,7 +2537,7 @@ class FibreSightGUI(QMainWindow):
             self.probability,
             threshold=float(self.threshold_spin.value()),
             min_size=int(self.min_size_spin.value()),
-            max_size=self.predictor.max_size,
+            max_size=self.probability_max_size,
             )
         self.selected.clear()
         self.fixed_ids.clear()
@@ -2435,6 +2583,36 @@ class FibreSightGUI(QMainWindow):
             return
 
         self.update_roi_dict()
+        if self.nwb_path is not None:
+            run_name = self.curated_run_line.text().strip()
+            if not run_name:
+                self.print_log('enter a name for the curated NWB run')
+                self.refresh_status('curated run name required')
+                return
+
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self.statusBar().showMessage('saving curated NWB run')
+            QApplication.processEvents()
+            try:
+                result = save_curated_rois(
+                    self.nwb_path,
+                    run_name,
+                    self.roi_dict,
+                    self.source_proposal_run,
+                    )
+            except Exception as exc:
+                self.print_log(f'failed to save curated run: {exc}')
+                self.refresh_status('curated run save failed')
+                return
+            finally:
+                QApplication.restoreOverrideCursor()
+
+            self.print_log(
+                f'saved {result["roi_count"]} ROIs as curated run {run_name}'
+                )
+            self.refresh_status('curated NWB run saved')
+            return
+
         out_path = self.default_roi_path()
         save_roi_dict(self.roi_dict, out_path)
         self.print_log(f'exported ROIs to {out_path}')
@@ -2456,6 +2634,14 @@ class FibreSightGUI(QMainWindow):
         return self.image_path.parent / f'{self.recname}_ROI_dict.npy'
 
     def update_export_tooltip(self):
+        if self.nwb_path is not None:
+            self.curate_buttons['save_roi'].setText('save curated run')
+            self.curate_buttons['save_roi'].setToolTip(
+                f'append a new immutable ROI run to {self.nwb_path}'
+                )
+            return
+
+        self.curate_buttons['save_roi'].setText('export ROIs')
         self.curate_buttons['save_roi'].setToolTip(
             f'export immediately to {self.default_roi_path()}'
             )
@@ -2894,6 +3080,8 @@ class FibreSightGUI(QMainWindow):
 
     def refresh_status(self, message=None):
         image_name = self.image_path.name if self.image_path else 'not loaded'
+        if self.source_proposal_run:
+            image_name = f'{image_name} · {self.source_proposal_run}'
         roi_count = len(self.roi_dict)
         selected_count = len(self.selected)
         fixed_count = len(self.fixed_ids)
@@ -3017,6 +3205,12 @@ class FibreSightGUI(QMainWindow):
         self.curate_buttons['fit_view'].setEnabled(image_ready)
         self.curate_buttons['zoom_in'].setEnabled(image_ready)
         self.curate_buttons['save_roi'].setEnabled(image_ready and has_rois)
+        if self.nwb_path is not None:
+            self.curate_buttons['save_roi'].setEnabled(
+                image_ready
+                and has_rois
+                and bool(self.curated_run_line.text().strip())
+                )
         if hasattr(self, 'controls_split_timer'):
             self.controls_split_timer.start(0)
 

@@ -71,6 +71,65 @@ def _seed_canvas(window, include_probability=False):
     return image
 
 
+def _preprocessed_nwb(path, reference):
+    from datetime import datetime, timezone
+
+    from hdmf.backends.hdf5.h5_utils import H5DataIO
+    from hdmf.common import DynamicTable
+    import numpy as np
+    from pynwb import NWBFile, NWBHDF5IO
+    from pynwb.base import Images
+    from pynwb.image import GrayscaleImage, ImageSeries
+
+    height, width = reference.shape
+    nwbfile = NWBFile(
+        session_description='GUI curation adapter test',
+        identifier=path.stem,
+        session_start_time=datetime(2026, 8, 19, tzinfo=timezone.utc),
+        )
+    preprocessing = nwbfile.create_processing_module(
+        name='preprocessing',
+        description='minimal registered recording',
+        )
+    for channel_index, channel in enumerate(('signal', 'control')):
+        movie = np.arange(3 * width * height, dtype=np.int16).reshape(
+            3, width, height) + channel_index
+        preprocessing.add(ImageSeries(
+            name=f'registered_{channel}',
+            data=H5DataIO(
+                movie,
+                chunks=(1, width, height),
+                compression='gzip',
+                compression_opts=1,
+                shuffle=True,
+                fletcher32=True,
+                ),
+            unit='counts',
+            format='raw',
+            dimension=(width, height),
+            num_samples=np.uint64(3),
+            rate=30.0,
+            ))
+    preprocessing.add(Images(
+        name='registration_references',
+        images=[GrayscaleImage(
+            name='control_reference',
+            data=np.asarray(reference, dtype=np.float32).T,
+            description='test reference',
+            )],
+        ))
+    metadata = DynamicTable(
+        name='recording_metadata',
+        description='test metadata',
+        )
+    metadata.add_column(name='control_label', description='control label')
+    metadata.add_column(name='pixel_size_um', description='pixel size')
+    metadata.add_row(control_label='tdTomato', pixel_size_um=1.2)
+    preprocessing.add(metadata)
+    with NWBHDF5IO(path, 'w') as io:
+        io.write(nwbfile)
+
+
 #%% probes
 def viewport(window):
     from PyQt5.QtCore import QPoint
@@ -311,11 +370,103 @@ def segmentation_fixed(window):
         assert window.fixed_ids == {1}
 
 
+def nwb_curation(window):
+    import numpy as np
+    from PyQt5.QtWidgets import QApplication
+
+    import fibre_sight.api as api
+    from fibre_sight.api import list_roi_runs, load_roi_run
+
+    with tempfile.TemporaryDirectory(prefix='fibre sight NWB curation ') as temp_dir:
+        temp_dir = Path(temp_dir)
+        nwb_path = temp_dir / 'recording.nwb'
+        reference = np.arange(24, dtype=np.float32).reshape(4, 6)
+        _preprocessed_nwb(nwb_path, reference)
+
+        class FakePredictor:
+            def __init__(self, **_kwargs):
+                self.checkpoint_path = Path(__file__)
+                self.threshold = 0.25
+                self.min_size = 2
+                self.max_size = 100
+                self.tta = True
+                self.device = 'cpu'
+
+            def predict_image(self, image):
+                probability = np.asarray(image, dtype=np.float32) / np.max(image)
+                roi_dict = {
+                    4: {
+                        'xpix': np.asarray([1, 2, 2]),
+                        'ypix': np.asarray([1, 1, 2]),
+                        },
+                    }
+                return roi_dict, np.zeros(image.shape, dtype=np.int32), probability
+
+        with mock.patch.object(api, 'ROIPredictor', FakePredictor):
+            api.segment_recording(nwb_path, 'proposal')
+            api.segment_recording(nwb_path, 'second_proposal')
+
+        window.image_line.setText(str(nwb_path))
+        window.load_channel_image()
+        assert window.ref_image is None
+        assert window.source_proposal_run is None
+        window.proposal_run_combo.setCurrentText('proposal')
+        window.resize(1000, 680)
+        window.show()
+        QApplication.processEvents()
+        assert window.proposal_run_combo.visibleRegion().contains(
+            window.proposal_run_combo.rect()
+            )
+        assert window.curated_run_line.visibleRegion().contains(
+            window.curated_run_line.rect()
+            )
+        np.testing.assert_array_equal(window.ref_image, reference)
+        np.testing.assert_array_equal(window.probability, reference / 23)
+        assert window.source_proposal_run == 'proposal'
+        assert window.proposal_run_combo.currentData() == 'proposal'
+        window.threshold_spin.setValue(0.9)
+        window.min_size_spin.setValue(1)
+        window.rebuild_rois_from_probability()
+        assert window.roi_dict
+        window.proposal_run_combo.setCurrentText('second_proposal')
+        window.proposal_run_combo.setCurrentText('proposal')
+        assert set(zip(
+            window.roi_dict[1]['xpix'],
+            window.roi_dict[1]['ypix'],
+            )) == {(1, 1), (2, 1), (2, 2)}
+
+        window.labelled[2, 3] = 1
+        window.update_roi_dict()
+        window.curated_run_line.setText('curated')
+        window.save_roi_file()
+
+        proposal = load_roi_run(nwb_path, 'proposal')
+        curated = load_roi_run(nwb_path, 'curated')
+        assert set(zip(
+            proposal['roi_dict'][4]['xpix'],
+            proposal['roi_dict'][4]['ypix'],
+            )) == {(1, 1), (2, 1), (2, 2)}
+        assert set(zip(
+            curated['roi_dict'][1]['xpix'],
+            curated['roi_dict'][1]['ypix'],
+            )) == {(1, 1), (2, 1), (2, 2), (3, 2)}
+        assert curated['provenance']['source_run'] == 'proposal'
+
+        window.save_roi_file()
+        assert [run['run_name'] for run in list_roi_runs(nwb_path)] == [
+            'proposal',
+            'second_proposal',
+            'curated',
+            ]
+        assert 'ROI run already exists: curated' in window.output_box.toPlainText()
+
+
 PROBES = {
     'viewport': viewport,
     'image_prediction': image_prediction,
     'roi_editing': roi_editing,
     'segmentation_fixed': segmentation_fixed,
+    'nwb_curation': nwb_curation,
     }
 
 
@@ -353,6 +504,9 @@ class GUIProbeTests(unittest.TestCase):
 
     def test_segmentation_preserves_fixed_rois(self):
         self.run_probe('segmentation_fixed')
+
+    def test_nwb_proposal_curation(self):
+        self.run_probe('nwb_curation')
 
 
 #%% entry point

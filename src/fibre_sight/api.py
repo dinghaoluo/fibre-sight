@@ -4,17 +4,32 @@ Created on 29 April 2026
 Modified on 3 June 2026
 Modified on 24 July 2026 to load the bundled channel-2 checkpoint
 Modified on 14 August 2026
+Modified on 19 August 2026
 
-model loading and prediction used by the GUI
+model prediction and named NWB ROI runs
 
 @author: Dinghao Luo
 '''
 
 #%% imports
+from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
+
+from pynwb import NWBHDF5IO
 
 from ._device import get_device
 from ._repo import PACKAGE_ROOT
+from .nwb_segmentation import (
+    CONTROL_REFERENCE_PATH,
+    _append_roi_run_transactionally,
+    _check_new_run,
+    _checkpoint_sha256,
+    _read_control_reference,
+    list_roi_runs,
+    load_roi_run,
+    save_curated_rois,
+    )
 from .postprocess import probability_to_roi_dict
 from .predict_rois import load_model, predict_probability
 
@@ -75,3 +90,51 @@ class ROIPredictor:
             max_size=self.max_size,
             )
         return roi_dict, labelled, probability
+
+
+#%% NWB segmentation
+def segment_recording(
+        nwb_path,
+        run_name,
+        *,
+        checkpoint_path=None,
+        threshold=None,
+        min_size=None,
+        tta=None,
+        device='auto',
+        ):
+    nwb_path = Path(nwb_path)
+    with NWBHDF5IO(nwb_path, 'r') as io:
+        nwbfile = io.read()
+        _check_new_run(nwbfile, run_name)
+        reference = _read_control_reference(nwbfile)
+
+    inference_start = perf_counter()
+    predictor = ROIPredictor(
+        checkpoint_path=checkpoint_path,
+        threshold=threshold,
+        min_size=min_size,
+        tta=tta,
+        device=device,
+        )
+    roi_dict, _, probability = predictor.predict_image(reference)
+    inference_time_s = perf_counter() - inference_start
+    checkpoint_path = predictor.checkpoint_path.resolve()
+    run_metadata = {
+        'run_name': run_name,
+        'run_type': 'proposed',
+        'source_run': '',
+        'reference_path': CONTROL_REFERENCE_PATH,
+        'checkpoint_path': str(checkpoint_path),
+        'checkpoint_sha256': _checkpoint_sha256(checkpoint_path),
+        'threshold': float(predictor.threshold),
+        'min_size': int(predictor.min_size),
+        'max_size': -1 if predictor.max_size is None else int(predictor.max_size),
+        'tta': bool(predictor.tta),
+        'device': str(predictor.device),
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        }
+    result = _append_roi_run_transactionally(
+        nwb_path, run_name, roi_dict, run_metadata, probability)
+    result['inference_time_s'] = inference_time_s
+    return result
