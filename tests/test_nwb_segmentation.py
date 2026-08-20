@@ -100,6 +100,12 @@ class _Predictor:
         return roi_dict, np.zeros(image.shape, dtype=np.int32), probability
 
 
+class _EmptyPredictor(_Predictor):
+    def predict_image(self, image):
+        probability = np.zeros(image.shape, dtype=np.float32)
+        return {}, np.zeros(image.shape, dtype=np.int32), probability
+
+
 #%% tests
 class NWBSegmentationTests(unittest.TestCase):
     def setUp(self):
@@ -147,6 +153,29 @@ class NWBSegmentationTests(unittest.TestCase):
         self.assertIsNone(loaded['probability'])
         self.assertIn(2, loaded['roi_dict'][10]['xpix'])
         self.assertIn(2, loaded['roi_dict'][11]['xpix'])
+
+    @patch('fibre_sight.api.ROIPredictor', _EmptyPredictor)
+    def test_empty_proposal_is_stored_as_a_valid_run(self):
+        result = segment_recording(self.path, 'empty_proposal')
+        loaded = load_roi_run(self.path, 'empty_proposal')
+
+        self.assertEqual(result['roi_count'], 0)
+        self.assertEqual(result['validation_errors'], [])
+        self.assertEqual(loaded['roi_dict'], {})
+        np.testing.assert_array_equal(
+            loaded['probability'],
+            np.zeros(self.reference.shape, dtype=np.float32),
+            )
+
+    def test_existing_partial_is_rejected_before_inference(self):
+        partial_path = self.root / 'recording.segmenting.partial.nwb'
+        partial_path.touch()
+
+        with patch('fibre_sight.api.ROIPredictor') as predictor:
+            with self.assertRaisesRegex(FileExistsError, 'partial output already exists'):
+                segment_recording(self.path, 'proposal')
+
+        predictor.assert_not_called()
 
     @patch('fibre_sight.api.ROIPredictor', _Predictor)
     @patch(

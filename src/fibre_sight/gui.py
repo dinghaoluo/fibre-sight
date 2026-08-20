@@ -3208,7 +3208,6 @@ class FibreSightGUI(QMainWindow):
         if self.nwb_path is not None:
             self.curate_buttons['save_roi'].setEnabled(
                 image_ready
-                and has_rois
                 and bool(self.curated_run_line.text().strip())
                 )
         if hasattr(self, 'controls_split_timer'):

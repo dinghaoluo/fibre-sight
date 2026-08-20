@@ -17,7 +17,7 @@ from time import perf_counter
 
 try:
     import resource
-except ImportError:  # Windows has no resource module
+except ImportError:  # unavailable on Windows
     resource = None
 
 from hdmf.backends.hdf5.h5_utils import H5DataIO
@@ -183,6 +183,18 @@ def _add_roi_run(nwbfile, run_name, roi_dict, run_metadata, probability=None):
         plane_segmentation.add_roi(
             id=int(roi_id),
             pixel_mask=list(zip(xpix, ypix, np.ones(len(xpix), dtype=float))),
+            )
+    if not roi_dict:
+        pixel_mask_dtype = np.dtype([
+            ('x', np.uint32),
+            ('y', np.uint32),
+            ('weight', np.float32),
+            ])
+        plane_segmentation.add_column(
+            name='pixel_mask',
+            description='pixel masks for each ROI',
+            data=np.empty(0, dtype=pixel_mask_dtype),
+            index=True,
             )
 
     if probability is not None:

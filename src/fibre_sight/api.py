@@ -6,7 +6,7 @@ Modified on 24 July 2026 to load the bundled channel-2 checkpoint
 Modified on 14 August 2026
 Modified on 19 August 2026
 
-model prediction and named NWB ROI runs
+model prediction, named NWB ROI runs, and fluorescence extraction
 
 @author: Dinghao Luo
 '''
@@ -20,12 +20,14 @@ from pynwb import NWBHDF5IO
 
 from ._device import get_device
 from ._repo import PACKAGE_ROOT
+from .fluorescence import extract_fluorescence, load_fluorescence_run
 from .nwb_segmentation import (
     CONTROL_REFERENCE_PATH,
     _append_roi_run_transactionally,
     _check_new_run,
     _checkpoint_sha256,
     _read_control_reference,
+    _segmentation_partial_path,
     list_roi_runs,
     load_roi_run,
     save_curated_rois,
@@ -104,6 +106,10 @@ def segment_recording(
         device='auto',
         ):
     nwb_path = Path(nwb_path)
+    partial_path = _segmentation_partial_path(nwb_path)
+    if partial_path.exists():
+        raise FileExistsError(f'partial output already exists: {partial_path}')
+
     with NWBHDF5IO(nwb_path, 'r') as io:
         nwbfile = io.read()
         _check_new_run(nwbfile, run_name)

@@ -452,11 +452,20 @@ def nwb_curation(window):
             )) == {(1, 1), (2, 1), (2, 2), (3, 2)}
         assert curated['provenance']['source_run'] == 'proposal'
 
+        window.labelled.fill(0)
+        window.update_roi_dict()
+        window.curated_run_line.setText('empty_curated')
+        assert window.curate_buttons['save_roi'].isEnabled()
+        window.save_roi_file()
+        assert load_roi_run(nwb_path, 'empty_curated')['roi_dict'] == {}
+
+        window.curated_run_line.setText('curated')
         window.save_roi_file()
         assert [run['run_name'] for run in list_roi_runs(nwb_path)] == [
             'proposal',
             'second_proposal',
             'curated',
+            'empty_curated',
             ]
         assert 'ROI run already exists: curated' in window.output_box.toPlainText()
 
