@@ -7,6 +7,7 @@ Modified on 23 July 2026 to keep the loss experiments beside the training loop
 Modified on 24 July 2026 to use packaged recipes and local run directories
 Modified on 1 August 2026 to seed comparable runs and expose augmentation choices
 Modified on 14 August 2026
+Modified on 20 August 2026
 
 train the small U-Net and keep its run record
 
@@ -283,18 +284,75 @@ def plot_history(history, path):
 
     mpl_formatting()
 
-    epochs = [stats['epoch'] for stats in history]
-    fig, axes = plt.subplots(1, 2, figsize=(7, 3), constrained_layout=True)
+    epochs = np.asarray([stats['epoch'] for stats in history])
+    training_loss = np.asarray([stats['train_loss'] for stats in history])
+    validation_loss = np.asarray([stats['val_loss'] for stats in history])
+    validation_dice = np.asarray([
+        stats['val_pixel_dice'] for stats in history])
+    selected_index = int(np.argmax(validation_dice))
+    selected_epoch = epochs[selected_index]
+    selected_dice = validation_dice[selected_index]
 
-    axes[0].plot(epochs, [stats['train_loss'] for stats in history], label='train')
-    axes[0].plot(epochs, [stats['val_loss'] for stats in history], label='val')
+    training_colour = '#1A1A1C'
+    validation_colour = '#009E73'
+    fig, axes = plt.subplots(
+        1, 2, figsize=(9.5, 3.4), constrained_layout=True)
+
+    axes[0].plot(
+        epochs, training_loss,
+        color=training_colour, linewidth=1.4, label='training')
+    axes[0].plot(
+        epochs, validation_loss,
+        color=validation_colour, linewidth=1.4, label='validation')
+    axes[0].set_title('loss')
     axes[0].set_xlabel('epoch')
-    axes[0].set_ylabel('loss')
+    axes[0].set_ylabel('BCE + Dice loss')
     axes[0].legend(frameon=False)
 
-    axes[1].plot(epochs, [stats['val_pixel_dice'] for stats in history])
+    dice_range = np.ptp(validation_dice)
+    lower_margin = max(0.2 * dice_range, 0.03)
+    upper_margin = max(0.08 * dice_range, 0.01)
+    dice_bottom = max(0, validation_dice.min() - lower_margin)
+    dice_top = min(1, validation_dice.max() + upper_margin)
+    annotation_top = dice_bottom + 0.18 * (dice_top - dice_bottom)
+
+    axes[1].plot(
+        epochs, validation_dice,
+        color=validation_colour, linewidth=1.4)
+    axes[1].vlines(
+        selected_epoch,
+        annotation_top,
+        selected_dice,
+        color='0.45',
+        linestyle=':',
+        linewidth=0.9,
+        )
+    axes[1].scatter(
+        selected_epoch,
+        selected_dice,
+        color=validation_colour,
+        s=38,
+        zorder=3,
+        )
+    axes[1].text(
+        selected_epoch,
+        dice_bottom + 0.05 * (dice_top - dice_bottom),
+        f'selected epoch {selected_epoch}\nDice {selected_dice:.4f}',
+        ha='center',
+        va='bottom',
+        fontsize=8,
+        )
+    axes[1].set_title('validation overlap')
     axes[1].set_xlabel('epoch')
-    axes[1].set_ylabel('validation Dice')
+    axes[1].set_ylabel('pixel Dice')
+    axes[1].set_ylim(dice_bottom, dice_top)
+
+    for axis in axes:
+        axis.grid(axis='y', color='0.90', linewidth=0.6)
+        axis.spines[['top', 'right']].set_visible(False)
+        if len(epochs) == 1:
+            axis.set_xlim(selected_epoch - 0.5, selected_epoch + 0.5)
+            axis.set_xticks([selected_epoch])
 
     fig.savefig(path, dpi=200, bbox_inches='tight')
     plt.close(fig)
