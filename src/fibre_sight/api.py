@@ -4,9 +4,9 @@ Created on 29 April 2026
 Modified on 3 June 2026
 Modified on 24 July 2026 to load the bundled channel-2 checkpoint
 Modified on 14 August 2026
-Modified on 19 August 2026
+Modified on 20 August 2026
 
-model prediction, named NWB ROI runs, and fluorescence extraction
+model prediction and immutable NWB analysis stages
 
 @author: Dinghao Luo
 '''
@@ -20,6 +20,7 @@ from pynwb import NWBHDF5IO
 
 from ._device import get_device
 from ._repo import PACKAGE_ROOT
+from .dff import calculate_dff, load_dff_run
 from .fluorescence import extract_fluorescence, load_fluorescence_run
 from .nwb_segmentation import (
     CONTROL_REFERENCE_PATH,

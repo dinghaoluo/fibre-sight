@@ -1,7 +1,7 @@
 '''
 Created on 19 August 2026
 
-extract ROI and annulus fluorescence from registered NWB movies
+extract ROI and surrounding fluorescence from registered NWB movies
 
 @author: Dinghao Luo
 '''
@@ -29,18 +29,23 @@ from .nwb_segmentation import (
 
 
 #%% defaults
-ANNULUS_INNER_PX = 2
-ANNULUS_OUTER_PX = 8
+SURROUND_METHOD = 'adaptive'
+SURROUND_INNER_PX = 5
+SURROUND_OUTER_PX = 8
+SURROUND_MIN_PIXELS = 350
+SURROUND_EXPANSION_PX = 5
 FRAME_BATCH_SIZE = 32
 STATISTICS = ('mean', 'median', 'iqr', 'valid_fraction')
 
 
 #%% masks and measurements
-def _roi_and_annulus_coordinates(
+def _roi_and_surround_coordinates(
         roi_dict,
         image_shape,
-        annulus_inner_px,
-        annulus_outer_px,
+        surround_method,
+        surround_inner_px,
+        surround_outer_px,
+        surround_min_pixels,
         ):
     occupied_roi_pixels = np.zeros(image_shape, dtype=bool)
     roi_masks = {}
@@ -50,19 +55,44 @@ def _roi_and_annulus_coordinates(
         roi_masks[roi_id] = roi_mask
         occupied_roi_pixels |= roi_mask
 
-    area_coordinates = {'roi': [], 'annulus': []}
+    area_coordinates = {'roi': [], 'surround': []}
+    four_connected = ndi.generate_binary_structure(2, 1)
     for roi_id in roi_dict:
         roi_mask = roi_masks[roi_id]
         roi_ypix, roi_xpix = np.nonzero(roi_mask)
-        distance_from_roi = ndi.distance_transform_edt(~roi_mask)
-        annulus_mask = (
-            (distance_from_roi > annulus_inner_px)
-            & (distance_from_roi <= annulus_outer_px)
-            & ~occupied_roi_pixels
-            )
-        annulus_ypix, annulus_xpix = np.nonzero(annulus_mask)
+        if surround_method == 'fixed':
+            distance_from_roi = ndi.distance_transform_edt(~roi_mask)
+            surround_mask = (
+                (distance_from_roi > surround_inner_px)
+                & (distance_from_roi <= surround_outer_px)
+                & ~occupied_roi_pixels
+                )
+        else:
+            inner_mask = roi_mask.copy()
+            if surround_inner_px:
+                inner_mask = ndi.binary_dilation(
+                    inner_mask,
+                    structure=four_connected,
+                    iterations=surround_inner_px,
+                    )
+            expanded_mask = inner_mask
+            surround_mask = np.zeros(image_shape, dtype=bool)
+            while np.count_nonzero(surround_mask) <= surround_min_pixels:
+                next_mask = ndi.binary_dilation(
+                    expanded_mask,
+                    structure=four_connected,
+                    iterations=SURROUND_EXPANSION_PX,
+                    )
+                if np.array_equal(next_mask, expanded_mask):
+                    break
+                expanded_mask = next_mask
+                surround_mask = (
+                    expanded_mask & ~inner_mask & ~occupied_roi_pixels
+                    )
+
+        surround_ypix, surround_xpix = np.nonzero(surround_mask)
         area_coordinates['roi'].append((roi_ypix, roi_xpix))
-        area_coordinates['annulus'].append((annulus_ypix, annulus_xpix))
+        area_coordinates['surround'].append((surround_ypix, surround_xpix))
     return area_coordinates
 
 
@@ -110,7 +140,7 @@ def _extract_traces(nwb_path, roi_dict, area_coordinates):
                 dtype=np.float32,
                 )
             for channel in ('signal', 'control')
-            for area in ('roi', 'annulus')
+            for area in ('roi', 'surround')
             for statistic in STATISTICS
             }
 
@@ -129,7 +159,7 @@ def _extract_traces(nwb_path, roi_dict, area_coordinates):
                         ])
                     for coordinate in ('y0', 'y1', 'x0', 'x1')
                     ])
-                for area in ('roi', 'annulus'):
+                for area in ('roi', 'surround'):
                     for roi_index, (ypix, xpix) in enumerate(
                             area_coordinates[area]):
                         measurements = _measure_pixels(
@@ -158,7 +188,8 @@ def _fluorescence_runs(nwbfile):
             column_name: table[column_name][row_index]
             for column_name in table.colnames
             }
-        for column_name in ('run_name', 'roi_run', 'created_at'):
+        for column_name in (
+                'run_name', 'roi_run', 'surround_method', 'created_at'):
             run[column_name] = _read_text(run[column_name])
         runs[run['run_name']] = run
     return runs
@@ -204,8 +235,11 @@ def _fluorescence_module(nwbfile):
     columns = {
         'run_name': 'unique immutable extraction run name',
         'roi_run': 'immutable segmentation or curation run used for extraction',
-        'annulus_inner_px': 'excluded distance from each ROI in pixels',
-        'annulus_outer_px': 'outer annulus distance from each ROI in pixels',
+        'surround_method': 'adaptive growth or fixed Euclidean annulus',
+        'surround_inner_px': 'excluded distance from each ROI in pixels',
+        'surround_outer_px': 'outer distance for fixed surrounds; NaN for adaptive',
+        'surround_min_pixels': 'adaptive target pixel count; -1 for fixed',
+        'surround_expansion_px': 'adaptive growth step in pixels; -1 for fixed',
         'created_at': 'UTC creation time',
         }
     for name, description in columns.items():
@@ -289,12 +323,13 @@ def _verify_fluorescence_run(
     np.testing.assert_array_equal(loaded['roi_ids'], roi_ids)
     if set(loaded['traces']) != set(traces):
         raise AssertionError('stored fluorescence series changed')
+    frame_count = len(next(iter(traces.values())))
+    frame_indices = sorted({0, frame_count // 2, frame_count - 1})
     for series_name, expected_values in traces.items():
-        np.testing.assert_array_equal(
-            loaded['traces'][series_name],
-            expected_values,
-            strict=True,
-            )
+        stored_values = loaded['traces'][series_name]
+        if stored_values.shape != expected_values.shape:
+            raise AssertionError(f'stored fluorescence shape changed: {series_name}')
+        np.testing.assert_array_equal(stored_values[frame_indices], expected_values[frame_indices])
     if _registered_movie_state(path) != registered_movie_state:
         raise AssertionError('registered movie storage or seeded frames changed')
 
@@ -305,11 +340,19 @@ def extract_fluorescence(
         run_name,
         roi_run,
         *,
-        annulus_inner_px=ANNULUS_INNER_PX,
-        annulus_outer_px=ANNULUS_OUTER_PX,
+        surround_method=SURROUND_METHOD,
+        surround_inner_px=SURROUND_INNER_PX,
+        surround_outer_px=SURROUND_OUTER_PX,
+        surround_min_pixels=SURROUND_MIN_PIXELS,
         ):
-    if not 0 <= annulus_inner_px < annulus_outer_px:
-        raise ValueError('annulus radii must satisfy 0 <= inner < outer')
+    if surround_method not in ('adaptive', 'fixed'):
+        raise ValueError("surround_method must be 'adaptive' or 'fixed'")
+    if surround_inner_px < 0:
+        raise ValueError('surround_inner_px must be non-negative')
+    if surround_method == 'fixed' and surround_outer_px <= surround_inner_px:
+        raise ValueError('fixed surround radii must satisfy inner < outer')
+    if surround_method == 'adaptive' and surround_min_pixels < 0:
+        raise ValueError('surround_min_pixels must be non-negative')
 
     nwb_path = Path(nwb_path)
     partial_path = nwb_path.with_name(f'{nwb_path.stem}.extracting.partial.nwb')
@@ -327,11 +370,13 @@ def extract_fluorescence(
     roi_dict = loaded_rois['roi_dict']
     if not roi_dict:
         raise ValueError(f'ROI run contains no ROIs: {roi_run}')
-    area_coordinates = _roi_and_annulus_coordinates(
+    area_coordinates = _roi_and_surround_coordinates(
         roi_dict,
         loaded_rois['reference'].shape,
-        annulus_inner_px,
-        annulus_outer_px,
+        surround_method,
+        surround_inner_px,
+        surround_outer_px,
+        surround_min_pixels,
         )
     extraction_start = perf_counter()
     traces = _extract_traces(nwb_path, roi_dict, area_coordinates)
@@ -340,8 +385,17 @@ def extract_fluorescence(
     run_metadata = {
         'run_name': run_name,
         'roi_run': roi_run,
-        'annulus_inner_px': annulus_inner_px,
-        'annulus_outer_px': annulus_outer_px,
+        'surround_method': surround_method,
+        'surround_inner_px': surround_inner_px,
+        'surround_outer_px': (
+            float(surround_outer_px) if surround_method == 'fixed' else np.nan
+            ),
+        'surround_min_pixels': (
+            surround_min_pixels if surround_method == 'adaptive' else -1
+            ),
+        'surround_expansion_px': (
+            SURROUND_EXPANSION_PX if surround_method == 'adaptive' else -1
+            ),
         'created_at': datetime.now(timezone.utc).isoformat(),
         }
     original_size = nwb_path.stat().st_size

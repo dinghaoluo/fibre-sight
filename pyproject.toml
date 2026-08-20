@@ -22,6 +22,7 @@ dependencies = [
   'matplotlib>=3.7',
   'numpy>=1.24',
   'opencv-python>=4.8',
+  'pandas>=2.0',
   'pynwb>=4.1',
   'PyQt5>=5.15',
   'PyYAML>=6.0',

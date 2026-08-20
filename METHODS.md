@@ -114,3 +114,45 @@ The 256-pixel ungated baseline remained the released model. The comparison stopp
 ## scope
 
 The checkpoint was trained and tested within one dLight acquisition source. Percentile normalisation handles simple changes in signal scale. A new indicator, microscope point-spread function, field size, background texture, or labelling convention changes the spatial problem and remains outside that correction. Images from another domain need hand-labelled checks; repeated misses in the confidence map are evidence for retraining, whilst below-threshold responses can be explored with the prediction controls at the top of this file.
+
+## fluorescence extraction and dF/F
+
+Fluorescence extraction and dF/F calculation are separate immutable NWB stages. Extraction measures the mean, median, interquartile range and valid-pixel fraction for each ROI and its surrounding pixels in both channels. 'Surround' is used as the general name because 'annulus' describes one available geometry, whilst 'neuropil' names biological tissue which cannot be inferred from these pixels.
+
+Adaptive surrounds use four-connected pixel growth. The first five pixels around an ROI are excluded; every curated ROI pixel is then removed, and the outer boundary grows in five-pixel steps until more than 350 surrounding pixels are available or the image boundary has been reached. This reproduces the geometry used by Suite2p, with the five-pixel inner exclusion inherited from `lc-ca1-project`. Fixed mode instead selects pixels whose Euclidean distance from the ROI lies between the chosen inner and outer radii. Overlapping ROIs remain separate, but neither surround can include pixels assigned to any curated ROI.
+
+The derived stage selects either the raw mean (default) or median. For each channel it calculates independent ROI, surround and surround-corrected traces. Surround subtraction happens before baseline estimation:
+
+```text
+F_corrected = F_roi - coefficient * F_surround
+dFF = (F - F0) / F0
+```
+
+The default coefficient is `0.7`; it is fixed for the run and is never fitted separately for each ROI. `F0` is a centred, reflectively padded rolling 20th percentile over 300 seconds. NaNs are omitted from each percentile. Frames rejected by `processing/quality_control/registration_qc/analysis_valid` are stored as NaN, excluded from every baseline, and never interpolated in the canonical traces. No temporal median filter is applied.
+
+Signal and control channels receive the same independent calculation. Control correction defaults to `none`. The optional deterministic mode subtracts surround-corrected control dF/F from surround-corrected signal dF/F; it does not subtract raw green and red counts, fit a coefficient, or treat tdTomato as an isosbestic channel. The dLight, GRABNE and nLight papers establish different sensor kinetics and acquisition contexts; Hamid *et al.* analysed tdTomato separately, whilst Keevers and Jean-Richard-dit-Bressel show how regression choices can change fibre-photometry results and Zhang *et al.* show the remaining haemodynamic limits. FibreSight therefore stores the uncorrected channel traces alongside any optional control-corrected result.
+
+| parameter or decision | default | basis |
+| --- | ---: | --- |
+| surround geometry | adaptive | Suite2p-style four-connected growth [1] |
+| inner surround exclusion | `5 px` | `lc-ca1-project` Suite2p configuration; Suite2p's general default is smaller [1] |
+| adaptive target | more than `350` pixels | Suite2p minimum surrounding-pixel rule [1] |
+| adaptive growth step | `5 px` | Suite2p mask construction [1] |
+| raw ROI statistic | mean | selectable analysis choice; median is retained as an alternative |
+| surround coefficient | `0.7` | Suite2p and the existing `lc-ca1-project` axonal pipeline [1] |
+| baseline | centred rolling 20th percentile | existing `lc-ca1-project` axonal pipeline; this exact percentile is not presented as a cross-sensor standard |
+| baseline window | `300 s` | `9,000` frames at 30 Hz in `lc-ca1-project` |
+| temporal median filter | none | no canonical filter in the source axonal pipeline |
+| control correction | none | sensor and control-channel methods differ across preparations [2-8] |
+| optional control correction | signal dF/F minus control dF/F | fixed, reproducible alternative; no per-ROI regression [6, 7] |
+
+## fluorescence references
+
+1. Pachitariu M, Stringer C, Dipoppa M, *et al.* (2017). Suite2p: beyond 10,000 neurons with standard two-photon microscopy. *bioRxiv*. [doi:10.1101/061507](https://doi.org/10.1101/061507).
+2. Patriarchi T, Cho JR, Merten K, *et al.* (2018). Ultrafast neuronal imaging of dopamine dynamics with designed genetically encoded sensors. *Science* 360(6396):eaat4422. [doi:10.1126/science.aat4422](https://doi.org/10.1126/science.aat4422).
+3. Feng J, Zhang C, Lischinsky JE, *et al.* (2019). A genetically encoded fluorescent sensor for rapid and specific *in vivo* detection of norepinephrine. *Neuron* 102(4):745-761.e8. [doi:10.1016/j.neuron.2019.02.037](https://doi.org/10.1016/j.neuron.2019.02.037).
+4. Feng J, Dong H, Lischinsky JE, *et al.* (2024). Monitoring norepinephrine release *in vivo* using next-generation GRABNE sensors. *Neuron* 112(12):1930-1942.e6. [doi:10.1016/j.neuron.2024.03.001](https://doi.org/10.1016/j.neuron.2024.03.001).
+5. Kagiampaki Z, Weng Y, Zhang C, *et al.* (2023). Sensitive multicolor indicators for monitoring norepinephrine *in vivo*. *Nature Methods* 20(9):1426-1436. [doi:10.1038/s41592-023-01959-z](https://doi.org/10.1038/s41592-023-01959-z).
+6. Hamid AA, Frank MJ and Moore CI (2021). Wave-like dopamine dynamics as a mechanism for spatiotemporal credit assignment. *Cell* 184(10):2733-2749.e16. [doi:10.1016/j.cell.2021.03.046](https://doi.org/10.1016/j.cell.2021.03.046).
+7. Keevers N and Jean-Richard-dit-Bressel P (2025). Obtaining artifact-corrected signals in fiber photometry *via* isosbestic signals, robust regression, and dF/F calculations. *Neurophotonics* 12(2):025003. [doi:10.1117/1.NPh.12.2.025003](https://doi.org/10.1117/1.NPh.12.2.025003).
+8. Zhang Y, Yee P, Zacharias NM, *et al.* (2022). Spectral fiber photometry derives hemoglobin concentration changes for accurate measurement of fluorescent sensor activity. *Cell Reports Methods* 2(7):100243. [doi:10.1016/j.crmeth.2022.100243](https://doi.org/10.1016/j.crmeth.2022.100243).
