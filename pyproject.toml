@@ -40,6 +40,7 @@ fibre-sight = 'fibre_sight.gui:main'
 fibre-sight-build-manifest = 'fibre_sight.build_manifest:main'
 fibre-sight-evaluate = 'fibre_sight.evaluate:main'
 fibre-sight-list-runs = 'fibre_sight.list_runs:main'
+fibre-sight-plot-traces = 'fibre_sight.plot_traces:main'
 fibre-sight-predict = 'fibre_sight.predict_rois:main'
 fibre-sight-train = 'fibre_sight.train_unet:main'
 

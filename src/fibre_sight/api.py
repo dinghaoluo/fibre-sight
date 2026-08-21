@@ -28,18 +28,20 @@ from .fluorescence import (
     )
 from .list_runs import list_analysis_runs
 from .nwb_segmentation import (
-    CONTROL_REFERENCE_PATH,
     _append_roi_run_transactionally,
     _check_new_run,
     _checkpoint_sha256,
-    _read_control_reference,
+    _preferred_reference_path,
+    _read_reference,
     _segmentation_partial_path,
     list_roi_runs,
     load_roi_run,
     save_curated_rois,
     )
+from .plot_traces import plot_dff_traces
 from .postprocess import probability_to_roi_dict
 from .predict_rois import load_model, predict_probability
+from .preprocessing import add_segmentation_references, preprocess_recording
 
 
 #%% defaults
@@ -110,6 +112,7 @@ def segment_recording(
         min_size=None,
         tta=None,
         device='auto',
+        reference_path=None,
         ):
     nwb_path = Path(nwb_path)
     partial_path = _segmentation_partial_path(nwb_path)
@@ -119,7 +122,9 @@ def segment_recording(
     with NWBHDF5IO(nwb_path, 'r') as io:
         nwbfile = io.read()
         _check_new_run(nwbfile, run_name)
-        reference = _read_control_reference(nwbfile)
+        if reference_path is None:
+            reference_path = _preferred_reference_path(nwbfile)
+        reference = _read_reference(nwbfile, reference_path)
 
     inference_start = perf_counter()
     predictor = ROIPredictor(
@@ -136,7 +141,7 @@ def segment_recording(
         'run_name': run_name,
         'run_type': 'proposed',
         'source_run': '',
-        'reference_path': CONTROL_REFERENCE_PATH,
+        'reference_path': reference_path,
         'checkpoint_path': str(checkpoint_path),
         'checkpoint_sha256': _checkpoint_sha256(checkpoint_path),
         'threshold': float(predictor.threshold),

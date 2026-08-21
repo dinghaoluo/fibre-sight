@@ -32,6 +32,8 @@ The MATLAB helper files that PatchWarp calls directly are kept under `benchmarki
 
 The public synthetic benchmark needs the ten `.npy` images under `benchmarking/sources/`. A same-stem PNG sits beside each array for inspection; `benchmarking/sources/PUBLIC_SOURCES.md` records the Allen, DANDI, FibreSight, and Zhuoyang Ye provenance. TIFF recordings, generated movies, external checkouts, and Python environments stay under the ignored `workspace/` directory. The local real-recording checks below are optional diagnostics and do not enter the synthetic figures or summary tables.
 
+![Ten public source images used by the registration benchmark](examples/benchmark_source_gallery.png)
+
 The completed base results were produced with these local interpreters and tools:
 
 - FibreSight 0.1.3 under the Python interpreter that launches `benchmarking.registration_benchmark_suite`;
@@ -91,6 +93,8 @@ The two 512-pixel labmate sources also exercised the reference fallback in all e
 Pooled held-out confidence rejects 96.25% of raw tile errors above 1 px and 2.49% of clean tiles, passing the declared 95% detection and 5% clean-rejection limits. Every held-out non-rigid cell passes the 0.20 px median and 0.50 px p95 endpoint gates. Seven of nine deformation-free cells pass the 0.10 px median and 0.25 px local p95 gates; the other two p95 values are 0.256 and 0.251 px.
 
 On the common 7 by 7 grid, FibreSight's mean held-out p95 error is 0.802346 px across ten complete sources, compared with 1.990556 for Suite2p piecewise and 3.697241 for PyFlowReg. FibreSight's source-level advantage over Suite2p is 1.188210 px (95% t interval 0.145726 to 2.230694); the lower bound is now positive. The 40-case Wilcoxon p-value is 1.27e-10 before correction and 5.09e-10 after correction for four piecewise comparisons.
+
+![Held-out rigid and piecewise registration error across the public benchmark](examples/registration_benchmark_comparison.png)
 
 CaImAn piecewise and PatchWarp affine failed enough public cases that their comparisons use seven complete sources. FibreSight's advantage is 1.028027 px against CaImAn (95% interval 0.391416 to 1.664638; 28 paired cases) and 1.173012 px against PatchWarp (0.400907 to 1.945117; 33 paired cases). The PyFlowReg comparison uses all ten sources and gives an advantage of 2.894895 px (0.579315 to 5.210474). These intervals describe the cases each method could estimate; the separate failure counts remain part of the result.
 
@@ -309,8 +313,8 @@ The ignored focal directory, `workspace/registration-benchmark-focal/`, contains
 
 The NWB locations are fixed as follows:
 
-- `processing['quality_control']['registration_qc']` is a `DynamicTable` with one row per paired observation. Its columns are `dx_px`, `dy_px`, `displacement_magnitude_px`, `peak_ratio`, `tile_disagreement_px`, `canonical_gradient_ncc`, `local_gradient_ncc`, `high_frequency_fraction`, `spatial_correlation`, `temporal_difference`, `control_gain`, `control_offset`, `valid_pixel_fraction`, `search_boundary`, `detector_artifact`, `timing_fault`, `local_reference_fallback`, `threshold_calibration`, `recommended_state`, `reason_code`, and `analysis_valid`.
-- `processing['quality_control']['registration_thresholds']` is a one-row `DynamicTable` containing the five exact, recording-specific classification boundaries and their MAD factor.
+- `processing['quality_control']['registration_qc']` is a `DynamicTable` with one row per paired observation. Its columns are `time_s`, `dx_px`, `dy_px`, `displacement_magnitude_px`, `peak_ratio`, `tile_disagreement_px`, `canonical_gradient_ncc`, `local_gradient_ncc`, `high_frequency_fraction`, `spatial_correlation`, `temporal_difference`, `control_gain`, `control_offset`, `signal_gain`, `signal_offset`, `valid_pixel_fraction`, `search_boundary`, `detector_artifact`, `timing_fault`, `photometric_control_gain_change`, `photometric_control_offset_change`, `photometric_signal_gain_change`, `photometric_signal_offset_change`, `photometric_artifact`, `local_reference_fallback`, `threshold_calibration`, `recommended_state`, `reason_code`, and `analysis_valid`.
+- `processing['quality_control']['registration_thresholds']` is a one-row `DynamicTable` containing nine recording-specific classification boundaries plus `focal_mads`, the MAD distance used for the four focal-loss boundaries.
 - `processing['quality_control']['axial_similarity']` is a `TimeSeries` with unit `dimensionless`; each value is the centred 60 s rolling mean of canonical gradient-NCC (1,800 observations at uninterrupted 30 Hz) and is a similarity trace, not a calibrated z displacement.
 - `nwbfile.intervals['focal_loss']` is a `TimeIntervals` table with `start_time`, `stop_time`, `duration_s`, `duration_class`, `reason_code`, and `n_frames`. Focal candidates separated by at most 0.10 s are merged, then labelled `brief`, `transient`, or `sustained` using the 0.25 s and 0.50 s boundaries.
 
@@ -318,9 +322,12 @@ The NWB locations are fixed as follows:
 
 `timing_fault` marks an observation whose preceding timestamp interval differs from `1 / sampling_frequency_hz` by more than half a frame period. A timing fault makes an otherwise accepted observation `ambiguous`; the first observation has no preceding interval and remains unflagged. Local references and axial-similarity windows use elapsed time when timestamps are available.
 
+`photometric_artifact` marks an abrupt frame-to-frame change in fitted gain or offset in either channel, but only where the frame and its neighbours retain credible motion estimates and spatial correspondence. Each boundary is the calibration median plus the larger of a fixed minimum rise or six scaled MADs. Both edges of a one-frame excursion can therefore be rejected; registration loss is handled by the earlier motion and focal rules instead.
+
 The figures and review movies kept under `examples/` are:
 
 - `registration_benchmark_accuracy.png`, including the paired rigid advantages;
+- `registration_benchmark_comparison.png`, placing the public rigid and piecewise error comparisons side by side;
 - `registration_benchmark_deformation.png`, separating the rigid and piecewise local-deformation comparison;
 - `registration_benchmark_references.png`, including reference convergence;
 - `registration_benchmark_resources.png`;

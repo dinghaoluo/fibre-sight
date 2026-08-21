@@ -276,7 +276,7 @@ def _add_fluorescence_run(nwbfile, run_metadata, traces):
                 trace_values,
                 chunks=(
                     min(1024, len(trace_values)),
-                    max(1, trace_values.shape[1]),
+                    trace_values.shape[1],
                     ),
                 compression='gzip',
                 compression_opts=1,

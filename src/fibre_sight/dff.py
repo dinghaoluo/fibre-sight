@@ -61,7 +61,14 @@ def _dff_from_raw(raw_fluorescence, analysis_valid, window_frames, percentile):
     fluorescence = np.asarray(raw_fluorescence, dtype=np.float32).copy()
     fluorescence[~analysis_valid] = np.nan
     baseline = _rolling_percentile(fluorescence, window_frames, percentile)
-    return ((fluorescence - baseline) / baseline).astype(np.float32)
+    dff = np.full(fluorescence.shape, np.nan, dtype=np.float32)
+    valid = (
+        np.isfinite(fluorescence)
+        & np.isfinite(baseline)
+        & (baseline > 0)
+        )
+    np.divide(fluorescence - baseline, baseline, out=dff, where=valid)
+    return dff
 
 
 def _calculate_dff_traces(
@@ -165,7 +172,7 @@ def _dff_module(nwbfile):
         'surround_correction': 'method used to subtract surrounding fluorescence',
         'surround_coefficient': 'fixed raw-space surround subtraction coefficient',
         'control_correction': 'none or signal dF/F minus control dF/F',
-        'quality_control_method': 'handling of frames rejected by registration QC',
+        'quality_control_method': 'handling of frames rejected by preprocessing QC',
         'created_at': 'UTC creation time',
         }
     for name, description in columns.items():
@@ -195,7 +202,7 @@ def _add_dff_run(nwbfile, run_metadata, traces):
                 trace_values,
                 chunks=(
                     min(1024, len(trace_values)),
-                    max(1, trace_values.shape[1]),
+                    trace_values.shape[1],
                     ),
                 compression='gzip',
                 compression_opts=1,

@@ -1934,7 +1934,7 @@ def make_rigid_comparison_movie(
     with np.load(root / 'truth.npz') as saved:
         truth = {name: saved[name] for name in saved.files}
 
-    names = ['suite2p_rigid', 'caiman_rigid', 'fibresight_rigid']
+    names = ['fibresight_rigid', 'suite2p_rigid', 'caiman_rigid']
     results = []
     calibration = (np.arange(len(movie)) < len(movie) // 2) & truth['estimable']
     known = np.column_stack([truth['shift_y'], truth['shift_x']])
@@ -1961,7 +1961,7 @@ def make_rigid_comparison_movie(
     stream.height = shown_height + 2 * margin + title_height
     stream.pix_fmt = 'yuv420p'
 
-    labels = ['raw', 'Suite2p rigid', 'CaImAn rigid', 'FibreSight rigid']
+    labels = ['raw', 'FibreSight rigid', 'Suite2p rigid', 'CaImAn rigid']
     sections = [('rigid benchmark', 0, min(900, len(movie)))]
     for section, start, stop in sections:
         for frame_i in range(start, stop):

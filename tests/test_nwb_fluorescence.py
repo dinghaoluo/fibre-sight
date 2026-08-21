@@ -35,6 +35,7 @@ from fibre_sight.api import (
     load_dff_run,
     load_fluorescence_run,
     )
+from fibre_sight.dff import _dff_from_raw
 from fibre_sight.fluorescence import _roi_and_surround_coordinates
 from fibre_sight.list_runs import (
     TABLE_COLUMNS,
@@ -42,6 +43,7 @@ from fibre_sight.list_runs import (
     main as list_runs_main,
     )
 from fibre_sight.nwb_segmentation import CONTROL_REFERENCE_PATH, _add_roi_run
+from fibre_sight.plot_traces import plot_dff_traces
 
 
 #%% fixture
@@ -364,6 +366,23 @@ class NWBFluorescenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'already exists'):
             calculate_dff(self.path, 'derived', 'extraction')
 
+    def test_dff_is_nan_for_nonpositive_baselines(self):
+        raw_fluorescence = np.asarray([[0.0, -2.0, 4.0]], dtype=np.float32)
+
+        with np.errstate(all='raise'):
+            dff = _dff_from_raw(
+                raw_fluorescence,
+                np.asarray([True]),
+                window_frames=1,
+                percentile=20,
+                )
+
+        np.testing.assert_allclose(
+            dff,
+            [[np.nan, np.nan, 0.0]],
+            equal_nan=True,
+            )
+
     def test_analysis_runs_are_composed_and_listed(self):
         extract_fluorescence(self.path, 'extraction', ROI_RUN)
         calculate_dff(
@@ -401,6 +420,28 @@ class NWBFluorescenceTests(unittest.TestCase):
         lines = output.getvalue().splitlines()
         self.assertEqual(lines[0], '\t'.join(TABLE_COLUMNS))
         self.assertIn('dff\tderived', lines[1])
+
+    def test_dff_trace_qa_plot_records_rejected_frames(self):
+        extract_fluorescence(self.path, 'extraction', ROI_RUN)
+        calculate_dff(
+            self.path,
+            'derived',
+            'extraction',
+            baseline_window_s=0.5,
+            )
+        output_path = self.root / 'trace_qa.png'
+        result = plot_dff_traces(
+            self.path,
+            'derived',
+            output_path,
+            roi_ids=[17],
+            )
+
+        self.assertTrue(output_path.exists())
+        self.assertEqual(result['roi_ids'], [17])
+        self.assertEqual(result['frame_count'], 3)
+        self.assertEqual(result['rejected_frame_count'], 1)
+        self.assertEqual(result['invalid_interval_count'], 1)
 
     @patch(
         'fibre_sight.fluorescence.validate',

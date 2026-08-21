@@ -26,10 +26,20 @@ from support import add_source_to_path
 add_source_to_path()
 
 from fibre_sight.api import load_roi_run, save_curated_rois, segment_recording
+from fibre_sight.nwb_segmentation import (
+    CONTROL_REFERENCE_PATH,
+    PROPOSAL_REFERENCE_PATH,
+    SEGMENTATION_REFERENCE_PATH,
+    )
 
 
 #%% fixtures
-def _preprocessed_nwb(path, reference):
+def _preprocessed_nwb(
+        path,
+        reference,
+        proposal_reference=None,
+        segmentation_reference=None,
+        ):
     height, width = reference.shape
     nwbfile = NWBFile(
         session_description='segmentation adapter test',
@@ -59,14 +69,66 @@ def _preprocessed_nwb(path, reference):
             num_samples=np.uint64(3),
             rate=30.0,
             ))
-    module.add(Images(
-        name='registration_references',
-        images=[GrayscaleImage(
+    references = [GrayscaleImage(
             name='control_reference',
             data=np.asarray(reference, dtype=np.float32).T,
             description='test reference',
-            )],
+            )]
+    if proposal_reference is not None:
+        references.append(GrayscaleImage(
+            name='proposal_reference',
+            data=np.asarray(proposal_reference, dtype=np.float32).T,
+            description='test proposal reference',
+            ))
+    module.add(Images(
+        name='registration_references',
+        images=references,
         ))
+    if segmentation_reference is not None:
+        module.add(Images(
+            name='segmentation_references',
+            images=[
+                GrayscaleImage(
+                    name='mean_control_reference',
+                    data=np.asarray(reference + 50, dtype=np.float32).T,
+                    description='test full-session mean',
+                    ),
+                GrayscaleImage(
+                    name='segmentation_reference',
+                    data=np.asarray(segmentation_reference, dtype=np.uint8).T,
+                    description='test segmentation reference',
+                    ),
+                ],
+            ))
+        reference_metadata = DynamicTable(
+            name='segmentation_reference_metadata',
+            description='test segmentation reference metadata',
+            )
+        columns = {
+            'reference_path': 'inference reference path',
+            'source_reference_path': 'source reference path',
+            'frame_count': 'averaged frame count',
+            'low_percentile': 'lower percentile',
+            'high_percentile': 'upper percentile',
+            'low_value': 'lower intensity',
+            'high_value': 'upper intensity',
+            'output_dtype': 'stored dtype',
+            }
+        for name, description in columns.items():
+            reference_metadata.add_column(name=name, description=description)
+        reference_metadata.add_row(
+            reference_path=SEGMENTATION_REFERENCE_PATH,
+            source_reference_path=(
+                'processing/preprocessing/segmentation_references/'
+                'mean_control_reference'),
+            frame_count=2400,
+            low_percentile=1.0,
+            high_percentile=97.0,
+            low_value=12.0,
+            high_value=108.0,
+            output_dtype='uint8',
+            )
+        module.add(reference_metadata)
     metadata = DynamicTable(
         name='recording_metadata', description='test metadata')
     metadata.add_column(name='control_label', description='control label')
@@ -128,8 +190,85 @@ class NWBSegmentationTests(unittest.TestCase):
         np.testing.assert_array_equal(loaded['probability'], self.reference / 23)
         np.testing.assert_array_equal(loaded['roi_dict'][4]['xpix'], [1, 5, 5])
         np.testing.assert_array_equal(loaded['roi_dict'][4]['ypix'], [0, 2, 3])
+        self.assertEqual(
+            loaded['provenance']['reference_path'], CONTROL_REFERENCE_PATH)
         self.assertEqual(result['roi_count'], 1)
         self.assertEqual(result['validation_errors'], [])
+
+    @patch('fibre_sight.api.ROIPredictor', _Predictor)
+    def test_legacy_proposal_reference_is_preferred_and_recorded(self):
+        proposal_reference = self.reference + 100
+        path = self.root / 'proposal_reference.nwb'
+        _preprocessed_nwb(path, self.reference, proposal_reference)
+
+        segment_recording(path, 'proposal')
+        loaded = load_roi_run(path, 'proposal')
+
+        np.testing.assert_array_equal(
+            _Predictor.seen_reference, proposal_reference)
+        np.testing.assert_array_equal(loaded['reference'], proposal_reference)
+        self.assertEqual(
+            loaded['provenance']['reference_path'], PROPOSAL_REFERENCE_PATH)
+
+    @patch('fibre_sight.api.ROIPredictor', _Predictor)
+    def test_segmentation_reference_is_preferred_with_percentile_provenance(self):
+        proposal_reference = self.reference + 100
+        segmentation_reference = self.reference + 200
+        path = self.root / 'segmentation_reference.nwb'
+        _preprocessed_nwb(
+            path,
+            self.reference,
+            proposal_reference,
+            segmentation_reference,
+            )
+
+        segment_recording(path, 'proposal')
+        loaded = load_roi_run(path, 'proposal')
+
+        np.testing.assert_array_equal(
+            _Predictor.seen_reference, segmentation_reference)
+        np.testing.assert_array_equal(
+            loaded['reference'], segmentation_reference)
+        self.assertEqual(
+            loaded['provenance']['reference_path'], SEGMENTATION_REFERENCE_PATH)
+        self.assertEqual(loaded['reference_provenance']['frame_count'], 2400)
+        self.assertEqual(loaded['reference_provenance']['low_percentile'], 1)
+        self.assertEqual(loaded['reference_provenance']['high_percentile'], 97)
+        self.assertEqual(
+            loaded['reference_provenance']['output_dtype'], 'uint8')
+
+    @patch('fibre_sight.api.ROIPredictor', _Predictor)
+    def test_reference_path_can_select_the_canonical_reference(self):
+        proposal_reference = self.reference + 100
+        path = self.root / 'explicit_reference.nwb'
+        _preprocessed_nwb(path, self.reference, proposal_reference)
+
+        segment_recording(
+            path,
+            'proposal',
+            reference_path=CONTROL_REFERENCE_PATH,
+            )
+        loaded = load_roi_run(path, 'proposal')
+
+        np.testing.assert_array_equal(_Predictor.seen_reference, self.reference)
+        self.assertEqual(
+            loaded['provenance']['reference_path'], CONTROL_REFERENCE_PATH)
+
+    @patch('fibre_sight.api.ROIPredictor', _Predictor)
+    def test_reference_path_must_name_a_preprocessing_image(self):
+        invalid_paths = (
+            'registration_references/control_reference',
+            'processing/preprocessing/recording_metadata/control_label',
+            )
+        for reference_path in invalid_paths:
+            with self.subTest(reference_path=reference_path):
+                with self.assertRaisesRegex(
+                        ValueError, 'processing/preprocessing'):
+                    segment_recording(
+                        self.path,
+                        'proposal',
+                        reference_path=reference_path,
+                        )
 
     @patch('fibre_sight.api.ROIPredictor', _Predictor)
     def test_proposed_and_curated_runs_are_immutable(self):
@@ -150,6 +289,10 @@ class NWBSegmentationTests(unittest.TestCase):
         self.assertEqual(proposal['provenance']['run_type'], 'proposed')
         self.assertEqual(loaded['provenance']['run_type'], 'curated')
         self.assertEqual(loaded['provenance']['source_run'], 'proposal')
+        self.assertEqual(
+            loaded['provenance']['reference_path'],
+            proposal['provenance']['reference_path'],
+            )
         self.assertIsNone(loaded['probability'])
         self.assertIn(2, loaded['roi_dict'][10]['xpix'])
         self.assertIn(2, loaded['roi_dict'][11]['xpix'])

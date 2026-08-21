@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 from time import perf_counter
 
@@ -39,6 +40,7 @@ import tifffile
 #%% TIFF order
 _NUMBER = re.compile(r'(\d+)')
 _SCANIMAGE_EPOCH = re.compile(r'^epoch\s*=\s*\[([^]]+)]', re.MULTILINE)
+SEGMENTATION_REFERENCE_PERCENTILES = (1, 97)
 
 
 def _sort_tiffs(paths):
@@ -1447,6 +1449,15 @@ def _low_threshold(values, baseline, minimum_drop, n_mad):
     return centre - max(minimum_drop, n_mad * mad)
 
 
+def _high_threshold(values, baseline, minimum_rise, n_mad):
+    values = values[baseline & np.isfinite(values)]
+    if not len(values):
+        return np.nan
+    centre = np.median(values)
+    mad = 1.4826 * np.median(np.abs(values - centre))
+    return centre + max(minimum_rise, n_mad * mad)
+
+
 def _quality_thresholds(fields, baseline, focal_mads):
     thresholds = {
         'canonical_focal': _low_threshold(
@@ -1585,10 +1596,17 @@ def _new_quality_fields(n_frames, timestamps, sampling_frequency_hz):
         'temporal_difference': np.full(n_frames, np.nan, dtype=np.float32),
         'control_gain': np.empty(n_frames, dtype=np.float32),
         'control_offset': np.empty(n_frames, dtype=np.float32),
+        'signal_gain': np.full(n_frames, np.nan, dtype=np.float32),
+        'signal_offset': np.full(n_frames, np.nan, dtype=np.float32),
         'valid_pixel_fraction': np.empty(n_frames, dtype=np.float32),
         'search_boundary': np.empty(n_frames, dtype=bool),
         'detector_artifact': np.empty(n_frames, dtype=bool),
         'timing_fault': timing_fault,
+        'photometric_control_gain_change': np.full(n_frames, np.nan, dtype=np.float32),
+        'photometric_control_offset_change': np.full(n_frames, np.nan, dtype=np.float32),
+        'photometric_signal_gain_change': np.full(n_frames, np.nan, dtype=np.float32),
+        'photometric_signal_offset_change': np.full(n_frames, np.nan, dtype=np.float32),
+        'photometric_artifact': np.empty(n_frames, dtype=bool),
         'local_reference_fallback': np.empty(n_frames, dtype=bool),
         'recommended_state': np.empty(n_frames, dtype=object),
         'reason_code': np.empty(n_frames, dtype=object),
@@ -1607,6 +1625,8 @@ def _measure_registered_quality(
         reference_gradient,
         local_references,
         previous_registered,
+        registered_signal=None,
+        signal_reference=None,
         ):
     local_i = local_references['reference_index'][frame_i]
     gain, offset = _gain_offset(reference, registered_control)
@@ -1637,6 +1657,11 @@ def _measure_registered_quality(
             previous_registered, registered_control)
     fields['control_gain'][frame_i] = gain
     fields['control_offset'][frame_i] = offset
+    if registered_signal is not None and signal_reference is not None:
+        signal_gain, signal_offset = _gain_offset(
+            signal_reference, registered_signal)
+        fields['signal_gain'][frame_i] = signal_gain
+        fields['signal_offset'][frame_i] = signal_offset
     fields['valid_pixel_fraction'][frame_i] = valid.mean()
     fields['search_boundary'][frame_i] = estimate['search_boundary']
     fields['detector_artifact'][frame_i] = (
@@ -1687,6 +1712,44 @@ def _finish_quality(
         raise ValueError('no usable frames for QC calibration')
     focal_candidates = _focal_candidates(fields, thresholds)
     fields['threshold_calibration'] = baseline
+    change_baseline = (
+        baseline
+        & np.r_[False, baseline[:-1]]
+        & np.r_[baseline[1:], False]
+        )
+    photometric_baseline = (
+        change_baseline
+        & (fields['canonical_gradient_ncc'] >= thresholds['canonical_ambiguous'])
+        & (fields['local_gradient_ncc'] >= thresholds['local_focal'])
+        )
+    for field_name, threshold_name, minimum_rise in (
+            ('control_gain', 'photometric_control_gain_jump', 0.15),
+            ('control_offset', 'photometric_control_offset_jump', 0.4),
+            ('signal_gain', 'photometric_signal_gain_jump', 0.15),
+            ('signal_offset', 'photometric_signal_offset_jump', 0.4),
+            ):
+        changes = np.full(n_frames, np.nan, dtype=np.float32)
+        changes[1:] = np.abs(np.diff(fields[field_name]))
+        fields[f'photometric_{field_name}_change'] = changes
+        thresholds[threshold_name] = _high_threshold(
+            changes,
+            change_baseline,
+            minimum_rise,
+            6,
+            )
+    fields['photometric_artifact'] = (
+        photometric_baseline
+        & (
+            (fields['photometric_control_gain_change']
+             > thresholds['photometric_control_gain_jump'])
+            | (fields['photometric_control_offset_change']
+               > thresholds['photometric_control_offset_jump'])
+            | (fields['photometric_signal_gain_change']
+               > thresholds['photometric_signal_gain_jump'])
+            | (fields['photometric_signal_offset_change']
+               > thresholds['photometric_signal_offset_jump'])
+            )
+        )
 
     for frame_i, estimate in enumerate(estimates):
         low_canonical = (
@@ -1711,6 +1774,9 @@ def _finish_quality(
                 'search_boundary' if fields['search_boundary'][frame_i]
                 else 'outside_search_range')
             state = 'out_of_range'
+        elif fields['photometric_artifact'][frame_i]:
+            reasons.append('photometric_artifact')
+            state = 'ambiguous'
         elif focal_candidates[frame_i]:
             # 17 August 2026: four measurements retain focal_loss when lateral confidence fails
             reasons.extend(motion_reasons)
@@ -1901,7 +1967,7 @@ def focal_loss_episodes(
 def add_quality_control_to_nwb(nwbfile, quality):
     module = nwbfile.create_processing_module(
         name='quality_control',
-        description='per-frame registration and focal-loss measurements',
+        description='per-frame registration, photometric and focal-loss measurements',
         )
     table = DynamicTable(
         name='registration_qc',
@@ -1925,10 +1991,17 @@ def add_quality_control_to_nwb(nwbfile, quality):
         'temporal_difference': 'MAD-scaled RMS difference from the previous frame',
         'control_gain': 'control-frame gain fitted against the canonical reference',
         'control_offset': 'control-frame offset fitted against the canonical reference (counts)',
+        'signal_gain': 'signal-frame gain fitted against the calibration reference',
+        'signal_offset': 'signal-frame offset fitted against the calibration reference (counts)',
         'valid_pixel_fraction': 'fraction remaining after the non-wrapping warp',
         'search_boundary': 'whether the estimate reached the allowed shift boundary',
         'detector_artifact': 'blank or more than 1% of pixels at integer dtype limits',
         'timing_fault': 'timestamp interval differs from the stated period by more than half a frame',
+        'photometric_control_gain_change': 'absolute frame-to-frame change in control-frame gain',
+        'photometric_control_offset_change': 'absolute frame-to-frame change in control-frame offset',
+        'photometric_signal_gain_change': 'absolute frame-to-frame change in signal-frame gain',
+        'photometric_signal_offset_change': 'absolute frame-to-frame change in signal-frame offset',
+        'photometric_artifact': 'abrupt photometric change detected between frames retaining spatial correspondence',
         'local_reference_fallback': 'local 60 s block used the canonical reference',
         'threshold_calibration': 'frame contributed to the recording-specific QC thresholds',
         'recommended_state': 'accepted, ambiguous, focal_loss or out_of_range',
@@ -1945,6 +2018,10 @@ def add_quality_control_to_nwb(nwbfile, quality):
         'local_focal': 'focal-loss boundary for local_gradient_ncc',
         'high_frequency_focal': 'focal-loss boundary for high_frequency_fraction',
         'control_gain_focal': 'focal-loss boundary for control_gain',
+        'photometric_control_gain_jump': 'abrupt-change boundary for control_gain',
+        'photometric_control_offset_jump': 'abrupt-change boundary for control_offset',
+        'photometric_signal_gain_jump': 'abrupt-change boundary for signal_gain',
+        'photometric_signal_offset_jump': 'abrupt-change boundary for signal_offset',
         'canonical_ambiguous': 'ambiguous boundary for canonical_gradient_ncc',
         'focal_mads': 'MAD distance used for the four focal-loss boundaries',
         }
@@ -2337,6 +2414,19 @@ def _registration_calibration(
         )
     signal_to_control_offset = (
         channel_offset['shift_y'], channel_offset['shift_x'])
+    calibration_accepted = np.asarray([
+        estimate['peak_ratio'] >= 1.1 and not estimate['out_of_range']
+        for estimate in estimates], dtype=bool)
+    signal_shifts = [
+        _channel_corrections(
+            estimate['shift_y'],
+            estimate['shift_x'],
+            signal_to_control_offset,
+            registration_channel,
+            )[0]
+        for estimate in estimates]
+    signal_reference = _registered_mean(
+        signal_frames, signal_shifts, calibration_accepted, recording['shape'])
 
     if registration_model == 'rigid':
         return {
@@ -2344,6 +2434,7 @@ def _registration_calibration(
             'requested_model': registration_model,
             'calibration_indices': calibration_indices,
             'channel_offset': channel_offset,
+            'signal_reference': signal_reference,
             'model_comparison': None,
             'tile_reference': None,
             }
@@ -2389,6 +2480,7 @@ def _registration_calibration(
         'requested_model': registration_model,
         'calibration_indices': calibration_indices,
         'channel_offset': channel_offset,
+        'signal_reference': signal_reference,
         'model_comparison': comparison,
         'tile_reference': tile_reference,
         }
@@ -2689,6 +2781,213 @@ def _int16_registered(frame):
     return stored
 
 
+def _calculate_segmentation_references(
+        nwb_path,
+        percentiles=SEGMENTATION_REFERENCE_PERCENTILES,
+        ):
+    low_percentile, high_percentile = map(float, percentiles)
+    if not 0 <= low_percentile < high_percentile <= 100:
+        raise ValueError('segmentation percentiles must satisfy 0 <= low < high <= 100')
+
+    with h5py.File(nwb_path, 'r') as file:
+        reference_path = 'processing/preprocessing/segmentation_references'
+        if reference_path in file:
+            raise ValueError('segmentation reference already exists')
+
+        analysis_valid = np.asarray(
+            file['processing/quality_control/registration_qc/analysis_valid'],
+            dtype=bool,
+            )
+        frame_indices = np.flatnonzero(analysis_valid)
+        if not len(frame_indices):
+            raise ValueError('no analysis-valid frames remain for segmentation reference')
+
+        movie = file['processing/preprocessing/registered_control/data']
+        bounds = file['processing/preprocessing/registered_valid_bounds']
+        shape = (movie.shape[2], movie.shape[1])
+        total = np.zeros(shape, dtype=np.float64)
+        count = np.zeros(shape, dtype=np.uint32)
+        for frame_i in frame_indices:
+            y0 = int(bounds['control_y0'][frame_i])
+            y1 = int(bounds['control_y1'][frame_i])
+            x0 = int(bounds['control_x0'][frame_i])
+            x1 = int(bounds['control_x1'][frame_i])
+            frame = np.asarray(movie[frame_i]).T
+            total[y0:y1, x0:x1] += frame[y0:y1, x0:x1]
+            count[y0:y1, x0:x1] += 1
+
+    mean_image = np.divide(
+        total,
+        count,
+        out=np.zeros_like(total),
+        where=count > 0,
+        ).astype(np.float32)
+    low_value, high_value = np.percentile(
+        mean_image, [low_percentile, high_percentile])
+    if high_value == low_value:
+        raise ValueError('segmentation reference percentile range is zero')
+    segmentation_image = np.clip(
+        (mean_image - low_value) / (high_value - low_value),
+        0,
+        1,
+        )
+    segmentation_image = (segmentation_image * 255).astype(np.uint8)
+    return {
+        'mean_image': mean_image,
+        'segmentation_image': segmentation_image,
+        'frame_indices': frame_indices.astype(np.int64),
+        'low_percentile': low_percentile,
+        'high_percentile': high_percentile,
+        'low_value': float(low_value),
+        'high_value': float(high_value),
+        }
+
+
+def _write_segmentation_references(nwb_path, references):
+    with NWBHDF5IO(nwb_path, 'a') as io:
+        nwbfile = io.read()
+        module = nwbfile.processing['preprocessing']
+        if 'segmentation_references' in module.data_interfaces:
+            raise ValueError('segmentation reference already exists')
+        module.add(Images(
+            name='segmentation_references',
+            description=(
+                'registered control-channel references used to construct and '
+                'run ROI segmentation'),
+            images=[
+                GrayscaleImage(
+                    name='mean_control_reference',
+                    data=references['mean_image'].T,
+                    description=(
+                        f'mean of all {len(references["frame_indices"]):,} '
+                        'analysis-valid registered control frames'),
+                    ),
+                GrayscaleImage(
+                    name='segmentation_reference',
+                    data=references['segmentation_image'].T,
+                    description=(
+                        '8-bit percentile-clipped mean control reference used '
+                        'for ROI inference'),
+                    ),
+                ],
+            ))
+        frames = DynamicTable(
+            name='segmentation_reference_frames',
+            description='registered frames averaged into the mean control reference',
+            id=np.arange(len(references['frame_indices'])),
+            )
+        frames.add_column(
+            name='frame_index',
+            description='zero-based paired-frame index',
+            data=references['frame_indices'],
+            )
+        module.add(frames)
+        metadata = DynamicTable(
+            name='segmentation_reference_metadata',
+            description='provenance for stored segmentation inference references',
+            )
+        columns = {
+            'reference_path': 'NWB path of the inference reference',
+            'source_reference_path': 'NWB path of the raw mean used as its source',
+            'frame_count': 'number of analysis-valid registered frames averaged',
+            'low_percentile': 'lower percentile used for clipping and rescaling',
+            'high_percentile': 'upper percentile used for clipping and rescaling',
+            'low_value': 'source-image intensity at the lower percentile',
+            'high_value': 'source-image intensity at the upper percentile',
+            'output_dtype': 'stored inference-reference dtype',
+            }
+        for name, description in columns.items():
+            metadata.add_column(name=name, description=description)
+        metadata.add_row(
+            reference_path=(
+                'processing/preprocessing/segmentation_references/'
+                'segmentation_reference'),
+            source_reference_path=(
+                'processing/preprocessing/segmentation_references/'
+                'mean_control_reference'),
+            frame_count=len(references['frame_indices']),
+            low_percentile=references['low_percentile'],
+            high_percentile=references['high_percentile'],
+            low_value=references['low_value'],
+            high_value=references['high_value'],
+            output_dtype='uint8',
+            )
+        module.add(metadata)
+        io.write(nwbfile)
+
+
+def _verify_segmentation_references(nwb_path, references):
+    with NWBHDF5IO(nwb_path, 'r') as io:
+        module = io.read().processing['preprocessing']
+        stored_mean = np.asarray(
+            module['segmentation_references']['mean_control_reference'].data).T
+        stored_segmentation = np.asarray(
+            module['segmentation_references']['segmentation_reference'].data).T
+        frame_indices = np.asarray(
+            module['segmentation_reference_frames']['frame_index'], dtype=np.int64)
+        metadata = module['segmentation_reference_metadata']
+        stored_metadata = {
+            name: metadata[name][0]
+            for name in metadata.colnames
+            }
+    np.testing.assert_array_equal(stored_mean, references['mean_image'])
+    np.testing.assert_array_equal(
+        stored_segmentation, references['segmentation_image'])
+    np.testing.assert_array_equal(frame_indices, references['frame_indices'])
+    if int(stored_metadata['frame_count']) != len(references['frame_indices']):
+        raise AssertionError('stored segmentation reference frame count changed')
+    for name in ('low_percentile', 'high_percentile', 'low_value', 'high_value'):
+        if float(stored_metadata[name]) != references[name]:
+            raise AssertionError(f'stored segmentation reference {name} changed')
+
+
+def _append_segmentation_references(
+        nwb_path,
+        percentiles=SEGMENTATION_REFERENCE_PERCENTILES,
+        ):
+    references = _calculate_segmentation_references(nwb_path, percentiles)
+    _write_segmentation_references(nwb_path, references)
+    _verify_segmentation_references(nwb_path, references)
+    return references
+
+
+def add_segmentation_references(
+        nwb_path,
+        percentiles=SEGMENTATION_REFERENCE_PERCENTILES,
+        ):
+    nwb_path = Path(nwb_path)
+    partial_path = nwb_path.with_name(
+        f'{nwb_path.stem}.segmentation-reference.partial.nwb')
+    if partial_path.exists():
+        raise FileExistsError(f'partial output already exists: {partial_path}')
+
+    references = _calculate_segmentation_references(nwb_path, percentiles)
+    original_size = nwb_path.stat().st_size
+    copy_start = perf_counter()
+    shutil.copyfile(nwb_path, partial_path)
+    copy_time_s = perf_counter() - copy_start
+    _write_segmentation_references(partial_path, references)
+
+    validation_errors = [str(error) for error in validate(path=partial_path)]
+    if validation_errors:
+        raise AssertionError(f'NWB validation failed: {validation_errors}')
+    _verify_segmentation_references(partial_path, references)
+    with partial_path.open('rb') as file:
+        os.fsync(file.fileno())
+    file_size_bytes = partial_path.stat().st_size
+    os.replace(partial_path, nwb_path)
+    return {
+        'output_path': nwb_path,
+        'frame_count': len(references['frame_indices']),
+        'percentiles': (
+            references['low_percentile'], references['high_percentile']),
+        'copy_time_s': copy_time_s,
+        'file_size_bytes': file_size_bytes,
+        'file_size_increase_bytes': file_size_bytes - original_size,
+        'validation_errors': validation_errors,
+        }
+
+
 def _add_full_registration(
         partial_path,
         recording,
@@ -2842,6 +3141,7 @@ def preprocess_recording(
         registration_channel='control',
         pixel_size_um=None,
         session_start_time=None,
+        segmentation_reference_percentiles=SEGMENTATION_REFERENCE_PERCENTILES,
         ):
     output_path = Path(output_path)
     partial_path = output_path.with_suffix('.partial.nwb')
@@ -3076,6 +3376,8 @@ def preprocess_recording(
                             reference_gradient,
                             local_references,
                             previous_for_quality,
+                            registered_signal=registered['signal'],
+                            signal_reference=calibration['signal_reference'],
                             ))
                         previous_for_quality = registered['control']
                         if result_i in spot_indices:
@@ -3106,6 +3408,10 @@ def preprocess_recording(
             control_bounds,
             piecewise_results,
             )
+        segmentation_references = _append_segmentation_references(
+            partial_path,
+            segmentation_reference_percentiles,
+            )
 
     validation_errors = [str(error) for error in validate(path=partial_path)]
     if validation_errors:
@@ -3125,4 +3431,10 @@ def preprocess_recording(
         'session_start_time': session_start_time,
         'session_time_source': session_time_source,
         'reference_fallback': bool(control_reference_info['reference_fallback']),
+        'segmentation_reference_frames': len(
+            segmentation_references['frame_indices']),
+        'segmentation_reference_percentiles': (
+            segmentation_references['low_percentile'],
+            segmentation_references['high_percentile'],
+            ),
         }

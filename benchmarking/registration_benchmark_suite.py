@@ -1257,8 +1257,8 @@ def summarise_piecewise_suite(
             color=METHOD_COLOURS[method], edgecolor='white', zorder=3)
     axes[0].set_xticks(
         range(len(methods)),
-        [_method_tick_label(method) for method in methods],
-        rotation=25, ha='center', rotation_mode='anchor')
+        [_method_tick_label(method) for method in methods])
+    axes[0].tick_params(axis='x', pad=7)
     axes[0].set_ylabel('held-out p95 error (px)')
     axes[0].set_title('piecewise registration')
     # 18 August 2026: keep the useful range visible and mark clipped cases at 10 px
@@ -1339,7 +1339,7 @@ def summarise_piecewise_suite(
     axes[1].set_xticks(
         source_centres,
         [source_abbreviations[source] for source in sources],
-        rotation=35, ha='center', rotation_mode='anchor')
+        rotation=35, ha='right', va='top', rotation_mode='anchor')
     for source_i in range(1, len(sources)):
         axes[1].axvline(4 * source_i - 0.5, color='0.90', linewidth=0.7)
     axes[1].set_xlabel('source image (four recipes per source)')
@@ -1351,6 +1351,9 @@ def summarise_piecewise_suite(
         figure_root / 'registration_benchmark_piecewise.png',
         dpi=180, bbox_inches='tight')
     plt.close(figure)
+    plot_registration_comparison(
+        _read_rows(root / 'suite_metrics.csv'), piecewise_metrics,
+        figure_root / 'registration_benchmark_comparison.png')
 
     photon_rows = (
         _read_rows(intensity_root / 'piecewise_photon_metrics.csv')
@@ -1748,13 +1751,10 @@ def _paired_plot(axis, rows, methods, metric, **conditions):
             color=METHOD_COLOURS[method], edgecolor='white', linewidth=0.7, zorder=3,
             )
     labels = [_method_tick_label(method) for method in methods]
+    axis.set_xticks(x, labels)
+    axis.tick_params(axis='x', pad=7)
     if len(methods) > 5:
-        # 16 August 2026: rotate six or more method labels so they remain legible
-        axis.set_xticks(
-            x, labels, rotation=35, ha='center', rotation_mode='anchor')
         axis.tick_params(axis='x', labelsize=7)
-    else:
-        axis.set_xticks(x, labels)
     axis.grid(axis='y', color='0.90', linewidth=0.6)
     axis.spines[['top', 'right']].set_visible(False)
 
@@ -2019,6 +2019,46 @@ def plot_accuracy(metrics, comparisons, path):
     axes[2].set_title('rigid methods on local deformation')
     axes[2].set_ylabel('95th-percentile error (px)')
     axes[2].set_ylim(bottom=0)
+    figure.savefig(path, dpi=180, bbox_inches='tight')
+    plt.close(figure)
+
+
+def plot_registration_comparison(rigid_rows, piecewise_rows, path):
+    import matplotlib.pyplot as plt
+
+    benchmark._format_benchmark_plots()
+    figure, axes = plt.subplots(1, 2, figsize=(10.5, 4.3), constrained_layout=True)
+    panels = (
+        (axes[0], rigid_rows, RIGID_METHODS, 'Rigid registration'),
+        (axes[1], piecewise_rows, (
+            'fibresight_piecewise', 'suite2p_piecewise', 'caiman_piecewise',
+            'patchwarp_affine', 'pyflowreg_piecewise'), 'Piecewise registration'),
+        )
+    plot_limit = 10
+    for axis, rows, methods, title in panels:
+        _paired_plot(axis, rows, methods, 'p95_error_px', group='heldout')
+        axis.set_title(title)
+        axis.set_ylabel('held-out p95 error (px)')
+        axis.set_ylim(0, plot_limit)
+        for method_i, method in enumerate(methods):
+            clipped = [
+                float(row['p95_error_px']) for row in rows
+                if row['method'] == method and row['group'] == 'heldout'
+                and float(row['p95_error_px']) > plot_limit
+                ]
+            if clipped:
+                axis.scatter(
+                    method_i + np.linspace(-0.04, 0.04, len(clipped)),
+                    np.full(len(clipped), plot_limit - 0.15),
+                    marker='^', s=28, facecolor='white',
+                    edgecolor=METHOD_COLOURS[method], zorder=4,
+                    )
+    figure.get_layout_engine().set(rect=(0, 0.08, 1, 1))
+    figure.text(
+        0.5, 0.012,
+        'diamonds show means; open triangles mark values above 10 px; * 8x8 grid with 4x4 retry on failure',
+        ha='center', fontsize=8,
+        )
     figure.savefig(path, dpi=180, bbox_inches='tight')
     plt.close(figure)
 

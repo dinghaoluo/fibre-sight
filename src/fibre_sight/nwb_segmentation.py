@@ -36,6 +36,15 @@ from .roi_io import roi_coordinates
 CONTROL_REFERENCE_PATH = (
     'processing/preprocessing/registration_references/control_reference'
     )
+PROPOSAL_REFERENCE_PATH = (
+    'processing/preprocessing/registration_references/proposal_reference'
+    )
+MEAN_CONTROL_REFERENCE_PATH = (
+    'processing/preprocessing/segmentation_references/mean_control_reference'
+    )
+SEGMENTATION_REFERENCE_PATH = (
+    'processing/preprocessing/segmentation_references/segmentation_reference'
+    )
 _TEXT_COLUMNS = {
     'run_name',
     'run_type',
@@ -84,10 +93,64 @@ def _check_new_run(nwbfile, run_name):
         raise ValueError(f'ROI run already exists: {run_name}')
 
 
-def _read_control_reference(nwbfile):
-    reference = nwbfile.processing['preprocessing'][
-        'registration_references']['control_reference']
+def _read_reference(nwbfile, reference_path):
+    reference_path = str(reference_path)
+    prefix = 'processing/preprocessing/'
+    relative_path = reference_path.removeprefix(prefix)
+    parts = relative_path.split('/')
+    if not reference_path.startswith(prefix) or len(parts) != 2:
+        raise ValueError(
+            'reference_path must name an image under processing/preprocessing'
+            )
+    collection_name, reference_name = parts
+    preprocessing = nwbfile.processing['preprocessing']
+    if (
+            collection_name not in preprocessing.data_interfaces
+            or not isinstance(preprocessing[collection_name], Images)
+            or reference_name not in preprocessing[collection_name].images
+            ):
+        raise ValueError(
+            'reference_path must name an image under processing/preprocessing'
+            )
+    reference = preprocessing[collection_name][reference_name]
     return np.asarray(reference.data).T.copy()
+
+
+def _read_control_reference(nwbfile):
+    return _read_reference(nwbfile, CONTROL_REFERENCE_PATH)
+
+
+def _preferred_reference_path(nwbfile):
+    preprocessing = nwbfile.processing['preprocessing']
+    if 'segmentation_references' in preprocessing.data_interfaces:
+        references = preprocessing['segmentation_references']
+        if 'segmentation_reference' in references.images:
+            return SEGMENTATION_REFERENCE_PATH
+    references = preprocessing['registration_references']
+    if 'proposal_reference' in references.images:
+        return PROPOSAL_REFERENCE_PATH
+    return CONTROL_REFERENCE_PATH
+
+
+def _reference_provenance(nwbfile, reference_path):
+    preprocessing = nwbfile.processing['preprocessing']
+    if 'segmentation_reference_metadata' not in preprocessing.data_interfaces:
+        return None
+    metadata = preprocessing['segmentation_reference_metadata']
+    for row_index in range(len(metadata)):
+        stored_path = _read_text(metadata['reference_path'][row_index])
+        if stored_path == reference_path:
+            return {
+                name: (
+                    _read_text(metadata[name][row_index])
+                    if name in {
+                        'reference_path', 'source_reference_path', 'output_dtype'
+                        }
+                    else metadata[name][row_index]
+                    )
+                for name in metadata.colnames
+                }
+    return None
 
 
 def _checkpoint_sha256(path):
@@ -119,7 +182,7 @@ def _segmentation_module(nwbfile):
         'run_name': 'unique immutable run name',
         'run_type': 'proposed or curated',
         'source_run': 'proposal run used for curation; empty for proposals',
-        'reference_path': 'canonical registered control reference',
+        'reference_path': 'registered control image used for this run',
         'checkpoint_path': 'checkpoint used for prediction; empty for curation',
         'checkpoint_sha256': 'checkpoint SHA-256; empty for curation',
         'threshold': 'proposal probability threshold; NaN for curation',
@@ -149,7 +212,7 @@ def _control_reference_plane(nwbfile):
         )
     optical_channel = OpticalChannel(
         name='control_channel',
-        description='canonical registered structural control channel',
+        description='registered structural control channel',
         emission_lambda=np.nan,
         )
     plane_spacing = {}
@@ -159,7 +222,7 @@ def _control_reference_plane(nwbfile):
     return nwbfile.create_imaging_plane(
         name=plane_name,
         optical_channel=optical_channel,
-        description='image plane of the canonical registered control reference',
+        description='image plane of the registered structural control channel',
         device=device,
         excitation_lambda=np.nan,
         indicator=control_label,
@@ -173,11 +236,12 @@ def _add_roi_run(nwbfile, run_name, roi_dict, run_metadata, probability=None):
     plane_segmentation = module['ImageSegmentation'].create_plane_segmentation(
         name=run_name,
         description=(
-            f'{run_metadata["run_type"]} ROIs on the canonical control reference'
+            f'{run_metadata["run_type"]} ROIs on {run_metadata["reference_path"]}'
             ),
         imaging_plane=_control_reference_plane(nwbfile),
         )
-    reference_shape = _read_control_reference(nwbfile).shape
+    reference_shape = _read_reference(
+        nwbfile, run_metadata['reference_path']).shape
     for roi_id, roi in roi_dict.items():
         xpix, ypix = roi_coordinates(roi_id, roi, reference_shape)
         plane_segmentation.add_roi(
@@ -207,7 +271,7 @@ def _add_roi_run(nwbfile, run_name, roi_dict, run_metadata, probability=None):
                 shuffle=True,
                 fletcher32=True,
                 ),
-            description='proposal probability on the canonical control reference',
+            description=f'proposal probability on {run_metadata["reference_path"]}',
             ))
     module['segmentation_runs'].add_row(**run_metadata)
 
@@ -241,13 +305,16 @@ def load_roi_run(nwb_path, run_name):
                 module['probability_maps'][run_name].data,
                 dtype=np.float32,
                 ).T.copy()
+        reference_path = runs[run_name]['reference_path']
         return {
             'run_name': run_name,
             'roi_dict': _read_plane_segmentation(
                 module['ImageSegmentation'][run_name]
                 ),
             'probability': probability,
-            'reference': _read_control_reference(nwbfile),
+            'reference': _read_reference(nwbfile, reference_path),
+            'reference_provenance': _reference_provenance(
+                nwbfile, reference_path),
             'provenance': runs[run_name],
             }
 
@@ -377,7 +444,8 @@ def save_curated_rois(nwb_path, run_name, roi_dict, source_run):
         runs = _segmentation_runs(nwbfile)
         if source_run not in runs or runs[source_run]['run_type'] != 'proposed':
             raise ValueError(f'source proposal does not exist: {source_run}')
-        reference_shape = _read_control_reference(nwbfile).shape
+        reference_path = runs[source_run]['reference_path']
+        reference_shape = _read_reference(nwbfile, reference_path).shape
     for roi_id, roi in roi_dict.items():
         roi_coordinates(roi_id, roi, reference_shape)
 
@@ -385,7 +453,7 @@ def save_curated_rois(nwb_path, run_name, roi_dict, source_run):
         'run_name': run_name,
         'run_type': 'curated',
         'source_run': source_run,
-        'reference_path': CONTROL_REFERENCE_PATH,
+        'reference_path': reference_path,
         'checkpoint_path': '',
         'checkpoint_sha256': '',
         'threshold': np.nan,
