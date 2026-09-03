@@ -16,6 +16,7 @@ Thumbs.db
 
 # generated FibreSight workspace
 workspace/
+output/
 
 # log files
 *.log
