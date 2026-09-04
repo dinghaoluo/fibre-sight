@@ -667,8 +667,51 @@ def nwb_curation(window):
         assert 'ROI run already exists: curated' in window.output_box.toPlainText()
 
 
+def training_configuration(window):
+    from fibre_sight.config import save_recipe
+
+    with tempfile.TemporaryDirectory(prefix='fibre sight training ') as temp_dir:
+        root = Path(temp_dir)
+        manifest = root / 'manifest.csv'
+        manifest.touch()
+        output_dir = root / 'runs'
+        run_dir = output_dir / 'gui_test'
+
+        window.source_root_line.setText(str(root))
+        window.manifest_line.setText(str(manifest))
+        window.train_output_dir_line.setText(str(output_dir))
+        window.run_name_line.setText('gui_test')
+        window.epochs_spin.setValue(3)
+        window.threshold_spin.setValue(0.21)
+        window.min_size_spin.setValue(7)
+
+        with mock.patch('fibre_sight.gui.save_recipe') as save:
+            window.write_training_config()
+        recipe = save.call_args.args[0]
+        assert recipe['train']['out_dir'] == str(output_dir)
+        assert recipe['train']['run_name'] == 'gui_test'
+        assert recipe['train']['epochs'] == 3
+        assert recipe['postprocess']['threshold'] == 0.5
+        assert recipe['postprocess']['min_size'] == 30
+        assert window.training_checkpoint_path() == run_dir / 'best.pt'
+
+        run_dir.mkdir(parents=True)
+        (run_dir / 'best.pt').touch()
+        save_recipe(recipe, run_dir / 'config.yaml')
+        window.refresh_status()
+        assert window.evaluate_model_button.isEnabled()
+        with mock.patch.object(window, 'start_process', return_value=True) as start:
+            window.evaluate_model()
+        args = start.call_args.args[2]
+        assert args[args.index('--checkpoint') + 1] == str(run_dir / 'best.pt')
+        assert args[args.index('--threshold') + 1] == '0.5'
+        assert args[args.index('--min-size') + 1] == '30'
+
+
 PROBES = {
     'viewport': viewport,
+    'automatic_session': automatic_session,
+    'training_configuration': training_configuration,
     'image_prediction': image_prediction,
     'roi_editing': roi_editing,
     'segmentation_fixed': segmentation_fixed,
@@ -701,6 +744,12 @@ class GUIProbeTests(unittest.TestCase):
 
     def test_viewport(self):
         self.run_probe('viewport', '1.5')
+
+    def test_automatic_session_configuration_and_trace_view(self):
+        self.run_probe('automatic_session')
+
+    def test_training_configuration(self):
+        self.run_probe('training_configuration')
 
     def test_image_prediction_and_confidence(self):
         self.run_probe('image_prediction')
