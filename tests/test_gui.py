@@ -2,6 +2,7 @@
 Created on 24 July 2026
 
 Modified on 14 August 2026 to keep the GUI checks at the workflow level
+Modified on 21 August 2026 for the automatic recording workflow
 
 run GUI checks separately because QApplication state cannot be reset
 
@@ -141,6 +142,15 @@ def viewport(window):
     window.resize(1000, 680)
     window.show()
 
+    assert [
+        window.tabs.tabText(index) for index in range(window.tabs.count())
+        ] == ['AUTO', 'train', 'segment']
+
+    auto_controls = (
+        window.auto_tiff_dir_line,
+        window.auto_acquisition_combo,
+        window.auto_sampling_spin,
+        )
     predict_controls = (
         window.threshold_spin,
         window.min_size_spin,
@@ -163,6 +173,45 @@ def viewport(window):
     window.tabs.setCurrentIndex(0)
     app.processEvents()
 
+    assert not window.resources_panel.isVisible()
+    assert not window.persistent_panel.isVisible()
+    assert not window.stage_header.isVisible()
+    assert not window.right_stack.isVisible()
+    assert window.activity_frame.isVisible()
+    assert window.auto_run_button.text() == 'RUN PIPELINE'
+    assert [
+        window.auto_registration_model_combo.itemText(index)
+        for index in range(window.auto_registration_model_combo.count())
+        ] == ['rigid', 'piecewise', 'auto']
+    assert window.auto_registration_model_combo.currentText() == 'auto'
+    assert window.auto_sampling_spin.decimals() == 1
+    assert window.auto_sampling_spin.text() == '30.0 Hz'
+    assert not hasattr(window, 'auto_source_summary')
+    assert all(
+        widget.visibleRegion().contains(widget.rect())
+        for widget in auto_controls
+        )
+    window.auto_advanced_button.setChecked(True)
+    window.auto_tab_scroll.verticalScrollBar().setValue(
+        window.auto_tab_scroll.verticalScrollBar().maximum())
+    app.processEvents()
+    assert window.auto_footer.isVisible()
+    assert all(
+        widget.visibleRegion().contains(widget.rect())
+        for widget in (
+            window.auto_state_label,
+            window.auto_progress,
+            window.auto_run_button,
+            window.auto_resume_button,
+            )
+        )
+
+    window.tabs.setCurrentIndex(2)
+    app.processEvents()
+    assert window.resources_panel.isVisible()
+    assert window.persistent_panel.isVisible()
+    assert window.stage_header.isVisible()
+    assert window.right_stack.isVisible()
     assert window.roi_table.isVisible()
     assert all(
         widget.visibleRegion().contains(widget.rect())
@@ -177,13 +226,158 @@ def viewport(window):
         assert top_left.x() + button.width() <= bar.width()
         assert top_left.y() + button.height() <= bar.height()
 
-    window.tabs.setCurrentIndex(1)
+    window.mser_advanced_button.setChecked(True)
     app.processEvents()
     assert window.segment_button.isVisible()
 
+    window.tabs.setCurrentIndex(1)
+    app.processEvents()
+    window.training_tab.verticalScrollBar().setValue(
+        window.training_tab.verticalScrollBar().maximum())
+    app.processEvents()
+    assert not window.resources_panel.isVisible()
+    assert not window.persistent_panel.isVisible()
+    assert not window.curation_bar.isVisible()
+    assert not window.stage_header.isVisible()
+    assert not window.right_stack.isVisible()
+    assert window.activity_frame.isVisible()
+    assert window.train_output_dir_line.isVisible()
+    assert window.train_model_button.isVisible()
+
     window.tabs.setCurrentIndex(2)
     app.processEvents()
-    assert window.train_model_button.isVisible()
+    assert window.resources_panel.isVisible()
+    assert window.persistent_panel.isVisible()
+    assert window.curation_bar.isVisible()
+    assert window.stage_header.isVisible()
+    assert window.right_stack.isVisible()
+
+
+def automatic_session(window):
+    import numpy as np
+    from PyQt5.QtCore import Qt
+
+    from fibre_sight.gui_worker import (
+        append_session_event,
+        latest_session_config,
+        session_stage_states,
+        )
+
+    with tempfile.TemporaryDirectory(prefix='fibre sight automatic ') as temp_dir:
+        root = Path(temp_dir)
+        tiff_dir = root / 'TIFFs'
+        tiff_dir.mkdir()
+        (tiff_dir / 'recording_10.tif').write_bytes(b'late')
+        (tiff_dir / 'recording_2.tif').write_bytes(b'early')
+        checkpoint = root / 'model.pt'
+        checkpoint.write_bytes(b'model')
+
+        window.auto_tiff_dir_line.setText(str(tiff_dir))
+        window.auto_output_dir_line.setText(str(root))
+        window.auto_session_line.setText('example')
+        window.auto_checkpoint_line.setText(str(checkpoint))
+        window.auto_reference_channel_combo.setCurrentText('signal')
+        window.auto_reference_high_spin.setValue(97)
+        window.auto_threshold_spin.setValue(0.31)
+        window.auto_min_size_spin.setValue(52)
+        config = window.auto_session_config()
+
+        assert [Path(record['path']).name for record in config['signal_files']] == [
+            'recording_2.tif',
+            'recording_10.tif',
+            ]
+        assert config['segmentation']['reference_channel'] == 'signal'
+        assert config['segmentation']['reference_high_percentile'] == 97
+        assert config['segmentation']['threshold'] == 0.31
+        assert config['segmentation']['min_size'] == 52
+        assert config['extraction']['roi_run'] == 'proposal_auto'
+        assert config['dff']['fluorescence_run'] == 'fluorescence_auto'
+
+        log_path = root / 'example.fibresight.jsonl'
+        append_session_event(log_path, {'event': 'configured', 'config': config})
+        append_session_event(
+            log_path,
+            {'event': 'stage_completed', 'stage': 'preprocessing'},
+            )
+        assert latest_session_config(log_path) == config
+        assert session_stage_states(log_path)['preprocessing'] == 'stage_completed'
+
+        window.auto_log_path = log_path
+        window.auto_loaded_config = config
+        window.auto_session_line.setText('next_example')
+        with mock.patch.object(window, 'start_process', return_value=True) as start:
+            window.start_auto_session()
+        next_log_path = root / 'next_example.fibresight.jsonl'
+        assert window.auto_log_path == next_log_path.resolve()
+        assert Path(latest_session_config(next_log_path)['output_path']).name == (
+            'next_example.nwb')
+        start.assert_called_once()
+
+        window.trace_cache = {
+            'run_name': 'dff_auto',
+            'timestamps': np.arange(20, dtype=float),
+            'analysis_valid': np.ones(20, dtype=bool),
+            'fluorescence': {'traces': {
+                'signal_roi_mean': np.arange(20, dtype=float)[:, None],
+                'signal_surround_mean': np.ones((20, 1), dtype=float),
+                }},
+            'dff': {
+                'roi_ids': np.asarray([7]),
+                'provenance': {'statistic': 'mean', 'surround_coefficient': 0.7},
+                'traces': {
+                    'signal_surround_corrected_dff': np.zeros((20, 1)),
+                    'control_surround_corrected_dff': np.ones((20, 1)),
+                    },
+                },
+            }
+        window.trace_roi_combo.addItem('7', 7)
+        window.draw_trace_inspector()
+        assert len(window.trace_figure.axes) == 1
+        assert window.trace_figure.axes[0].get_title() == 'ROI 7 dF/F'
+        assert len(window.trace_figure.axes[0].lines) == 2
+        assert all(
+            abs(line.get_linewidth() - 0.9) < 1e-6
+            for line in window.trace_figure.axes[0].lines
+            )
+        window.trace_signal_check.setChecked(False)
+        assert len(window.trace_figure.axes[0].lines) == 1
+        window.trace_signal_check.setChecked(True)
+        window.trace_zoom_in_button.click()
+        assert window.trace_figure.axes[0].get_xlim()[1] < 20
+        window.nwb_path = Path(window.auto_loaded_config['output_path'])
+        window.controls_tab_changed(0)
+        assert not window.right_stack.isHidden()
+        assert window.right_stack.currentIndex() == 0
+        assert [
+            window.activity_tabs.tabText(index)
+            for index in range(window.activity_tabs.count())
+            ] == ['trace inspector', 'console']
+        assert window.activity_tabs.currentIndex() == 0
+        window.activity_tabs.setCurrentIndex(1)
+        assert window.activity_tabs.currentIndex() == 1
+        window.activity_tabs.setCurrentIndex(0)
+
+        window.ref_image = np.ones((6, 8), dtype=float)
+        window.labelled = np.zeros((6, 8), dtype=np.int32)
+        window.labelled[1:4, 2:5] = 7
+        window.roi_dict = {
+            7: {
+                'xpix': np.array([2, 3, 4]),
+                'ypix': np.array([1, 2, 3]),
+                },
+        }
+        window.selected.clear()
+        window.refresh_roi_table()
+        window.activity_tabs.setCurrentIndex(1)
+        window.on_click(_click_event(window, 3, 2, Qt.NoModifier))
+        assert window.selected == {7}
+        assert window.trace_roi_combo.currentData() == 7
+        assert window.activity_tabs.currentIndex() == 0
+
+        window.load_auto_session_log(next_log_path)
+        assert window.trace_cache is None
+        assert window.trace_roi_combo.count() == 0
+        assert window.right_stack.isHidden()
 
 
 def image_prediction(window):
@@ -410,6 +604,8 @@ def nwb_curation(window):
         window.load_channel_image()
         assert window.ref_image is None
         assert window.source_proposal_run is None
+        assert not window.predict_button.isEnabled()
+        window.tabs.setCurrentIndex(2)
         window.proposal_run_combo.setCurrentText('proposal')
         window.resize(1000, 680)
         window.show()
@@ -424,6 +620,7 @@ def nwb_curation(window):
         np.testing.assert_array_equal(window.probability, reference / 23)
         assert window.source_proposal_run == 'proposal'
         assert window.proposal_run_combo.currentData() == 'proposal'
+        assert window.predict_button.isEnabled()
         window.threshold_spin.setValue(0.9)
         window.min_size_spin.setValue(1)
         window.rebuild_rois_from_probability()

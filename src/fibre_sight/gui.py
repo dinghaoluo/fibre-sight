@@ -9,8 +9,10 @@ Modified on 24 July 2026 to load packaged assets and the bundled model
 Modified on 25 July 2026 to separate the workbench tasks and reduce the control density
 Modified on 14 August 2026 to simplify the GUI workflow and tests
 Modified on 19 August 2026 to curate named NWB proposal runs
+Modified on 21 August 2026 to add the automatic recording workflow
+Modified on 22 August 2026 to expose piecewise extraction in AUTO
 
-labelling, training, prediction, and ROI curation in the FibreSight GUI
+automatic recording analysis, segmentation, training, and ROI curation
 
 @author: Dinghao Luo
 '''
@@ -27,7 +29,9 @@ matplotlib.use('Qt5Agg')
 
 import numpy as np
 from matplotlib import font_manager
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from pynwb import NWBHDF5IO
 from PyQt5.QtCore import (
     QByteArray,
     QItemSelectionModel,
@@ -68,6 +72,8 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
     QPlainTextEdit,
     QShortcut,
@@ -76,6 +82,7 @@ from PyQt5.QtWidgets import (
     QSlider,
     QSplitter,
     QSpinBox,
+    QStackedWidget,
     QStatusBar,
     QTabBar,
     QTableWidget,
@@ -94,21 +101,35 @@ from ._repo import (
     SOURCE_ROOT,
     WORKSPACE_ROOT,
     )
+from . import __version__
 from .api import (
     BUNDLED_CHECKPOINT,
     BUNDLED_MIN_SIZE,
     BUNDLED_THRESHOLD,
     ROIPredictor,
+    list_dff_runs,
+    list_fluorescence_runs,
     list_roi_runs,
+    load_dff_run,
+    load_fluorescence_run,
     load_roi_run,
     save_curated_rois,
     )
-from .config import load_recipe, save_recipe
+from .config import load_recipe, resolve_path, save_recipe
 from .gui_canvas import (
     ZoomableCanvas,
     generate_distinct_colours,
     normalise_for_display,
     squeeze_image,
+    )
+from .gui_worker import (
+    SESSION_SCHEMA_VERSION,
+    append_session_event,
+    fingerprint_paths,
+    latest_session_config,
+    natural_tiff_paths,
+    partial_paths,
+    session_stage_states,
     )
 from .mser_segmenter import (
     PARAMETER_SPECS,
@@ -304,6 +325,11 @@ class FibreSightGUI(QMainWindow):
         self.interface_font_size = interface_font_size
         self._syncing_roi_table = False
         self._process_was_stopped = False
+        self.auto_log_path = None
+        self.auto_loaded_config = None
+        self.trace_cache = None
+        self.trace_xlim = None
+        self.auto_output_buffer = ''
         self._controls_split_positions = {}
         self._sizing_controls_splitter = False
 
@@ -357,24 +383,21 @@ class FibreSightGUI(QMainWindow):
             )
 
         self.tabs = QTabWidget()
+        self.auto_tab = QWidget()
+        self.auto_tab.setObjectName('autoTab')
+        self.auto_tab_scroll, self.auto_tab_content = self._make_scroll_tab()
         self.predict_tab, self.predict_tab_content = self._make_scroll_tab()
-        # Predict fits inside the rounded Qt tab at its minimum width
+        # predict fits inside the rounded Qt tab at its minimum width
         self.predict_tab.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        (
-            self.mser_tab,
-            self.mser_scroll,
-            self.mser_tab_content,
-            self.mser_action_bar,
-            self.mser_action_layout,
-            ) = self._make_label_tab()
         self.training_tab, self.training_tab_content = self._make_scroll_tab()
-        self.tabs.addTab(self.predict_tab, 'Predict')
-        self.tabs.addTab(self.mser_tab, 'Label')
-        self.tabs.addTab(self.training_tab, 'Train')
+        self.tabs.addTab(self.auto_tab, 'AUTO')
+        self.tabs.addTab(self.training_tab, 'train')
+        self.tabs.addTab(self.predict_tab, 'segment')
         self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.tabs.tabBar().setExpanding(False)
         self.tabs.tabBar().setUsesScrollButtons(True)
         self.tabs.currentChanged.connect(self.controls_tab_changed)
+        self._build_auto_widgets()
         self._build_training_widgets()
         self._build_prediction_widgets()
         self._build_segment_widgets()
@@ -383,9 +406,15 @@ class FibreSightGUI(QMainWindow):
         self.output_box = self.make_log_box()
 
         self.roi_overlay_check = QCheckBox('ROI on')
+        self.roi_overlay_check.setAccessibleName('ROI overlay')
+        self.roi_overlay_check.setAccessibleDescription(
+            'show or hide the ROI outlines on the image')
         self.roi_overlay_check.setChecked(True)
         self.roi_overlay_check.stateChanged.connect(self.set_roi_overlay_visible)
         self.dark_mode_check = QCheckBox('dark mode')
+        self.dark_mode_check.setAccessibleName('dark mode')
+        self.dark_mode_check.setAccessibleDescription(
+            'switch between dark and light interface colours')
         self.dark_mode_check.setChecked(True)
         self.dark_mode_check.stateChanged.connect(self.set_dark_mode)
 
@@ -421,23 +450,236 @@ class FibreSightGUI(QMainWindow):
         scroll.setWidget(content)
         return scroll, content
 
-    def _make_label_tab(self):
-        tab = QWidget()
-        tab.setObjectName('labelTab')
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+    def _build_auto_widgets(self):
+        self.auto_tiff_dir_line = QLineEdit()
+        self.auto_control_dir_line = QLineEdit()
+        self.auto_output_dir_line = QLineEdit(str(OUTPUT_ROOT))
+        self.auto_session_line = QLineEdit('session')
+        self.auto_signal_label_line = QLineEdit('signal')
+        self.auto_control_label_line = QLineEdit('control')
 
-        scroll, content = self._make_scroll_tab()
-        action_bar = QFrame()
-        action_bar.setObjectName('labelActionBar')
-        action_layout = QHBoxLayout(action_bar)
-        action_layout.setContentsMargins(10, 8, 10, 8)
-        action_layout.setSpacing(6)
+        self.auto_acquisition_combo = QComboBox()
+        self.auto_acquisition_combo.addItem('interleaved pages', True)
+        self.auto_acquisition_combo.addItem('separate TIFF folders', False)
+        self.auto_signal_channel_combo = QComboBox()
+        self.auto_control_channel_combo = QComboBox()
+        for combo in (
+                self.auto_signal_channel_combo,
+                self.auto_control_channel_combo,
+                ):
+            combo.addItems(['1', '2'])
+        self.auto_control_channel_combo.setCurrentText('2')
 
-        layout.addWidget(scroll, 1)
-        layout.addWidget(action_bar)
-        return tab, scroll, content, action_bar, action_layout
+        self.auto_sampling_spin = QDoubleSpinBox()
+        self.auto_sampling_spin.setRange(0.01, 10000)
+        self.auto_sampling_spin.setDecimals(1)
+        self.auto_sampling_spin.setValue(30)
+        self.auto_sampling_spin.setSuffix(' Hz')
+        self.prepare_value_control(self.auto_sampling_spin)
+
+        self.auto_registration_model_combo = QComboBox()
+        self.auto_registration_model_combo.addItems(['rigid', 'piecewise', 'auto'])
+        self.auto_registration_model_combo.setCurrentText('auto')
+        self.auto_registration_model_combo.setToolTip(
+            'piecewise stores local spline fields and uses exact valid pixels '
+            'during segmentation and extraction; auto selects it when the '
+            'registration benchmarks pass')
+        self.auto_registration_channel_combo = QComboBox()
+        self.auto_registration_channel_combo.addItems(['control', 'signal'])
+
+        self.auto_reference_channel_combo = QComboBox()
+        self.auto_reference_channel_combo.addItems(['control', 'signal'])
+        self.auto_checkpoint_line = QLineEdit(str(BUNDLED_CHECKPOINT))
+        self.auto_threshold_spin = QDoubleSpinBox()
+        self.auto_threshold_spin.setRange(0.01, 0.99)
+        self.auto_threshold_spin.setSingleStep(0.01)
+        self.auto_threshold_spin.setDecimals(2)
+        self.auto_threshold_spin.setValue(BUNDLED_THRESHOLD)
+        self.prepare_value_control(self.auto_threshold_spin)
+        self.auto_min_size_spin = QSpinBox()
+        self.auto_min_size_spin.setRange(1, 100000)
+        self.auto_min_size_spin.setValue(BUNDLED_MIN_SIZE)
+        self.prepare_value_control(self.auto_min_size_spin)
+        self.auto_reference_high_spin = QDoubleSpinBox()
+        self.auto_reference_high_spin.setRange(1, 100)
+        self.auto_reference_high_spin.setDecimals(1)
+        self.auto_reference_high_spin.setValue(97)
+        self.auto_reference_high_spin.setSuffix('%')
+        self.prepare_value_control(self.auto_reference_high_spin)
+
+        self.auto_surround_method_combo = QComboBox()
+        self.auto_surround_method_combo.addItems(['adaptive', 'fixed'])
+        self.auto_surround_inner_spin = QSpinBox()
+        self.auto_surround_inner_spin.setRange(0, 1000)
+        self.auto_surround_inner_spin.setValue(5)
+        self.auto_surround_outer_spin = QSpinBox()
+        self.auto_surround_outer_spin.setRange(1, 1000)
+        self.auto_surround_outer_spin.setValue(8)
+        self.auto_surround_min_spin = QSpinBox()
+        self.auto_surround_min_spin.setRange(0, 100000)
+        self.auto_surround_min_spin.setValue(350)
+        for spin in (
+                self.auto_surround_inner_spin,
+                self.auto_surround_outer_spin,
+                self.auto_surround_min_spin,
+                ):
+            self.prepare_value_control(spin)
+
+        self.auto_statistic_combo = QComboBox()
+        self.auto_statistic_combo.addItems(['mean', 'median'])
+        self.auto_baseline_percentile_spin = QDoubleSpinBox()
+        self.auto_baseline_percentile_spin.setRange(0, 100)
+        self.auto_baseline_percentile_spin.setDecimals(1)
+        self.auto_baseline_percentile_spin.setValue(20)
+        self.auto_baseline_percentile_spin.setSuffix('%')
+        self.auto_baseline_window_spin = QDoubleSpinBox()
+        self.auto_baseline_window_spin.setRange(0.01, 100000)
+        self.auto_baseline_window_spin.setDecimals(1)
+        self.auto_baseline_window_spin.setValue(300)
+        self.auto_baseline_window_spin.setSuffix(' s')
+        self.auto_surround_coefficient_spin = QDoubleSpinBox()
+        self.auto_surround_coefficient_spin.setRange(0, 10)
+        self.auto_surround_coefficient_spin.setDecimals(2)
+        self.auto_surround_coefficient_spin.setValue(0.7)
+        for spin in (
+                self.auto_baseline_percentile_spin,
+                self.auto_baseline_window_spin,
+                self.auto_surround_coefficient_spin,
+                ):
+            self.prepare_value_control(spin)
+        self.auto_control_correction_combo = QComboBox()
+        self.auto_control_correction_combo.addItem('none', 'none')
+        self.auto_control_correction_combo.addItem(
+            'signal dF/F minus control dF/F',
+            'subtract_dff',
+            )
+
+        self.auto_advanced_button = QPushButton('advanced')
+        self.auto_advanced_button.setCheckable(True)
+        self.set_button_role(self.auto_advanced_button, 'quiet')
+        self.auto_advanced_widget = QWidget()
+        self.auto_advanced_widget.hide()
+        self.auto_reference_low_spin = QDoubleSpinBox()
+        self.auto_reference_low_spin.setRange(0, 99)
+        self.auto_reference_low_spin.setDecimals(1)
+        self.auto_reference_low_spin.setValue(1)
+        self.auto_reference_low_spin.setSuffix('%')
+        self.auto_tta_check = QCheckBox('four-view TTA')
+        self.auto_tta_check.setChecked(True)
+        self.auto_device_combo = QComboBox()
+        self.auto_device_combo.addItems(['auto', 'cpu', 'mps', 'cuda'])
+        self.auto_pixel_size_spin = QDoubleSpinBox()
+        self.auto_pixel_size_spin.setRange(0, 10000)
+        self.auto_pixel_size_spin.setDecimals(4)
+        self.auto_pixel_size_spin.setSpecialValueText('not supplied')
+        self.auto_pixel_size_spin.setSuffix(' um')
+        self.auto_proposal_run_line = QLineEdit('proposal_auto')
+        self.auto_roi_source_combo = QComboBox()
+        self.auto_roi_source_combo.setEditable(True)
+        self.auto_roi_source_combo.addItem('proposal_auto')
+        self.auto_fluorescence_run_line = QLineEdit('fluorescence_auto')
+        self.auto_dff_run_line = QLineEdit('dff_auto')
+
+        for widget, name, description in (
+                (self.auto_tiff_dir_line, 'TIFF folder',
+                 'folder containing the recording TIFFs'),
+                (self.auto_control_dir_line, 'control TIFF folder',
+                 'second folder when signal and control are stored separately'),
+                (self.auto_output_dir_line, 'destination folder',
+                 'folder for the NWB and session log'),
+                (self.auto_session_line, 'session name',
+                 'name used for the NWB output and session log'),
+                (self.auto_signal_label_line, 'signal label',
+                 'label stored for the signal channel'),
+                (self.auto_control_label_line, 'control label',
+                 'label stored for the control channel'),
+                (self.auto_acquisition_combo, 'recording layout',
+                 'whether the two channels share each TIFF or use separate folders'),
+                (self.auto_signal_channel_combo, 'signal channel',
+                 'channel number for the signal in interleaved TIFFs'),
+                (self.auto_control_channel_combo, 'control channel',
+                 'channel number for the control in interleaved TIFFs'),
+                (self.auto_sampling_spin, 'sampling frequency',
+                 'paired observations per second'),
+                (self.auto_registration_model_combo, 'registration model',
+                 'rigid, piecewise, or automatic registration selection'),
+                (self.auto_registration_channel_combo, 'registration channel',
+                 'channel used to estimate movement'),
+                (self.auto_reference_channel_combo, 'reference channel',
+                 'channel used to build the segmentation reference'),
+                (self.auto_checkpoint_line, 'segmentation model',
+                 'checkpoint used for automatic ROI proposals'),
+                (self.auto_threshold_spin, 'prediction threshold',
+                 'minimum model confidence for an ROI'),
+                (self.auto_min_size_spin, 'minimum ROI area',
+                 'smallest connected component kept as an ROI'),
+                (self.auto_reference_high_spin, 'reference upper percentile',
+                 'upper contrast limit for the full-session reference'),
+                (self.auto_surround_method_combo, 'surround method',
+                 'method used to choose pixels around each ROI'),
+                (self.auto_surround_inner_spin, 'surround inner distance',
+                 'inner distance around each ROI'),
+                (self.auto_surround_outer_spin, 'surround outer distance',
+                 'outer distance for a fixed surround'),
+                (self.auto_surround_min_spin, 'minimum surround pixels',
+                 'minimum pixels in an adaptive surround'),
+                (self.auto_statistic_combo, 'fluorescence statistic',
+                 'pixel statistic used for fluorescence traces'),
+                (self.auto_baseline_percentile_spin, 'baseline percentile',
+                 'percentile used for the rolling baseline'),
+                (self.auto_baseline_window_spin, 'baseline window',
+                 'rolling baseline window in seconds'),
+                (self.auto_surround_coefficient_spin, 'surround coefficient',
+                 'weight subtracted from the ROI surround trace'),
+                (self.auto_control_correction_combo, 'control correction',
+                 'whether control dF/F is subtracted from signal dF/F'),
+                (self.auto_reference_low_spin, 'reference lower percentile',
+                 'lower contrast limit for the full-session reference'),
+                (self.auto_tta_check, 'four-view TTA',
+                 'average predictions from four image views'),
+                (self.auto_device_combo, 'inference device',
+                 'device used for automatic ROI inference'),
+                (self.auto_pixel_size_spin, 'pixel size',
+                 'optional pixel size in micrometres'),
+                (self.auto_proposal_run_line, 'proposal run',
+                 'name for the immutable automatic ROI proposal'),
+                (self.auto_roi_source_combo, 'extraction ROI run',
+                 'ROI run measured during extraction'),
+                (self.auto_fluorescence_run_line, 'fluorescence run',
+                 'name for the immutable fluorescence run'),
+                (self.auto_dff_run_line, 'dF/F run',
+                 'name for the immutable dF/F run'),
+                ):
+            widget.setAccessibleName(name)
+            widget.setAccessibleDescription(description)
+
+        self.auto_state_label = ElidedLabel('automatic session not started')
+        self.auto_state_label.setObjectName('panelValue')
+        self.auto_progress = QProgressBar()
+        self.auto_progress.setAccessibleName('pipeline progress')
+        self.auto_progress.setAccessibleDescription(
+            'completed automatic recording stages out of four')
+        self.auto_progress.setRange(0, 4)
+        self.auto_progress.setValue(0)
+        self.auto_progress.setTextVisible(True)
+        self.auto_progress.setFormat('%v / 4 stages')
+        self.auto_run_button = QPushButton('RUN PIPELINE')
+        self.auto_resume_button = QPushButton('resume session')
+        self.auto_stop_button = QPushButton('stop')
+        self.auto_stop_button.hide()
+        self.set_button_role(self.auto_run_button, 'primary')
+        self.set_button_role(self.auto_resume_button, 'secondary')
+        self.set_button_role(self.auto_stop_button, 'danger')
+
+        self.auto_acquisition_combo.currentIndexChanged.connect(
+            self.auto_acquisition_changed)
+        self.auto_surround_method_combo.currentTextChanged.connect(
+            self.update_auto_surround_controls)
+        self.auto_advanced_button.toggled.connect(
+            self.auto_advanced_widget.setVisible)
+        self.auto_run_button.clicked.connect(self.start_auto_session)
+        self.auto_resume_button.clicked.connect(self.choose_auto_session_log)
+        self.auto_stop_button.clicked.connect(self.stop_process)
 
     def _build_training_widgets(self):
         self.source_root_line = QLineEdit(str(SOURCE_ROOT))
@@ -445,10 +687,13 @@ class FibreSightGUI(QMainWindow):
         self.config_line = QLineEdit(
             str(PACKAGE_ROOT / 'configs' / 'ch2_unet.yaml')
             )
+        self.train_output_dir_line = QLineEdit(str(OUTPUT_ROOT / 'runs'))
         self.run_name_line = QLineEdit('ch2_unet')
         self.source_root_line.textChanged.connect(lambda _: self.refresh_status())
         self.manifest_line.textChanged.connect(lambda _: self.refresh_status())
         self.config_line.textChanged.connect(lambda _: self.refresh_status())
+        self.train_output_dir_line.textChanged.connect(
+            lambda _: self.refresh_status())
         self.run_name_line.textChanged.connect(lambda _: self.refresh_status())
 
         self.val_fraction_spin = QDoubleSpinBox()
@@ -475,24 +720,17 @@ class FibreSightGUI(QMainWindow):
         self.evaluate_model_button = QPushButton('score model')
         self.stop_process_button = QPushButton('stop process')
         self.inspect_manifest_button = QPushButton('dataset summary')
-        self.preview_training_button = QPushButton('save label preview')
-        self.preview_predictions_button = QPushButton('save prediction preview')
         self.set_button_role(self.train_model_button, 'primary')
         self.set_button_role(self.stop_process_button, 'danger')
         self.set_button_role(self.inspect_manifest_button, 'quiet')
         self.set_button_role(self.evaluate_model_button, 'quiet')
-        self.set_button_role(self.preview_training_button, 'quiet')
-        self.set_button_role(self.preview_predictions_button, 'quiet')
         self.evaluate_model_button.setToolTip('score the current trained model on held-out labelled sessions')
-        self.preview_predictions_button.setToolTip('save example overlays comparing model ROIs with held-out labels')
         self.stop_process_button.hide()
 
         self.build_manifest_button.clicked.connect(self.build_manifest)
         self.train_model_button.clicked.connect(self.train_model)
         self.evaluate_model_button.clicked.connect(self.evaluate_model)
         self.inspect_manifest_button.clicked.connect(self.inspect_manifest)
-        self.preview_training_button.clicked.connect(self.preview_training_labels)
-        self.preview_predictions_button.clicked.connect(self.preview_model_predictions)
         self.stop_process_button.clicked.connect(self.stop_process)
 
     def _build_prediction_widgets(self):
@@ -611,6 +849,12 @@ class FibreSightGUI(QMainWindow):
     def _build_persistent_widgets(self):
         self.image_view_button = QPushButton('image')
         self.confidence_view_button = QPushButton('confidence')
+        self.image_view_button.setAccessibleName('image display')
+        self.confidence_view_button.setAccessibleName('confidence display')
+        self.image_view_button.setAccessibleDescription(
+            'show the loaded reference image')
+        self.confidence_view_button.setAccessibleDescription(
+            'show the model confidence map')
         for button in (self.image_view_button, self.confidence_view_button):
             button.setCheckable(True)
             self.set_button_role(button, 'viewMode')
@@ -643,6 +887,15 @@ class FibreSightGUI(QMainWindow):
             spin.setKeyboardTracking(False)
             spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
             spin.setMaximumWidth(70)
+
+        self.black_slider.setAccessibleName('black point')
+        self.black_slider.setAccessibleDescription(
+            'lower display percentile for the image')
+        self.white_slider.setAccessibleName('white point')
+        self.white_slider.setAccessibleDescription(
+            'upper display percentile for the image')
+        self.black_value.setAccessibleName('black point value')
+        self.white_value.setAccessibleName('white point value')
 
         self.black_slider.setValue(int(round(DISPLAY_BLACK_DEFAULT * 10)))
         self.white_slider.setValue(int(round(DISPLAY_WHITE_DEFAULT * 10)))
@@ -742,16 +995,88 @@ class FibreSightGUI(QMainWindow):
         canvas_stage_layout.addWidget(self.curation_bar)
         canvas_stage_layout.addWidget(canvas_frame, 1)
 
-        activity_frame = QFrame()
-        activity_frame.setObjectName('activityFrame')
-        activity_layout = QVBoxLayout(activity_frame)
+        self.activity_frame = QFrame()
+        self.activity_frame.setObjectName('activityFrame')
+        activity_layout = QVBoxLayout(self.activity_frame)
         activity_layout.setContentsMargins(8, 8, 8, 8)
-        activity_layout.addWidget(self.output_box, 1)
+        self.activity_tabs = QTabWidget()
+        self.activity_tabs.setObjectName('activityTabs')
+        self.activity_tabs.setAccessibleName('activity view')
+        self.activity_tabs.currentChanged.connect(self.set_activity_view)
+        activity_layout.addWidget(self.activity_tabs, 1)
+
+        self.trace_figure = Figure(dpi=100, facecolor=self._theme()['canvas'])
+        self.trace_canvas = FigureCanvasQTAgg(self.trace_figure)
+        self.trace_canvas.setMinimumSize(300, 300)
+        self.trace_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.trace_canvas.setAccessibleName('fluorescence trace inspector')
+        self.trace_canvas.mpl_connect('scroll_event', self.trace_scroll)
+        self.trace_run_combo = QComboBox()
+        self.trace_run_combo.setAccessibleName('dF/F run')
+        self.trace_roi_combo = QComboBox()
+        self.trace_roi_combo.setAccessibleName('ROI trace')
+        self.trace_signal_check = QCheckBox('signal')
+        self.trace_signal_check.setAccessibleName('show signal trace')
+        self.trace_signal_check.setChecked(True)
+        self.trace_control_check = QCheckBox('control')
+        self.trace_control_check.setAccessibleName('show control trace')
+        self.trace_control_check.setChecked(True)
+        self.trace_zoom_out_button = QPushButton('zoom out')
+        self.trace_fit_button = QPushButton('fit')
+        self.trace_zoom_in_button = QPushButton('zoom in')
+        for button in (
+                self.trace_zoom_out_button,
+                self.trace_fit_button,
+                self.trace_zoom_in_button,
+                ):
+            self.set_button_role(button, 'small')
+        self.trace_run_combo.currentIndexChanged.connect(self.load_trace_run)
+        self.trace_roi_combo.currentIndexChanged.connect(self.draw_trace_inspector)
+        self.trace_signal_check.toggled.connect(self.draw_trace_inspector)
+        self.trace_control_check.toggled.connect(self.draw_trace_inspector)
+        self.trace_zoom_out_button.clicked.connect(
+            lambda: self.zoom_trace(0.5))
+        self.trace_fit_button.clicked.connect(self.fit_trace)
+        self.trace_zoom_in_button.clicked.connect(
+            lambda: self.zoom_trace(2.0))
+
+        trace_header = QFrame()
+        trace_header.setObjectName('curationBar')
+        trace_header_layout = QHBoxLayout(trace_header)
+        trace_header_layout.setContentsMargins(7, 5, 7, 5)
+        trace_header_layout.setSpacing(6)
+        trace_header_layout.addWidget(QLabel('dF/F run'))
+        trace_header_layout.addWidget(self.trace_run_combo, 1)
+        trace_header_layout.addWidget(QLabel('ROI'))
+        trace_header_layout.addWidget(self.trace_roi_combo)
+        trace_header_layout.addWidget(self.trace_signal_check)
+        trace_header_layout.addWidget(self.trace_control_check)
+        trace_header_layout.addWidget(self.trace_zoom_out_button)
+        trace_header_layout.addWidget(self.trace_fit_button)
+        trace_header_layout.addWidget(self.trace_zoom_in_button)
+
+        trace_frame = QFrame()
+        trace_frame.setObjectName('canvasFrame')
+        trace_frame_layout = QVBoxLayout(trace_frame)
+        trace_frame_layout.setContentsMargins(3, 3, 3, 3)
+        trace_frame_layout.addWidget(self.trace_canvas)
+        trace_stage = QWidget()
+        trace_stage_layout = QVBoxLayout(trace_stage)
+        trace_stage_layout.setContentsMargins(0, 0, 0, 0)
+        trace_stage_layout.setSpacing(8)
+        trace_stage_layout.addWidget(trace_header)
+        trace_stage_layout.addWidget(trace_frame, 1)
+
+        self.activity_tabs.addTab(trace_stage, 'trace inspector')
+        self.activity_tabs.addTab(self.output_box, 'console')
+
+        self.right_stack = QStackedWidget()
+        self.right_stack.addWidget(canvas_stage)
 
         self.activity_splitter = QSplitter(Qt.Vertical)
         self.activity_splitter.setObjectName('activitySplitter')
-        self.activity_splitter.addWidget(canvas_stage)
-        self.activity_splitter.addWidget(activity_frame)
+        self.activity_splitter.addWidget(self.right_stack)
+        self.activity_splitter.addWidget(self.activity_frame)
         self.activity_splitter.setChildrenCollapsible(True)
         self.activity_splitter.setCollapsible(0, False)
         self.activity_splitter.setCollapsible(1, True)
@@ -766,8 +1091,8 @@ class FibreSightGUI(QMainWindow):
         right_pane.setObjectName('mainPane')
         right_pane.setLayout(right_layout)
 
+        self._layout_auto_tab()
         self._layout_prediction_tab()
-        self._layout_mser_tab()
         self._layout_training_tab()
 
         self.resources_panel = QWidget()
@@ -889,9 +1214,9 @@ class FibreSightGUI(QMainWindow):
         self.main_splitter.setSizes([420, 840])
         self.main_splitter.splitterMoved.connect(self.schedule_curation_layout)
 
-        stage_header = QFrame()
-        stage_header.setObjectName('stageHeader')
-        stage_layout = QHBoxLayout(stage_header)
+        self.stage_header = QFrame()
+        self.stage_header.setObjectName('stageHeader')
+        stage_layout = QHBoxLayout(self.stage_header)
         stage_layout.setContentsMargins(6, 7, 6, 7)
         stage_layout.setSpacing(4)
 
@@ -907,16 +1232,38 @@ class FibreSightGUI(QMainWindow):
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(10, 8, 10, 8)
         main_layout.setSpacing(6)
-        main_layout.addWidget(stage_header)
+        main_layout.addWidget(self.stage_header)
         main_layout.addWidget(self.main_splitter, 1)
 
         container = QWidget()
         container.setObjectName('centralWidget')
         container.setLayout(main_layout)
         self.setCentralWidget(container)
+        self.controls_tab_changed(self.tabs.currentIndex())
         self.controls_split_timer.start(0)
 
     def controls_tab_changed(self, _index):
+        auto_selected = self.tabs.currentWidget() is self.auto_tab
+        segment_selected = self.tabs.currentWidget() is self.predict_tab
+        auto_trace_ready = (
+            auto_selected
+            and self.auto_loaded_config is not None
+            and self.trace_cache is not None
+            and self.nwb_path == Path(self.auto_loaded_config['output_path'])
+            )
+        self.resources_panel.setVisible(segment_selected)
+        self.persistent_panel.setVisible(segment_selected or auto_trace_ready)
+        self.curation_bar.setVisible(segment_selected)
+        self.stage_header.setVisible(segment_selected)
+        self.right_stack.setVisible(segment_selected or auto_trace_ready)
+        if segment_selected:
+            self.right_stack.setCurrentIndex(0)
+            self.activity_tabs.setCurrentIndex(1)
+        elif auto_trace_ready:
+            self.right_stack.setCurrentIndex(0)
+            self.activity_tabs.setCurrentIndex(0)
+        else:
+            self.activity_tabs.setCurrentIndex(1)
         self.refresh_status()
         if hasattr(self, 'controls_split_timer'):
             self.controls_split_timer.start(0)
@@ -994,8 +1341,8 @@ class FibreSightGUI(QMainWindow):
         stored_height = self._controls_split_positions.get(tab_index)
         if stored_height is None:
             current_scroll = (
-                self.mser_scroll
-                if self.tabs.currentWidget() is self.mser_tab else
+                self.auto_tab_scroll
+                if self.tabs.currentWidget() is self.auto_tab else
                 self.tabs.currentWidget()
                 )
             tab_chrome = max(
@@ -1003,8 +1350,11 @@ class FibreSightGUI(QMainWindow):
                 self.tabs.height() - current_scroll.viewport().height(),
                 )
             stored_height = (
-                self.resources_panel.sizeHint().height() +
-                self.upper_controls_layout.spacing() +
+                (
+                    self.resources_panel.sizeHint().height() +
+                    self.upper_controls_layout.spacing()
+                    if self.resources_panel.isVisible() else 0
+                    ) +
                 tab_chrome +
                 max(
                     current_scroll.widget().sizeHint().height(),
@@ -1012,26 +1362,178 @@ class FibreSightGUI(QMainWindow):
                     )
                 )
 
+        if (
+                self.tabs.currentWidget() is self.auto_tab
+                and self.trace_cache is not None
+                ):
+            stored_height = int(total * 2 / 3)
+
         min_upper = self.upper_controls.minimumSizeHint().height()
-        max_upper = total - self.persistent_panel.minimumSizeHint().height()
+        persistent_height = (
+            self.persistent_panel.minimumSizeHint().height()
+            if self.persistent_panel.isVisible() else 0
+            )
+        max_upper = total - persistent_height
         target = int(np.clip(stored_height, min_upper, max_upper))
         self._sizing_controls_splitter = True
         self.controls_splitter.setSizes([target, total - target])
         self._sizing_controls_splitter = False
 
-    def _layout_mser_tab(self):
-        layout = QVBoxLayout(self.mser_tab_content)
-        layout.setSpacing(6)
+    def _layout_auto_tab(self):
+        tab_layout = QVBoxLayout(self.auto_tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.setSpacing(0)
+
+        layout = QVBoxLayout(self.auto_tab_content)
+        layout.setSpacing(8)
         layout.setContentsMargins(10, 10, 10, 10)
-        self._layout_mser_section(layout)
-        self.mser_action_layout.addWidget(self.segment_button, 1)
-        self.mser_action_layout.addWidget(self.reset_segment_button)
+
+        layout.addWidget(self.make_section_label('recording'))
+        source_form = QFormLayout()
+        source_form.setVerticalSpacing(5)
+        source_form.addRow(
+            self.make_form_label('TIFF folder', 'folder containing the recording TIFFs'),
+            self._path_row(self.auto_tiff_dir_line, self.browse_auto_tiff_dir),
+            )
+        self.auto_control_dir_row = self._path_row(
+            self.auto_control_dir_line,
+            self.browse_auto_control_dir,
+            )
+        self.auto_control_dir_label = self.make_form_label(
+            'control TIFF folder',
+            'second folder when signal and control are stored separately',
+            )
+        source_form.addRow(
+            self.auto_control_dir_label,
+            self.auto_control_dir_row,
+            )
+        source_form.addRow('layout', self.auto_acquisition_combo)
+        source_form.addRow('sampling frequency', self.auto_sampling_spin)
+        source_form.addRow('signal channel', self.auto_signal_channel_combo)
+        source_form.addRow('control channel', self.auto_control_channel_combo)
+        source_form.addRow('signal label', self.auto_signal_label_line)
+        source_form.addRow('control label', self.auto_control_label_line)
+        source_form.addRow(
+            self.make_form_label('destination', 'folder for the NWB and session log'),
+            self._path_row(self.auto_output_dir_line, self.browse_auto_output_dir),
+            )
+        source_form.addRow('session name', self.auto_session_line)
+        layout.addLayout(source_form)
+
+        layout.addWidget(self.make_section_label('registration'))
+        registration_form = QFormLayout()
+        registration_form.setVerticalSpacing(5)
+        registration_form.addRow(
+            self.make_form_label(
+                'model',
+                self.auto_registration_model_combo.toolTip(),
+                self.auto_registration_model_combo,
+                ),
+            self.auto_registration_model_combo,
+            )
+        registration_form.addRow('registration channel', self.auto_registration_channel_combo)
+        layout.addLayout(registration_form)
+
+        layout.addWidget(self.make_section_label('segmentation'))
+        segmentation_form = QFormLayout()
+        segmentation_form.setVerticalSpacing(5)
+        segmentation_form.addRow('reference channel', self.auto_reference_channel_combo)
+        segmentation_form.addRow(
+            self.make_form_label(
+                'reference upper percentile',
+                'upper contrast limit for the full-session reference',
+                ),
+            self.auto_reference_high_spin,
+            )
+        segmentation_form.addRow(
+            self.make_form_label('model', 'checkpoint used for ROI proposals'),
+            self._path_row(self.auto_checkpoint_line, self.browse_auto_checkpoint),
+            )
+        segmentation_form.addRow('prediction threshold', self.auto_threshold_spin)
+        segmentation_form.addRow('minimum ROI area', self.auto_min_size_spin)
+        layout.addLayout(segmentation_form)
+
+        layout.addWidget(self.make_section_label('extraction'))
+        extraction_form = QFormLayout()
+        extraction_form.setVerticalSpacing(5)
+        extraction_form.addRow('surround method', self.auto_surround_method_combo)
+        extraction_form.addRow('inner distance', self.auto_surround_inner_spin)
+        self.auto_surround_outer_label = QLabel('outer distance')
+        extraction_form.addRow(
+            self.auto_surround_outer_label,
+            self.auto_surround_outer_spin,
+            )
+        self.auto_surround_min_label = QLabel('minimum surround pixels')
+        extraction_form.addRow(
+            self.auto_surround_min_label,
+            self.auto_surround_min_spin,
+            )
+        layout.addLayout(extraction_form)
+
+        layout.addWidget(self.make_section_label('dF/F'))
+        dff_form = QFormLayout()
+        dff_form.setVerticalSpacing(5)
+        dff_form.addRow('statistic', self.auto_statistic_combo)
+        dff_form.addRow('baseline percentile', self.auto_baseline_percentile_spin)
+        dff_form.addRow('baseline window', self.auto_baseline_window_spin)
+        dff_form.addRow('surround coefficient', self.auto_surround_coefficient_spin)
+        dff_form.addRow('control correction', self.auto_control_correction_combo)
+        layout.addLayout(dff_form)
+
+        layout.addWidget(self.auto_advanced_button)
+        advanced_form = QFormLayout(self.auto_advanced_widget)
+        advanced_form.setContentsMargins(0, 0, 0, 0)
+        advanced_form.setVerticalSpacing(5)
+        advanced_form.addRow('reference lower percentile', self.auto_reference_low_spin)
+        advanced_form.addRow('inference', self.auto_tta_check)
+        advanced_form.addRow('device', self.auto_device_combo)
+        advanced_form.addRow('pixel size', self.auto_pixel_size_spin)
+        advanced_form.addRow('proposal run', self.auto_proposal_run_line)
+        advanced_form.addRow('extraction ROI run', self.auto_roi_source_combo)
+        advanced_form.addRow('fluorescence run', self.auto_fluorescence_run_line)
+        advanced_form.addRow('dF/F run', self.auto_dff_run_line)
+        layout.addWidget(self.auto_advanced_widget)
+        layout.addStretch(1)
+
+        self.auto_footer = QFrame()
+        self.auto_footer.setObjectName('autoFooter')
+        footer_layout = QVBoxLayout(self.auto_footer)
+        footer_layout.setContentsMargins(10, 7, 10, 9)
+        footer_layout.setSpacing(5)
+        footer_layout.addWidget(self.auto_state_label)
+        footer_layout.addWidget(self.auto_progress)
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        actions.addWidget(self.auto_run_button, 1)
+        actions.addWidget(self.auto_resume_button)
+        actions.addWidget(self.auto_stop_button)
+        footer_layout.addLayout(actions)
+        tab_layout.addWidget(self.auto_tab_scroll, 1)
+        tab_layout.addWidget(self.auto_footer)
+        self.auto_acquisition_changed()
+        self.update_auto_surround_controls()
 
     def _layout_prediction_tab(self):
         layout = QVBoxLayout(self.predict_tab_content)
         layout.setSpacing(8)
         layout.setContentsMargins(10, 10, 10, 10)
         self._layout_prediction_section(layout)
+        self.mser_advanced_button = QPushButton('MSER proposal controls')
+        self.mser_advanced_button.setCheckable(True)
+        self.set_button_role(self.mser_advanced_button, 'quiet')
+        self.mser_panel = QWidget()
+        mser_layout = QVBoxLayout(self.mser_panel)
+        mser_layout.setContentsMargins(0, 0, 0, 0)
+        mser_layout.setSpacing(6)
+        self._layout_mser_section(mser_layout)
+        mser_actions = QHBoxLayout()
+        mser_actions.addWidget(self.segment_button, 1)
+        mser_actions.addWidget(self.reset_segment_button)
+        mser_layout.addLayout(mser_actions)
+        self.mser_panel.hide()
+        self.mser_advanced_button.toggled.connect(self.mser_panel.setVisible)
+        layout.addWidget(self.mser_advanced_button)
+        layout.addWidget(self.mser_panel)
         layout.addStretch(1)
 
     def _layout_training_tab(self):
@@ -1077,54 +1579,70 @@ class FibreSightGUI(QMainWindow):
 
     def _layout_training_section(self, layout):
         layout.addWidget(self.make_section_label('data'))
-        layout.addWidget(self.make_form_label(
-            'labelled sessions',
-            'folder containing processed sessions for training',
-            self.source_root_line,
-            ))
-        layout.addWidget(self._path_row(self.source_root_line, self.browse_source_root))
-        layout.addWidget(self.make_form_label(
-            'dataset table',
-            'CSV index of labelled images and ROI dicts',
-            self.manifest_line,
-            ))
-        layout.addWidget(self._path_row(self.manifest_line, self.browse_manifest_out))
-        split_form = QFormLayout()
-        split_form.setVerticalSpacing(5)
-        split_form.addRow(
+        data_form = QFormLayout()
+        data_form.setVerticalSpacing(5)
+        data_form.addRow(
+            self.make_form_label(
+                'labelled sessions',
+                'folder containing processed sessions for training',
+                self.source_root_line,
+                ),
+            self._path_row(self.source_root_line, self.browse_source_root),
+            )
+        data_form.addRow(
+            self.make_form_label(
+                'dataset table',
+                'CSV index of labelled images and ROI dicts',
+                self.manifest_line,
+                ),
+            self._path_row(self.manifest_line, self.browse_manifest_out),
+            )
+        data_form.addRow(
             self.make_form_label(
                 'validation split',
                 'fraction used for tuning during training',
                 self.val_fraction_spin,
-                ),
+            ),
             self.val_fraction_spin,
             )
-        split_form.addRow(
+        data_form.addRow(
             self.make_form_label(
                 'test split',
                 'held-out fraction used for scoring',
                 self.test_fraction_spin,
-                ),
+            ),
             self.test_fraction_spin,
             )
-        layout.addLayout(split_form)
+        layout.addLayout(data_form)
         data_actions = QGridLayout()
         data_actions.setHorizontalSpacing(6)
         data_actions.setVerticalSpacing(6)
         data_actions.addWidget(self.build_manifest_button, 0, 0)
         data_actions.addWidget(self.inspect_manifest_button, 0, 1)
-        data_actions.addWidget(self.preview_training_button, 1, 0, 1, 2)
         layout.addLayout(data_actions)
 
         layout.addWidget(self.make_section_label('training'))
-        layout.addWidget(self.make_form_label(
-            'training recipe',
-            'YAML settings used for model training',
-            self.config_line,
-            ))
-        layout.addWidget(self._path_row(self.config_line, self.browse_config))
         form = QFormLayout()
         form.setVerticalSpacing(5)
+        form.addRow(
+            self.make_form_label(
+                'training recipe',
+                'YAML settings used for model training',
+                self.config_line,
+                ),
+            self._path_row(self.config_line, self.browse_config),
+            )
+        form.addRow(
+            self.make_form_label(
+                'output folder',
+                'best.pt and latest.pt are saved under output folder/run name',
+                self.train_output_dir_line,
+                ),
+            self._path_row(
+                self.train_output_dir_line,
+                self.browse_training_output_dir,
+                ),
+            )
         form.addRow(
             self.make_form_label(
                 'run name',
@@ -1154,7 +1672,6 @@ class FibreSightGUI(QMainWindow):
         evaluation_actions.setHorizontalSpacing(6)
         evaluation_actions.setVerticalSpacing(6)
         evaluation_actions.addWidget(self.evaluate_model_button, 0, 0)
-        evaluation_actions.addWidget(self.preview_predictions_button, 0, 1)
         layout.addLayout(evaluation_actions)
 
     def _layout_prediction_section(self, layout):
@@ -1208,7 +1725,7 @@ class FibreSightGUI(QMainWindow):
         box.setMaximumBlockCount(3000)
         box.setMinimumHeight(72)
         box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        box.setPlaceholderText('console')
+        box.setPlaceholderText('pipeline messages appear here')
         box.setAccessibleName('activity log')
         return box
 
@@ -1225,7 +1742,8 @@ class FibreSightGUI(QMainWindow):
 
     @staticmethod
     def make_section_label(text):
-        label = QLabel(text)
+        display_text = 'dF/F' if text == 'dF/F' else text.upper()
+        label = QLabel(display_text)
         label.setObjectName('sectionHeading')
         label.setFont(load_gui_font(bold=True))
         return label
@@ -1359,6 +1877,11 @@ class FibreSightGUI(QMainWindow):
                 border-radius: 3px;
                 background: {theme['surface']};
             }}
+            QFrame#autoFooter {{
+                border: none;
+                border-top: 1px solid {theme['border']};
+                background: {theme['surface']};
+            }}
             QFrame#curationHistoryDivider {{
                 border: none;
                 background: {theme['border']};
@@ -1388,13 +1911,8 @@ class FibreSightGUI(QMainWindow):
                 border-radius: 3px;
                 background: {theme['surface']};
             }}
-            QScrollArea, QWidget#tabContent, QWidget#labelTab {{
+            QScrollArea, QWidget#tabContent, QWidget#autoTab {{
                 border: none;
-                background: {theme['surface']};
-            }}
-            QFrame#labelActionBar {{
-                border: none;
-                border-top: 1px solid {theme['border']};
                 background: {theme['surface']};
             }}
             QTabWidget::pane {{
@@ -1439,9 +1957,6 @@ class FibreSightGUI(QMainWindow):
                 border-bottom: 1px solid {theme['border']};
                 padding: 3px 0 4px 6px;
             }}
-            QWidget#labelTab QLabel#sectionHeading {{
-                background: {theme['surface_alt']};
-            }}
             QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {{
                 border: 1px solid {theme['border']};
                 border-radius: 2px;
@@ -1464,6 +1979,18 @@ class FibreSightGUI(QMainWindow):
                 border-color: {theme['border']};
                 background: {theme['surface_alt']};
                 color: {theme['disabled']};
+            }}
+            QProgressBar {{
+                border: 1px solid {theme['border']};
+                border-radius: 2px;
+                background: {theme['surface_alt']};
+                min-height: 18px;
+                max-height: 18px;
+                text-align: center;
+                color: {theme['text']};
+            }}
+            QProgressBar::chunk {{
+                background: {theme['border_strong']};
             }}
             QCheckBox {{
                 spacing: 6px;
@@ -1658,6 +2185,7 @@ class FibreSightGUI(QMainWindow):
         self.dark_mode = bool(state)
         self._apply_palette_and_style()
         self.plot_image(preserve_view=True)
+        self.draw_trace_inspector()
 
     def set_interface_font_size(self, point_size):
         text_widget_types = (
@@ -1690,6 +2218,7 @@ class FibreSightGUI(QMainWindow):
         self.settings.setValue('interface/font_size', point_size)
         self.settings.sync()
         self.plot_image(preserve_view=True)
+        self.draw_trace_inspector()
         self._controls_split_positions.clear()
         self.controls_split_timer.start(0)
         self.schedule_curation_layout()
@@ -1931,7 +2460,7 @@ class FibreSightGUI(QMainWindow):
             if item.column() == 1 and item.data(Qt.UserRole) is not None
             }
         if rebuild or table_selected != self.selected:
-            # Qt keeps a private Shift-selection anchor beyond the current index
+            # qt keeps a private shift-selection anchor beyond the current index
             self.roi_table.setCurrentItem(None)
             self.roi_table.clearSelection()
             for row, roi_id in enumerate(roi_ids):
@@ -1967,8 +2496,20 @@ class FibreSightGUI(QMainWindow):
             if item.column() == 1 and item.data(Qt.UserRole) is not None
             }
         self.selected = selected
+        self.sync_trace_roi_selection()
         self.plot_image(preserve_view=True)
         self.refresh_status()
+
+    def sync_trace_roi_selection(self):
+        if (
+                self.tabs.currentWidget() is self.auto_tab
+                and self.trace_cache is not None
+                and self.selected
+                ):
+            trace_index = self.trace_roi_combo.findData(min(self.selected))
+            if trace_index >= 0:
+                self.trace_roi_combo.setCurrentIndex(trace_index)
+                self.activity_tabs.setCurrentIndex(0)
 
     def centre_roi_from_table(self, row, _column):
         item = self.roi_table.item(row, 1)
@@ -1987,9 +2528,544 @@ class FibreSightGUI(QMainWindow):
         self.refresh_status(f'centred ROI {roi_id}')
 
 
+    #%% automatic recording workflow
+    def browse_auto_tiff_dir(self):
+        self._browse_auto_directory(self.auto_tiff_dir_line, 'select TIFF folder')
+
+    def browse_auto_control_dir(self):
+        self._browse_auto_directory(
+            self.auto_control_dir_line,
+            'select control TIFF folder',
+            )
+
+    def browse_auto_output_dir(self):
+        self._browse_auto_directory(
+            self.auto_output_dir_line,
+            'select destination folder',
+            )
+
+    def _browse_auto_directory(self, line_edit, title):
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            title,
+            line_edit.text().strip() or str(Path.home()),
+            )
+        if selected:
+            line_edit.setText(selected)
+
+    def browse_auto_checkpoint(self):
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            'select segmentation model',
+            self.auto_checkpoint_line.text().strip() or str(PACKAGE_ROOT),
+            'PyTorch checkpoints (*.pt *.pth);;All files (*)',
+            )
+        if selected:
+            self.auto_checkpoint_line.setText(selected)
+
+    def auto_acquisition_changed(self, _index=None):
+        separate = not bool(self.auto_acquisition_combo.currentData())
+        self.auto_control_dir_label.setVisible(separate)
+        self.auto_control_dir_row.setVisible(separate)
+        self.auto_signal_channel_combo.setEnabled(not separate)
+        self.auto_control_channel_combo.setEnabled(not separate)
+
+    def update_auto_surround_controls(self, _method=None):
+        fixed = self.auto_surround_method_combo.currentText() == 'fixed'
+        self.auto_surround_outer_label.setVisible(fixed)
+        self.auto_surround_outer_spin.setVisible(fixed)
+        self.auto_surround_min_label.setVisible(not fixed)
+        self.auto_surround_min_spin.setVisible(not fixed)
+
+    def auto_session_config(self):
+        signal_text = self.auto_tiff_dir_line.text().strip()
+        signal_dir = Path(signal_text)
+        if not signal_text or not signal_dir.is_dir():
+            raise ValueError('select a TIFF folder')
+        signal_paths = natural_tiff_paths(signal_dir)
+        if not signal_paths:
+            raise ValueError(f'no TIFF files found in {signal_dir}')
+
+        multiplexed = bool(self.auto_acquisition_combo.currentData())
+        signal_channel = int(self.auto_signal_channel_combo.currentText())
+        control_channel = int(self.auto_control_channel_combo.currentText())
+        if multiplexed and signal_channel == control_channel:
+            raise ValueError('signal and control channels must be different')
+        control_paths = []
+        if not multiplexed:
+            control_text = self.auto_control_dir_line.text().strip()
+            control_dir = Path(control_text)
+            if not control_text or not control_dir.is_dir():
+                raise ValueError('select the control TIFF folder')
+            control_paths = natural_tiff_paths(control_dir)
+            if len(control_paths) != len(signal_paths):
+                raise ValueError(
+                    'signal and control TIFF folders contain different file counts')
+
+        destination_text = self.auto_output_dir_line.text().strip()
+        destination = Path(destination_text)
+        if not destination_text or not destination.is_dir():
+            raise ValueError('select an existing destination folder')
+        session_name = self.auto_session_line.text().strip()
+        if not session_name or Path(session_name).name != session_name:
+            raise ValueError('session name must be one file name')
+        checkpoint_text = self.auto_checkpoint_line.text().strip()
+        checkpoint = Path(checkpoint_text)
+        if not checkpoint_text or not checkpoint.is_file():
+            raise ValueError('select a segmentation model')
+        low = float(self.auto_reference_low_spin.value())
+        high = float(self.auto_reference_high_spin.value())
+        if low >= high:
+            raise ValueError('reference percentiles must satisfy lower < upper')
+
+        signal_records = fingerprint_paths(signal_paths)
+        control_records = fingerprint_paths(control_paths)
+        checkpoint_record = fingerprint_paths([checkpoint])[0]
+        proposal_run = self.auto_proposal_run_line.text().strip()
+        roi_run = self.auto_roi_source_combo.currentText().strip()
+        fluorescence_run = self.auto_fluorescence_run_line.text().strip()
+        dff_run = self.auto_dff_run_line.text().strip()
+        if not all((proposal_run, roi_run, fluorescence_run, dff_run)):
+            raise ValueError('automatic run names cannot be empty')
+
+        return {
+            'schema_version': SESSION_SCHEMA_VERSION,
+            'fibre_sight_version': __version__,
+            'output_path': str((destination / f'{session_name}.nwb').resolve()),
+            'source_files': signal_records + control_records,
+            'signal_files': signal_records,
+            'control_files': control_records,
+            'source': {
+                'multiplexed': multiplexed,
+                'sampling_frequency_hz': float(self.auto_sampling_spin.value()),
+                'signal_channel': signal_channel,
+                'control_channel': control_channel,
+                'signal_label': self.auto_signal_label_line.text().strip(),
+                'control_label': self.auto_control_label_line.text().strip(),
+                'pixel_size_um': (
+                    float(self.auto_pixel_size_spin.value())
+                    if self.auto_pixel_size_spin.value() else
+                    None
+                    ),
+                },
+            'registration': {
+                'model': self.auto_registration_model_combo.currentText(),
+                'channel': self.auto_registration_channel_combo.currentText(),
+                },
+            'segmentation': {
+                'run_name': proposal_run,
+                'reference_channel': self.auto_reference_channel_combo.currentText(),
+                'reference_low_percentile': low,
+                'reference_high_percentile': high,
+                'checkpoint_path': str(checkpoint.resolve()),
+                'checkpoint_file': checkpoint_record,
+                'threshold': float(self.auto_threshold_spin.value()),
+                'min_size': int(self.auto_min_size_spin.value()),
+                'tta': self.auto_tta_check.isChecked(),
+                'device': self.auto_device_combo.currentText(),
+                },
+            'extraction': {
+                'run_name': fluorescence_run,
+                'roi_run': roi_run,
+                'surround_method': self.auto_surround_method_combo.currentText(),
+                'surround_inner_px': int(self.auto_surround_inner_spin.value()),
+                'surround_outer_px': int(self.auto_surround_outer_spin.value()),
+                'surround_min_pixels': int(self.auto_surround_min_spin.value()),
+                },
+            'dff': {
+                'run_name': dff_run,
+                'fluorescence_run': fluorescence_run,
+                'statistic': self.auto_statistic_combo.currentText(),
+                'baseline_percentile': float(
+                    self.auto_baseline_percentile_spin.value()),
+                'baseline_window_s': float(self.auto_baseline_window_spin.value()),
+                'surround_coefficient': float(
+                    self.auto_surround_coefficient_spin.value()),
+                'control_correction': self.auto_control_correction_combo.currentData(),
+                },
+            }
+
+    def _remove_auto_partials(self, config):
+        existing = [path for path in partial_paths(config) if path.exists()]
+        if not existing:
+            return True
+        names = '\n'.join(path.name for path in existing)
+        answer = QMessageBox.question(
+            self,
+            'Interrupted automatic stage',
+            f'Remove the incomplete stage file before restarting?\n\n{names}',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+            )
+        if answer != QMessageBox.Yes:
+            return False
+        for path in existing:
+            path.unlink()
+            self.print_log(f'removed incomplete stage file: {path}')
+        return True
+
+    def start_auto_session(self):
+        try:
+            config = self.auto_session_config()
+        except Exception as exc:
+            self.print_log(str(exc))
+            self.refresh_status('automatic session configuration failed')
+            return
+
+        output_path = Path(config['output_path'])
+        log_path = output_path.with_suffix('.fibresight.jsonl')
+        resuming = (
+            self.auto_log_path is not None
+            and self.auto_log_path.resolve() == log_path.resolve()
+            )
+        if not resuming:
+            if log_path.exists():
+                self.print_log(f'session log already exists: {log_path}')
+                self.refresh_status('open the existing session log to resume')
+                return
+            if output_path.exists():
+                self.print_log(f'NWB output already exists: {output_path}')
+                self.refresh_status('automatic output already exists')
+                return
+        else:
+            previous = latest_session_config(log_path)
+            if previous != config:
+                self.print_log(
+                    'automatic settings changed; reload the session log to restore them')
+                self.refresh_status('automatic settings changed')
+                return
+
+        if not self._remove_auto_partials(config):
+            return
+        append_session_event(log_path, {'event': 'configured', 'config': config})
+        self.auto_log_path = log_path
+        self.auto_loaded_config = config
+        started = self.start_process(
+            'automatic session',
+            'gui_worker',
+            [str(log_path)],
+            )
+        if started:
+            self.trace_cache = None
+            self.trace_xlim = None
+            self.auto_output_buffer = ''
+            self.trace_run_combo.clear()
+            self.trace_roi_combo.clear()
+            self.auto_state_label.setText('automatic session running')
+            self.auto_progress.setRange(0, 4)
+            self.auto_progress.setValue(0)
+            self.auto_stop_button.show()
+            self.right_stack.hide()
+            self.activity_tabs.setCurrentIndex(1)
+
+    def choose_auto_session_log(self):
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            'open automatic session log',
+            self.auto_output_dir_line.text().strip() or str(OUTPUT_ROOT),
+            'FibreSight session logs (*.fibresight.jsonl);;JSON Lines (*.jsonl)',
+            )
+        if selected:
+            self.load_auto_session_log(selected)
+
+    def load_auto_session_log(self, log_path):
+        log_path = Path(log_path)
+        try:
+            config = latest_session_config(log_path)
+        except Exception as exc:
+            self.print_log(f'failed to load automatic session: {exc}')
+            return
+        self.auto_log_path = log_path
+        self.auto_loaded_config = config
+        self.populate_auto_config(config)
+        states = session_stage_states(log_path)
+        completed = [
+            stage for stage in ('preprocessing', 'segmentation', 'extraction', 'dff')
+            if states.get(stage) in {'stage_completed', 'stage_skipped'}
+            ]
+        state_text = 'ready to resume'
+        if completed:
+            state_text = f'completed: {", ".join(completed)}'
+        self.auto_state_label.setText(state_text)
+        self.trace_cache = None
+        self.trace_xlim = None
+        self.trace_run_combo.clear()
+        self.trace_roi_combo.clear()
+        self.right_stack.hide()
+        self.activity_tabs.setCurrentIndex(1)
+        output_path = Path(config['output_path'])
+        if output_path.exists():
+            self.load_nwb_recording(output_path)
+            if self.trace_cache is not None:
+                self.right_stack.setCurrentIndex(0)
+                self.right_stack.show()
+                self.activity_tabs.setCurrentIndex(0)
+                self.controls_tab_changed(self.tabs.currentIndex())
+        self.print_log(f'loaded automatic session: {log_path}')
+        if self.trace_cache is not None:
+            total = max(
+                sum(self.activity_splitter.sizes()),
+                self.activity_splitter.height(),
+                400,
+                )
+            self.activity_splitter.setSizes([
+                int(total * 2 / 3),
+                int(total / 3),
+                ])
+        self.refresh_status('automatic session ready to resume')
+
+    def populate_auto_config(self, config):
+        source = config['source']
+        signal_files = config['signal_files']
+        control_files = config['control_files']
+        if signal_files:
+            self.auto_tiff_dir_line.setText(str(Path(signal_files[0]['path']).parent))
+        if control_files:
+            self.auto_control_dir_line.setText(str(Path(control_files[0]['path']).parent))
+        self.auto_acquisition_combo.setCurrentIndex(0 if source['multiplexed'] else 1)
+        self.auto_output_dir_line.setText(str(Path(config['output_path']).parent))
+        self.auto_session_line.setText(Path(config['output_path']).stem)
+        self.auto_sampling_spin.setValue(source['sampling_frequency_hz'])
+        self.auto_signal_channel_combo.setCurrentText(str(source['signal_channel']))
+        self.auto_control_channel_combo.setCurrentText(str(source['control_channel']))
+        self.auto_signal_label_line.setText(source['signal_label'])
+        self.auto_control_label_line.setText(source['control_label'])
+        self.auto_pixel_size_spin.setValue(source['pixel_size_um'] or 0)
+
+        registration = config['registration']
+        self.auto_registration_model_combo.setCurrentText(registration['model'])
+        self.auto_registration_channel_combo.setCurrentText(registration['channel'])
+        segmentation = config['segmentation']
+        self.auto_reference_channel_combo.setCurrentText(
+            segmentation['reference_channel'])
+        self.auto_reference_low_spin.setValue(
+            segmentation['reference_low_percentile'])
+        self.auto_reference_high_spin.setValue(
+            segmentation['reference_high_percentile'])
+        self.auto_checkpoint_line.setText(segmentation['checkpoint_path'])
+        self.auto_threshold_spin.setValue(segmentation['threshold'])
+        self.auto_min_size_spin.setValue(segmentation['min_size'])
+        self.auto_tta_check.setChecked(segmentation['tta'])
+        self.auto_device_combo.setCurrentText(segmentation['device'])
+        self.auto_proposal_run_line.setText(segmentation['run_name'])
+
+        extraction = config['extraction']
+        self.auto_surround_method_combo.setCurrentText(
+            extraction['surround_method'])
+        self.auto_surround_inner_spin.setValue(extraction['surround_inner_px'])
+        self.auto_surround_outer_spin.setValue(extraction['surround_outer_px'])
+        self.auto_surround_min_spin.setValue(extraction['surround_min_pixels'])
+        self.auto_roi_source_combo.setCurrentText(extraction['roi_run'])
+        self.auto_fluorescence_run_line.setText(extraction['run_name'])
+
+        dff = config['dff']
+        self.auto_dff_run_line.setText(dff['run_name'])
+        self.auto_statistic_combo.setCurrentText(dff['statistic'])
+        self.auto_baseline_percentile_spin.setValue(dff['baseline_percentile'])
+        self.auto_baseline_window_spin.setValue(dff['baseline_window_s'])
+        self.auto_surround_coefficient_spin.setValue(dff['surround_coefficient'])
+        correction_index = self.auto_control_correction_combo.findData(
+            dff['control_correction'])
+        self.auto_control_correction_combo.setCurrentIndex(correction_index)
+
+    def load_auto_result(self):
+        if self.auto_loaded_config is None:
+            return
+        nwb_path = Path(self.auto_loaded_config['output_path'])
+        if not nwb_path.exists():
+            return
+        self.load_nwb_recording(nwb_path)
+        target_run = self.auto_loaded_config['dff']['run_name']
+        target_index = self.trace_run_combo.findData(target_run)
+        if target_index >= 0:
+            self.trace_run_combo.setCurrentIndex(target_index)
+        self.right_stack.setCurrentIndex(0)
+        if self.tabs.currentWidget() is self.auto_tab:
+            self.right_stack.show()
+            self.activity_tabs.setCurrentIndex(0)
+            self.controls_tab_changed(self.tabs.currentIndex())
+        total = max(
+            sum(self.activity_splitter.sizes()),
+            self.activity_splitter.height(),
+            400,
+            )
+        self.activity_splitter.setSizes([int(total * 2 / 3), int(total / 3)])
+
+    def refresh_trace_runs(self):
+        blocker = QSignalBlocker(self.trace_run_combo)
+        self.trace_run_combo.clear()
+        if self.nwb_path is not None:
+            for run in list_dff_runs(self.nwb_path):
+                self.trace_run_combo.addItem(run['run_name'], run['run_name'])
+        del blocker
+        if self.trace_run_combo.count():
+            self.trace_run_combo.setCurrentIndex(0)
+            self.load_trace_run()
+        else:
+            self.trace_cache = None
+            self.trace_roi_combo.clear()
+            self.draw_trace_inspector()
+
+    def load_trace_run(self, _index=None):
+        run_name = self.trace_run_combo.currentData()
+        if self.nwb_path is None or not run_name:
+            self.trace_cache = None
+            self.draw_trace_inspector()
+            return
+        dff = load_dff_run(self.nwb_path, run_name)
+        fluorescence = load_fluorescence_run(
+            self.nwb_path,
+            dff['fluorescence_run'],
+            )
+        with NWBHDF5IO(self.nwb_path, 'r') as io:
+            nwbfile = io.read()
+            container = nwbfile.processing['dff'][run_name]
+            timestamps = np.asarray(
+                container.roi_response_series['signal_roi_dff'].timestamps,
+                dtype=float,
+                )
+            analysis_valid = np.asarray(
+                nwbfile.processing['quality_control']['registration_qc'][
+                    'analysis_valid'],
+                dtype=bool,
+                )
+            metadata = nwbfile.processing['preprocessing']['recording_metadata']
+            def metadata_text(name, fallback):
+                if name not in metadata.colnames:
+                    return fallback
+                value = metadata[name][0]
+                return value.decode() if isinstance(value, bytes) else str(value)
+
+            labels = {
+                'signal': metadata_text('signal_label', 'signal'),
+                'control': metadata_text('control_label', 'control'),
+                }
+        self.trace_cache = {
+            'run_name': run_name,
+            'dff': dff,
+            'fluorescence': fluorescence,
+            'timestamps': timestamps,
+            'analysis_valid': analysis_valid,
+            'labels': labels,
+            }
+        self.trace_signal_check.setText(labels['signal'])
+        self.trace_control_check.setText(labels['control'])
+        self.trace_xlim = None
+        blocker = QSignalBlocker(self.trace_roi_combo)
+        self.trace_roi_combo.clear()
+        for roi_id in dff['roi_ids']:
+            self.trace_roi_combo.addItem(str(int(roi_id)), int(roi_id))
+        del blocker
+        if self.trace_roi_combo.count():
+            self.trace_roi_combo.setCurrentIndex(0)
+        self.draw_trace_inspector()
+
+    def set_activity_view(self, index):
+        self.activity_tabs.setCurrentIndex(index)
+
+    def fit_trace(self):
+        self.trace_xlim = None
+        self.draw_trace_inspector()
+
+    def zoom_trace(self, factor):
+        if self.trace_cache is None or not self.trace_figure.axes:
+            return
+        axis = self.trace_figure.axes[0]
+        x0, x1 = axis.get_xlim()
+        centre = (x0 + x1) / 2
+        half_width = (x1 - x0) / (2 * factor)
+        timestamps = self.trace_cache['timestamps']
+        lower = float(timestamps[0])
+        upper = float(timestamps[-1])
+        if upper <= lower:
+            return
+        half_width = min(half_width, (upper - lower) / 2)
+        centre = float(np.clip(centre, lower + half_width, upper - half_width))
+        self.trace_xlim = (centre - half_width, centre + half_width)
+        axis.set_xlim(*self.trace_xlim)
+        self.trace_canvas.draw_idle()
+
+    def trace_scroll(self, event):
+        if event.inaxes is None or event.button not in ('up', 'down'):
+            return
+        self.zoom_trace(1.5 if event.button == 'up' else 1 / 1.5)
+
+    def draw_trace_inspector(self, _index=None):
+        self.trace_figure.clear()
+        if self.trace_cache is None or self.trace_roi_combo.currentData() is None:
+            axis = self.trace_figure.add_subplot(111)
+            axis.axis('off')
+            axis.text(
+                0.5,
+                0.5,
+                'no dF/F run',
+                ha='center',
+                va='center',
+                color=self._theme()['muted'],
+                )
+            self.trace_canvas.draw_idle()
+            return
+
+        cache = self.trace_cache
+        roi_id = int(self.trace_roi_combo.currentData())
+        roi_ids = np.asarray(cache['dff']['roi_ids'], dtype=int)
+        roi_index = int(np.flatnonzero(roi_ids == roi_id)[0])
+        timestamps = cache['timestamps']
+        analysis_valid = cache['analysis_valid']
+        dff = cache['dff']['traces']
+        colours = self._theme()
+
+        axis = self.trace_figure.add_subplot(111)
+        labels = cache.get('labels', {'signal': 'signal', 'control': 'control'})
+        if self.trace_signal_check.isChecked():
+            signal = dff['signal_surround_corrected_dff'][:, roi_index].copy()
+            signal[~analysis_valid] = np.nan
+            axis.plot(
+                timestamps,
+                signal,
+                color='#D55E00',
+                linewidth=0.9,
+                label=labels['signal'],
+                )
+        if self.trace_control_check.isChecked():
+            control = dff['control_surround_corrected_dff'][:, roi_index].copy()
+            control[~analysis_valid] = np.nan
+            axis.plot(
+                timestamps,
+                control,
+                color='#0072B2',
+                linewidth=0.9,
+                label=labels['control'],
+                )
+        axis.set_ylabel('dF/F')
+        axis.set_xlabel('time (s)')
+        axis.set_title(f'ROI {roi_id} dF/F')
+        axis.set_facecolor(colours['canvas'])
+        axis.tick_params(colors=colours['text'])
+        axis.xaxis.label.set_color(colours['text'])
+        axis.yaxis.label.set_color(colours['text'])
+        axis.title.set_color(colours['text'])
+        axis.grid(axis='y', color=colours['border'], linewidth=0.6)
+        axis.spines[['top', 'right']].set_visible(False)
+        axis.spines['left'].set_color(colours['border'])
+        axis.spines['bottom'].set_color(colours['border'])
+        if axis.lines:
+            axis.legend(frameon=False, fontsize=8, labelcolor=colours['text'])
+        if self.trace_xlim is None:
+            axis.set_xlim(float(timestamps[0]), float(timestamps[-1]))
+        else:
+            axis.set_xlim(*self.trace_xlim)
+        self.trace_figure.patch.set_facecolor(colours['canvas'])
+        self.trace_figure.tight_layout(pad=1.3)
+        self.trace_canvas.draw_idle()
+
     #%% browse
     def browse_source_root(self):
-        path = QFileDialog.getExistingDirectory(self, 'select training source root', self.source_root_line.text())
+        path = QFileDialog.getExistingDirectory(
+            self,
+            'select training source root',
+            self.source_root_line.text(),
+            )
         if path:
             self.source_root_line.setText(path)
 
@@ -2012,6 +3088,15 @@ class FibreSightGUI(QMainWindow):
             )
         if path:
             self.config_line.setText(path)
+
+    def browse_training_output_dir(self):
+        path = QFileDialog.getExistingDirectory(
+            self,
+            'select training output folder',
+            self.train_output_dir_line.text().strip() or str(OUTPUT_ROOT),
+            )
+        if path:
+            self.train_output_dir_line.setText(path)
 
     def browse_image(self):
         start_path = self.image_line.text().strip() or str(WORKSPACE_ROOT)
@@ -2036,6 +3121,13 @@ class FibreSightGUI(QMainWindow):
             self.checkpoint_line.setText(path)
 
     #%% training processes
+    def training_checkpoint_path(self):
+        output_dir = resolve_path(
+            self.train_output_dir_line.text().strip(),
+            WORKSPACE_ROOT,
+            )
+        return output_dir / self.run_name_line.text().strip() / 'best.pt'
+
     def build_manifest(self):
         source_root = Path(self.source_root_line.text().strip())
         if not source_root.exists():
@@ -2075,79 +3167,39 @@ class FibreSightGUI(QMainWindow):
             self.print_log(f'failed to write training recipe: {exc}')
             return
 
-        run_name = self.run_name_line.text().strip()
-        checkpoint_path = OUTPUT_ROOT / 'runs' / run_name / 'best.pt'
+        checkpoint_path = self.training_checkpoint_path()
         args = ['--config', str(config_path)]
         if self.start_process('train', 'train_unet', args):
             self.pending_checkpoint_path = checkpoint_path
 
     def evaluate_model(self):
-        model_path = self.checkpoint_line.text().strip()
-        if not model_path:
-            self.print_log('please train or load a model first')
-            return
-        if not Path(model_path).exists():
-            self.print_log(f'trained model does not exist: {model_path}')
-            self.refresh_status('model file missing')
-            return
-        manifest = Path(self.manifest_line.text().strip())
-        if not manifest.exists():
-            self.print_log(f'dataset table does not exist yet: {manifest}')
-            self.refresh_status('dataset table missing')
-            return
-
-        args = [
-            '--manifest', str(manifest),
-            '--checkpoint', model_path,
-            '--split', 'test',
-            '--threshold', str(self.threshold_spin.value()),
-            '--min-size', str(self.min_size_spin.value()),
-            '--tta',
-            '--device', 'auto',
-            ]
-        self.start_process('evaluate', 'evaluate', args)
-
-    def preview_training_labels(self):
-        manifest = Path(self.manifest_line.text().strip())
-        if not manifest.exists():
-            self.print_log(f'dataset table does not exist yet: {manifest}')
-            self.refresh_status('dataset table missing')
-            return
-
-        args = [
-            '--manifest', str(manifest),
-            '--split', 'train',
-            '--n', '6',
-            ]
-        self.start_process('preview labels', 'plot_training_data', args)
-
-    def preview_model_predictions(self):
-        manifest = Path(self.manifest_line.text().strip())
-        model_path_text = self.checkpoint_line.text().strip()
-        if not manifest.exists():
-            self.print_log(f'dataset table does not exist yet: {manifest}')
-            self.refresh_status('dataset table missing')
-            return
-        if not model_path_text:
-            self.print_log('please train or load a model first')
-            self.refresh_status('model missing')
-            return
-        model_path = Path(model_path_text)
+        model_path = self.training_checkpoint_path()
         if not model_path.exists():
             self.print_log(f'trained model does not exist: {model_path}')
             self.refresh_status('model file missing')
             return
+        run_recipe = model_path.parent / 'config.yaml'
+        if not run_recipe.exists():
+            self.print_log(f'training recipe does not exist: {run_recipe}')
+            self.refresh_status('training recipe missing')
+            return
+        manifest = Path(self.manifest_line.text().strip())
+        if not manifest.exists():
+            self.print_log(f'dataset table does not exist yet: {manifest}')
+            self.refresh_status('dataset table missing')
+            return
+        config = load_recipe(run_recipe)
 
         args = [
             '--manifest', str(manifest),
-            '--split', 'test',
             '--checkpoint', str(model_path),
-            '--threshold', str(self.threshold_spin.value()),
-            '--min-size', str(self.min_size_spin.value()),
-            '--n', '4',
+            '--split', 'test',
+            '--threshold', str(config['postprocess']['threshold']),
+            '--min-size', str(config['postprocess']['min_size']),
+            '--tta',
             '--device', 'auto',
             ]
-        self.start_process('preview predictions', 'plot_model_diagnostics', args)
+        self.start_process('evaluate', 'evaluate', args)
 
     def inspect_manifest(self):
         path = Path(self.manifest_line.text().strip())
@@ -2188,10 +3240,12 @@ class FibreSightGUI(QMainWindow):
         # leave the baseline YAML alone whilst trying controls here; save this recipe beside the run
         config['data']['manifest'] = self.path_for_config(self.manifest_line.text())
         config['train']['run_name'] = run_name
+        output_dir = self.train_output_dir_line.text().strip()
+        if not output_dir:
+            raise ValueError('output folder cannot be empty')
+        config['train']['out_dir'] = self.path_for_config(output_dir)
         config['train']['epochs'] = int(self.epochs_spin.value())
         config['train']['device'] = 'auto'
-        config['postprocess']['threshold'] = float(self.threshold_spin.value())
-        config['postprocess']['min_size'] = int(self.min_size_spin.value())
 
         out_path = OUTPUT_ROOT / 'gui_configs' / f'{run_name}.yaml'
         save_recipe(config, out_path)
@@ -2227,6 +3281,11 @@ class FibreSightGUI(QMainWindow):
             return
 
         self._process_was_stopped = True
+        if self.current_process_name == 'automatic session' and self.auto_log_path:
+            append_session_event(
+                self.auto_log_path,
+                {'event': 'session_cancelled'},
+                )
         self.process.kill()
         self.print_log('process stopped')
 
@@ -2235,6 +3294,32 @@ class FibreSightGUI(QMainWindow):
             return
         text = bytes(self.process.readAllStandardOutput()).decode(errors='replace')
         self.print_log(text, end='')
+        if self.current_process_name == 'automatic session':
+            self.auto_output_buffer += text
+            lines = self.auto_output_buffer.split('\n')
+            self.auto_output_buffer = lines.pop()
+            stages = {
+                'preprocessing': 1,
+                'segmentation': 2,
+                'extraction': 3,
+                'dF/F': 4,
+            }
+            for line in lines:
+                line = line.strip()
+                stage = next(
+                    (name for name in stages if line.startswith(f'{name}:')),
+                    None,
+                    )
+                if stage is None:
+                    continue
+                self.auto_state_label.setText(line)
+                if (
+                        'completed' in line
+                        or 'existing result retained' in line
+                        ):
+                    self.auto_progress.setValue(stages[stage])
+                else:
+                    self.auto_progress.setValue(stages[stage] - 1)
 
     def read_process_stderr(self):
         if self.process is None:
@@ -2262,6 +3347,26 @@ class FibreSightGUI(QMainWindow):
             self.predictor = None
             self.clear_probability()
             self.print_log(f'trained model ready: {self.pending_checkpoint_path}')
+
+        automatic_succeeded = (
+            self.current_process_name == 'automatic session'
+            and not self._process_was_stopped
+            and exit_code == 0
+            and exit_status == QProcess.NormalExit
+            )
+        if self.current_process_name == 'automatic session':
+            self.auto_progress.setRange(0, 4)
+            self.auto_progress.setValue(4 if automatic_succeeded else 0)
+            self.auto_stop_button.hide()
+            self.auto_state_label.setText(
+                'automatic session complete'
+                if automatic_succeeded else
+                'automatic session interrupted'
+                )
+            if not automatic_succeeded:
+                self.right_stack.hide()
+        if automatic_succeeded:
+            self.load_auto_result()
 
         self.current_process_name = None
         self.pending_checkpoint_path = None
@@ -2371,9 +3476,18 @@ class FibreSightGUI(QMainWindow):
         self.curated_run_line.clear()
         if len(proposal_runs) == 1:
             self.proposal_run_combo.setCurrentIndex(1)
-            return
-
-        self.plot_image()
+        else:
+            self.plot_image()
+        self.refresh_trace_runs()
+        roi_runs = list_roi_runs(nwb_path)
+        roi_blocker = QSignalBlocker(self.auto_roi_source_combo)
+        current_roi_run = self.auto_roi_source_combo.currentText()
+        self.auto_roi_source_combo.clear()
+        for run in roi_runs:
+            self.auto_roi_source_combo.addItem(run['run_name'])
+        if current_roi_run:
+            self.auto_roi_source_combo.setCurrentText(current_roi_run)
+        del roi_blocker
         if proposal_runs:
             self.refresh_status('select an NWB proposal run')
         else:
@@ -2784,6 +3898,8 @@ class FibreSightGUI(QMainWindow):
         else:
             self.selected = {roi_id}
 
+        self.refresh_roi_table()
+        self.sync_trace_roi_selection()
         self.plot_image(preserve_view=True)
         self.refresh_status()
 
@@ -3079,6 +4195,19 @@ class FibreSightGUI(QMainWindow):
             )
 
     def refresh_status(self, message=None):
+        if self.tabs.currentWidget() is self.auto_tab:
+            session_name = self.auto_session_line.text().strip() or 'not named'
+            self.state_label.setText(f'session: {session_name}')
+            self.state_label.setToolTip(
+                str(self.auto_log_path) if self.auto_log_path else 'automatic session'
+                )
+            self.roi_label.setText('')
+            self.model_separator.setText('')
+            self.model_label.setText('')
+            self.update_controls()
+            if message:
+                self.statusBar().showMessage(message, 4000)
+            return
         image_name = self.image_path.name if self.image_path else 'not loaded'
         if self.source_proposal_run:
             image_name = f'{image_name} · {self.source_proposal_run}'
@@ -3091,6 +4220,7 @@ class FibreSightGUI(QMainWindow):
         self.state_label.setToolTip(
             str(self.image_path) if self.image_path else 'no channel-2 image loaded'
             )
+        self.model_separator.setText('·')
         self.roi_label.setText(
             f'{roi_count} ROIs | {selected_count} selected | {fixed_count} fixed'
             )
@@ -3130,12 +4260,14 @@ class FibreSightGUI(QMainWindow):
         return f'model: {name} · {self.predictor.device}'
 
     def update_controls(self):
-        image_text = self.image_line.text().strip()
-        image_path_ready = bool(image_text) and Path(image_text).exists()
         image_ready = self.image_selection_matches_loaded()
         checkpoint_text = self.checkpoint_line.text().strip()
         checkpoint_ready = bool(checkpoint_text) and Path(checkpoint_text).exists()
-        model_ready = checkpoint_ready
+        training_run_dir = self.training_checkpoint_path().parent
+        training_model_ready = (
+            (training_run_dir / 'best.pt').exists()
+            and (training_run_dir / 'config.yaml').exists()
+            )
         manifest_text = self.manifest_line.text().strip()
         manifest_ready = bool(manifest_text) and Path(manifest_text).exists()
         config_text = self.config_line.text().strip()
@@ -3151,22 +4283,26 @@ class FibreSightGUI(QMainWindow):
             )
         has_fixed = bool(self.fixed_ids)
 
+        self.auto_run_button.setEnabled(not process_running)
+        self.auto_resume_button.setEnabled(not process_running)
+        self.auto_stop_button.setEnabled(process_running)
+
         self.build_manifest_button.setEnabled(source_ready and not process_running)
         self.inspect_manifest_button.setEnabled(manifest_ready and not process_running)
         self.train_model_button.setEnabled(
             source_ready
             and config_ready
+            and bool(self.train_output_dir_line.text().strip())
             and bool(self.run_name_line.text().strip())
             and not process_running
             )
-        self.evaluate_model_button.setEnabled(manifest_ready and model_ready and not process_running)
-        self.preview_training_button.setEnabled(manifest_ready and not process_running)
-        self.preview_predictions_button.setEnabled(manifest_ready and model_ready and not process_running)
+        self.evaluate_model_button.setEnabled(
+            manifest_ready and training_model_ready and not process_running)
         self.stop_process_button.setEnabled(process_running)
         self.stop_process_button.setVisible(process_running)
 
         self.predict_button.setEnabled(
-            image_path_ready and checkpoint_ready and not process_running
+            image_ready and checkpoint_ready and not process_running
             )
         probability_ready = self.probability is not None
         self.rebuild_rois_button.setEnabled(
