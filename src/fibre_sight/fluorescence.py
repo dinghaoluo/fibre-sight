@@ -1,5 +1,6 @@
 '''
 Created on 19 August 2026
+Modified on 22 August 2026 to use piecewise per-pixel validity
 
 extract ROI and surrounding fluorescence from registered NWB movies
 
@@ -26,6 +27,7 @@ from .nwb_segmentation import (
     _segmentation_runs,
     load_roi_run,
     )
+from .preprocessing import registration_valid_mask
 
 
 #%% defaults
@@ -96,17 +98,20 @@ def _roi_and_surround_coordinates(
     return area_coordinates
 
 
-def _measure_pixels(frames, valid_bounds, ypix, xpix):
+def _measure_pixels(frames, valid_bounds, ypix, xpix, valid_masks=None):
     measurements = np.full((len(frames), len(STATISTICS)), np.nan, dtype=np.float32)
     if len(ypix) == 0:
         return measurements
 
-    valid_pixels = (
-        (ypix[None, :] >= valid_bounds[:, 0, None])
-        & (ypix[None, :] < valid_bounds[:, 1, None])
-        & (xpix[None, :] >= valid_bounds[:, 2, None])
-        & (xpix[None, :] < valid_bounds[:, 3, None])
-        )
+    if valid_masks is None:
+        valid_pixels = (
+            (ypix[None, :] >= valid_bounds[:, 0, None])
+            & (ypix[None, :] < valid_bounds[:, 1, None])
+            & (xpix[None, :] >= valid_bounds[:, 2, None])
+            & (xpix[None, :] < valid_bounds[:, 3, None])
+            )
+    else:
+        valid_pixels = valid_masks[:, ypix, xpix]
     valid_pixel_count = np.sum(valid_pixels, axis=1)
     measurements[:, 3] = valid_pixel_count / len(ypix)
     frames_with_valid_pixels = valid_pixel_count > 0
@@ -127,6 +132,104 @@ def _measure_pixels(frames, valid_bounds, ypix, xpix):
     return measurements
 
 
+def _read_text(value):
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def _registration_valid_masks(preprocessing, frame_indices, channel, shape):
+    bounds = preprocessing['registered_valid_bounds']
+    piecewise_table = (
+        preprocessing['piecewise_registration']
+        if 'piecewise_registration' in preprocessing.data_interfaces else None
+        )
+    registration_table = (
+        preprocessing['registration_model']
+        if 'registration_model' in preprocessing.data_interfaces else None
+        )
+    registration_channel = 'control'
+    if (
+            registration_table is not None
+            and 'registration_channel' in registration_table.colnames
+            ):
+        registration_channel = _read_text(
+            registration_table['registration_channel'][0])
+    signal_to_control_offset = (0, 0)
+    if 'channel_alignment' in preprocessing.data_interfaces:
+        alignment = preprocessing['channel_alignment']
+        signal_to_control_offset = (
+            alignment['dy_px'][0],
+            alignment['dx_px'][0],
+            )
+    rigid_translation = (
+        preprocessing['rigid_translation'].data
+        if 'rigid_translation' in preprocessing.data_interfaces else None
+        )
+    coefficients = (
+        preprocessing['piecewise_spline_coefficients'].data
+        if 'piecewise_spline_coefficients' in preprocessing.data_interfaces else None
+        )
+    grid = (
+        preprocessing['piecewise_spline_grid']
+        if 'piecewise_spline_grid' in preprocessing.data_interfaces else None
+        )
+    control_y = (
+        np.unique(np.asarray(grid['y_px'])) if grid is not None else None)
+    control_x = (
+        np.unique(np.asarray(grid['x_px'])) if grid is not None else None)
+    if control_y is not None and len(control_y) > 1:
+        inferred_tile_size = np.diff(control_y)[0]
+    else:
+        inferred_tile_size = None
+
+    models_used = [
+        'rigid' if piecewise_table is None else _read_text(
+            piecewise_table['model_used'][frame_i])
+        for frame_i in frame_indices
+        ]
+    if 'piecewise_rigid' not in models_used:
+        return None
+
+    masks = np.empty((len(frame_indices), *shape), dtype=bool)
+    for mask_i, frame_i in enumerate(frame_indices):
+        valid_bounds = [
+            bounds[f'{channel}_{coordinate}'][frame_i]
+            for coordinate in ('y0', 'y1', 'x0', 'x1')
+            ]
+        model_used = models_used[mask_i]
+        kwargs = {}
+        if model_used == 'piecewise_rigid':
+            if coefficients is None or grid is None:
+                raise ValueError(
+                    'piecewise registration is missing spline validity metadata')
+            tile_size = (
+                piecewise_table['tile_size_px'][frame_i]
+                if 'tile_size_px' in piecewise_table.colnames
+                else inferred_tile_size
+                )
+            kwargs = {
+                'registration_channel': registration_channel,
+                'signal_to_control_offset': signal_to_control_offset,
+                'coefficient_y': coefficients[frame_i][0],
+                'coefficient_x': coefficients[frame_i][1],
+                'piecewise_global_shift': (
+                    piecewise_table['global_shift_y_px'][frame_i],
+                    piecewise_table['global_shift_x_px'][frame_i],
+                    ),
+                'control_y': control_y,
+                'control_x': control_x,
+                'tile_size': tile_size,
+                }
+        masks[mask_i] = registration_valid_mask(
+            shape,
+            model_used,
+            (0, 0) if rigid_translation is None else rigid_translation[frame_i],
+            valid_bounds,
+            channel=channel,
+            **kwargs,
+            )
+    return masks
+
+
 def _extract_traces(nwb_path, roi_dict, area_coordinates):
     roi_count = len(roi_dict)
     with NWBHDF5IO(nwb_path, 'r') as io:
@@ -143,8 +246,8 @@ def _extract_traces(nwb_path, roi_dict, area_coordinates):
             for area in ('roi', 'surround')
             for statistic in STATISTICS
             }
+        bounds = preprocessing['registered_valid_bounds']
 
-        valid_bounds = preprocessing['registered_valid_bounds']
         for batch_start in range(0, frame_count, FRAME_BATCH_SIZE):
             batch_stop = min(batch_start + FRAME_BATCH_SIZE, frame_count)
             for channel in ('signal', 'control'):
@@ -154,16 +257,27 @@ def _extract_traces(nwb_path, roi_dict, area_coordinates):
                         ]
                     ).swapaxes(1, 2)
                 channel_bounds = np.column_stack([
-                    np.asarray(valid_bounds[f'{channel}_{coordinate}'][
-                        batch_start:batch_stop
-                        ])
+                    np.asarray(
+                        bounds[f'{channel}_{coordinate}'][
+                            batch_start:batch_stop])
                     for coordinate in ('y0', 'y1', 'x0', 'x1')
                     ])
+                valid_masks = _registration_valid_masks(
+                    preprocessing,
+                    range(batch_start, batch_stop),
+                    channel,
+                    frames.shape[1:],
+                    )
                 for area in ('roi', 'surround'):
                     for roi_index, (ypix, xpix) in enumerate(
                             area_coordinates[area]):
                         measurements = _measure_pixels(
-                            frames, channel_bounds, ypix, xpix)
+                            frames,
+                            channel_bounds,
+                            ypix,
+                            xpix,
+                            valid_masks=valid_masks,
+                            )
                         for statistic_index, statistic in enumerate(STATISTICS):
                             traces[f'{channel}_{area}_{statistic}'][
                                 batch_start:batch_stop,
@@ -173,10 +287,6 @@ def _extract_traces(nwb_path, roi_dict, area_coordinates):
 
 
 #%% NWB storage
-def _read_text(value):
-    return value.decode() if isinstance(value, bytes) else str(value)
-
-
 def _fluorescence_runs(nwbfile):
     if 'fluorescence' not in nwbfile.processing:
         return {}
@@ -207,22 +317,6 @@ def _check_new_fluorescence_run(nwbfile, run_name):
         raise ValueError('run_name is reserved for fluorescence provenance')
     if run_name in _fluorescence_runs(nwbfile):
         raise ValueError(f'fluorescence run already exists: {run_name}')
-
-
-def _check_registration_for_fluorescence(nwbfile):
-    preprocessing = nwbfile.processing['preprocessing']
-    if 'piecewise_registration' not in preprocessing.data_interfaces:
-        return
-
-    models_used = {
-        _read_text(model)
-        for model in preprocessing['piecewise_registration']['model_used']
-        }
-    if 'piecewise_rigid' in models_used:
-        raise ValueError(
-            'fluorescence extraction is unavailable for piecewise-rigid frames '
-            'because the NWB stores enclosing bounds, not exact valid-pixel masks'
-            )
 
 
 def _fluorescence_module(nwbfile):
@@ -367,7 +461,6 @@ def extract_fluorescence(
     with NWBHDF5IO(nwb_path, 'r') as io:
         nwbfile = io.read()
         _check_new_fluorescence_run(nwbfile, run_name)
-        _check_registration_for_fluorescence(nwbfile)
         if roi_run not in _segmentation_runs(nwbfile):
             raise ValueError(f'ROI run does not exist: {roi_run}')
 

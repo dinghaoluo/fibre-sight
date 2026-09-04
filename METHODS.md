@@ -109,7 +109,7 @@ Three alternative recipes remain beside the selected baseline. Each changed one 
 
 **`ch2_unet_attention.yaml`** added attention gates to the skip connections of the standard `SmallUNet` whilst keeping the 256-pixel crop, base width 24, BCE + Dice loss, and the baseline seed unchanged. The gate projects skip features and the upsampled decoder features into a shared low-dimensional space (half the minimum of skip and gate channels), applies ReLU then a 1×1 convolution to a single-channel sigmoid score, and multiplies that score back onto the skip path before concatenation. The decoder path itself is unmodified; only the skip contribution is gated. In our tests the attention-gated variant performed comparably to the standard U-Net on the same data. The recipe is included for cases where the training data contains more heterogeneous backgrounds and the skip connections might benefit from learned suppression of irrelevant features.
 
-The 256-pixel ungated baseline remained the released model. The comparison stopped with these working trials whilst the labelling and curation loop was still changing. The full [training guide](TRAINING.md) describes each recipe and how to write a new one.
+The 256-pixel ungated baseline remained the released model. The comparison stopped with these working trials whilst the labelling and curation loop was still changing. [How to Train Your Model™](TRAINING.md) describes each recipe and how to write a new one.
 
 ## scope
 
@@ -117,7 +117,7 @@ The checkpoint was trained and tested within one dLight acquisition source. Perc
 
 ## full-movie segmentation reference
 
-Movie preprocessing keeps `processing/preprocessing/registration_references/control_reference` as the two-pass control-channel anchor used for registration. After registration and quality control, it averages every final `analysis_valid` tdTomato frame into `processing/preprocessing/segmentation_references/mean_control_reference`. Each stored frame contributes only within its `registered_valid_bounds`; the mean at an image pixel therefore uses the accepted frames for which that pixel remains valid. The exact paired-frame indices are stored in `processing/preprocessing/segmentation_reference_frames`.
+Movie preprocessing keeps `processing/preprocessing/registration_references/control_reference` as the two-pass control-channel anchor used for registration. After registration and quality control, it averages every final `analysis_valid` frame from the chosen segmentation channel into `processing/preprocessing/segmentation_references/mean_signal_reference` or `mean_control_reference`. Rigid frames use their exact rectangular support; piecewise frames reconstruct the per-pixel support from the stored spline field and channel offset. `registered_valid_bounds` remains as the enclosing rectangle, and the exact paired-frame indices are stored in `processing/preprocessing/segmentation_reference_frames`.
 
 The mean is clipped and rescaled from the 1st to 97th percentile, converted to 8-bit, and stored separately as `processing/preprocessing/segmentation_references/segmentation_reference`. The historical training references also passed through an 8-bit percentile transform before checkpoint inference; they used `p1-p99`. The full-session mean left faint axons too dim at that upper percentile, so `p1-p97` is now the preprocessing default. The checkpoint still applies its saved `p1-p99.7` inference normalisation to the stored 8-bit image.
 

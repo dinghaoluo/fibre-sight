@@ -13,6 +13,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import h5py
 import numpy as np
 from scipy import ndimage as ndi
 import tifffile
@@ -40,6 +41,8 @@ from fibre_sight.preprocessing import (
     read_tiffs,
     refine_tile_field,
     register_pair,
+    registration_valid_mask,
+    _registration_valid_mask_from_h5,
     register_pair_piecewise,
     rolling_axial_similarity,
     select_registration_model,
@@ -199,7 +202,7 @@ class PreprocessingTests(unittest.TestCase):
         image[16, 20], image[16, 75] = 101, 202
         image[48, 20], image[48, 75] = 303, 404
         pages = np.empty((100, *image.shape), dtype=np.int16)
-        pages[0::2] = image
+        pages[0::2] = image * 2
         pages[1::2] = image
         pages[50] = image * 3
         tiff_path = self.root / 'non_square.tif'
@@ -209,6 +212,7 @@ class PreprocessingTests(unittest.TestCase):
         preprocess_recording(
             [tiff_path], output_path, 1, 2, True, 30,
             registration_model='piecewise',
+            segmentation_reference_channel='signal',
             session_start_time=datetime(2026, 8, 19, tzinfo=timezone.utc),
             )
 
@@ -219,7 +223,7 @@ class PreprocessingTests(unittest.TestCase):
             reference = np.asarray(
                 module['registration_references']['control_reference'].data)
             mean_reference = np.asarray(
-                module['segmentation_references']['mean_control_reference'].data)
+                module['segmentation_references']['mean_signal_reference'].data)
             segmentation_reference = np.asarray(
                 module['segmentation_references']['segmentation_reference'].data)
             segmentation_frames = np.asarray(
@@ -236,22 +240,23 @@ class PreprocessingTests(unittest.TestCase):
                 for value in nwbfile.processing['quality_control'][
                     'registration_qc']['reason_code'][:]
                 ])
-            movie = np.asarray(module['registered_control'].data[:]).transpose(0, 2, 1)
+            movie = np.asarray(module['registered_signal'].data[:]).transpose(0, 2, 1)
             bounds = module['registered_valid_bounds']
             expected_total = np.zeros(image.shape, dtype=np.float64)
             expected_count = np.zeros(image.shape, dtype=np.uint32)
-            for frame_i in segmentation_frames:
-                y0 = int(bounds['control_y0'][frame_i])
-                y1 = int(bounds['control_y1'][frame_i])
-                x0 = int(bounds['control_x0'][frame_i])
-                x1 = int(bounds['control_x1'][frame_i])
-                expected_total[y0:y1, x0:x1] += movie[
-                    frame_i, y0:y1, x0:x1]
-                expected_count[y0:y1, x0:x1] += 1
             shift_y, shift_x = module['rigid_translation'].data[0]
             source_hash = module['source_tiffs']['sha256'][0]
             n_grid_points = len(module['piecewise_spline_grid'])
             coefficient_shape = module['piecewise_spline_coefficients'].data.shape
+            registration_channel = module['registration_model'][
+                'registration_channel'][0]
+        with h5py.File(output_path, 'r') as file:
+            bounds = file['processing/preprocessing/registered_valid_bounds']
+            for frame_i in segmentation_frames:
+                valid = _registration_valid_mask_from_h5(
+                    file, frame_i, 'signal', image.shape, bounds)
+                expected_total[valid] += movie[frame_i][valid]
+                expected_count[valid] += 1
 
         self.assertEqual(stored.shape, (96, 64))
         self.assertEqual(reference.shape, (96, 64))
@@ -278,10 +283,12 @@ class PreprocessingTests(unittest.TestCase):
         self.assertEqual(reference_metadata['frame_count'], len(segmentation_frames))
         self.assertEqual(reference_metadata['low_percentile'], 1)
         self.assertEqual(reference_metadata['high_percentile'], 97)
+        self.assertEqual(reference_metadata['source_channel'], 'signal')
         self.assertEqual(reference_metadata['low_value'], low)
         self.assertEqual(reference_metadata['high_value'], high)
         self.assertEqual(len(source_hash), 64)
         self.assertEqual(n_grid_points, coefficient_shape[2] * coefficient_shape[3])
+        self.assertEqual(registration_channel, 'control')
         expected, _ = warp_frame(image, shift_y, shift_x)
         expected = np.nan_to_num(np.rint(expected), nan=0).astype(np.int16)
         np.testing.assert_array_equal(stored.T, expected)
@@ -406,6 +413,21 @@ class PreprocessingTests(unittest.TestCase):
             registered['signal_valid'], registered['control_valid'])
         np.testing.assert_array_equal(
             np.isfinite(registered['control']), registered['control_valid'])
+        reconstructed_valid = registration_valid_mask(
+            reference.shape,
+            'piecewise_rigid',
+            (rigid['shift_y'], rigid['shift_x']),
+            registered['control_bounds'],
+            channel='control',
+            coefficient_y=field['coefficient_y'],
+            coefficient_x=field['coefficient_x'],
+            piecewise_global_shift=(
+                field['global_shift_y'], field['global_shift_x']),
+            control_y=field['control_y'],
+            control_x=field['control_x'],
+            tile_size=field['tile_size'],
+            )
+        np.testing.assert_array_equal(reconstructed_valid, valid)
         self.assertGreater(np.corrcoef(
             reference[valid], registered['control'][valid])[0, 1], 0.98)
 

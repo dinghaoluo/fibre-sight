@@ -2,6 +2,7 @@
 Created on 14 August 2026
 Modified on 18 August 2026
 Modified on 19 August 2026
+Modified on 22 August 2026 to carry piecewise validity into downstream stages
 
 read paired TIFF frames, correct rigid and piecewise movement, and record registration QC
 
@@ -1031,6 +1032,68 @@ def field_coordinates(field, shape, rigid_shift=(0, 0), static_offset=(0, 0)):
     return source_y, source_x, valid, bounds
 
 
+def registration_valid_mask(
+        shape,
+        model_used,
+        rigid_shift,
+        valid_bounds,
+        *,
+        channel,
+        registration_channel='control',
+        signal_to_control_offset=(0, 0),
+        coefficient_y=None,
+        coefficient_x=None,
+        piecewise_global_shift=(0, 0),
+        control_y=None,
+        control_x=None,
+        tile_size=None,
+        ):
+    mask = np.zeros(shape, dtype=bool)
+    if model_used == 'rigid':
+        y0, y1, x0, x1 = map(int, valid_bounds)
+        mask[y0:y1, x0:x1] = True
+        return mask
+    if model_used != 'piecewise_rigid':
+        raise ValueError(f'unknown registration model: {model_used}')
+
+    if any(value is None for value in (
+            coefficient_y, coefficient_x, control_y, control_x, tile_size)):
+        raise ValueError(
+            'piecewise registration is missing spline validity metadata')
+
+    signal_static, control_static = _channel_corrections(
+        0,
+        0,
+        signal_to_control_offset,
+        registration_channel,
+        )
+    static_offset = signal_static if channel == 'signal' else control_static
+    field = {
+        'global_shift_y': piecewise_global_shift[0],
+        'global_shift_x': piecewise_global_shift[1],
+        'coefficient_y': np.asarray(coefficient_y),
+        'coefficient_x': np.asarray(coefficient_x),
+        'control_y': np.asarray(control_y),
+        'control_x': np.asarray(control_x),
+        'tile_size': int(tile_size),
+        }
+    source_y, source_x, valid, _ = field_coordinates(
+        field,
+        shape,
+        rigid_shift=rigid_shift,
+        static_offset=static_offset,
+        )
+    sampled = cv2.remap(
+        np.ones(shape, dtype=np.float32),
+        source_x,
+        source_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=np.nan,
+        )
+    return valid & np.isfinite(sampled)
+
+
 def warp_frame_piecewise(frame, field, rigid_shift=(0, 0), static_offset=(0, 0)):
     source_y, source_x, valid, _ = field_coordinates(
         field, frame.shape, rigid_shift, static_offset)
@@ -1129,7 +1192,7 @@ def _registered_mean(frames, shifts, accepted, shape):
 
 
 def _reference_bounds(shape, shift_y, shift_x):
-    # Lanczos4 samples floor(x)-3 through floor(x)+4
+    # lanczos4 samples floor(x)-3 through floor(x)+4
     y0 = max(0, int(np.ceil(shift_y + 3)))
     y1 = min(shape[0], int(np.ceil(shape[0] - 4 + shift_y)))
     x0 = max(0, int(np.ceil(shift_x + 3)))
@@ -2001,7 +2064,9 @@ def add_quality_control_to_nwb(nwbfile, quality):
         'photometric_control_offset_change': 'absolute frame-to-frame change in control-frame offset',
         'photometric_signal_gain_change': 'absolute frame-to-frame change in signal-frame gain',
         'photometric_signal_offset_change': 'absolute frame-to-frame change in signal-frame offset',
-        'photometric_artifact': 'abrupt photometric change detected between frames retaining spatial correspondence',
+        'photometric_artifact': (
+            'abrupt photometric change detected between frames retaining '
+            'spatial correspondence'),
         'local_reference_fallback': 'local 60 s block used the canonical reference',
         'threshold_calibration': 'frame contributed to the recording-specific QC thresholds',
         'recommended_state': 'accepted, ambiguous, focal_loss or out_of_range',
@@ -2540,6 +2605,7 @@ def _add_recording_tables(
         session_time_source,
         pixel_size_um,
         calibration,
+        registration_channel,
         ):
     metadata = DynamicTable(
         name='recording_metadata',
@@ -2662,6 +2728,7 @@ def _add_recording_tables(
     for name, description in (
             ('requested_model', 'rigid, piecewise or auto'),
             ('selected_model', 'model used for the recording'),
+            ('registration_channel', 'signal or control channel used for motion'),
             ('calibration_frames', 'number of time-balanced calibration frames'),
             ('comparison', 'JSON-encoded candidate metrics, thresholds and decisions'),
             ):
@@ -2670,6 +2737,7 @@ def _add_recording_tables(
     model.add_row(
         requested_model=calibration['requested_model'],
         selected_model=calibration['selected_model'],
+        registration_channel=registration_channel,
         calibration_frames=len(calibration['calibration_indices']),
         comparison=(
             '' if comparison is None else json.dumps(
@@ -2760,6 +2828,7 @@ def _new_preprocessing_file(
         session_time_source,
         pixel_size_um,
         calibration,
+        registration_channel,
         )
 
     with NWBHDF5IO(partial_path, 'w') as io:
@@ -2781,10 +2850,78 @@ def _int16_registered(frame):
     return stored
 
 
+def _h5_text(value):
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def _registration_valid_mask_from_h5(file, frame_i, channel, shape, bounds):
+    preprocessing = file['processing/preprocessing']
+    valid_bounds = [
+        bounds[f'{channel}_{coordinate}'][frame_i]
+        for coordinate in ('y0', 'y1', 'x0', 'x1')
+        ]
+    model_used = 'rigid'
+    if 'piecewise_registration' in preprocessing:
+        model_used = _h5_text(
+            preprocessing['piecewise_registration']['model_used'][frame_i])
+    if model_used != 'piecewise_rigid':
+        return registration_valid_mask(
+            shape,
+            model_used,
+            (0, 0),
+            valid_bounds,
+            channel=channel,
+            )
+
+    registration_channel = 'control'
+    registration_model = preprocessing.get('registration_model')
+    if registration_model is not None and 'registration_channel' in registration_model:
+        registration_channel = _h5_text(
+            registration_model['registration_channel'][0])
+    signal_to_control_offset = (0, 0)
+    channel_alignment = preprocessing.get('channel_alignment')
+    if channel_alignment is not None:
+        signal_to_control_offset = (
+            channel_alignment['dy_px'][0],
+            channel_alignment['dx_px'][0],
+            )
+
+    coefficients = preprocessing['piecewise_spline_coefficients']['data'][frame_i]
+    grid = preprocessing['piecewise_spline_grid']
+    control_y = np.unique(np.asarray(grid['y_px']))
+    control_x = np.unique(np.asarray(grid['x_px']))
+    piecewise_table = preprocessing['piecewise_registration']
+    if 'tile_size_px' in piecewise_table:
+        tile_size = piecewise_table['tile_size_px'][frame_i]
+    else:
+        tile_size = np.diff(control_y)[0]
+    return registration_valid_mask(
+        shape,
+        model_used,
+        preprocessing['rigid_translation']['data'][frame_i],
+        valid_bounds,
+        channel=channel,
+        registration_channel=registration_channel,
+        signal_to_control_offset=signal_to_control_offset,
+        coefficient_y=coefficients[0],
+        coefficient_x=coefficients[1],
+        piecewise_global_shift=(
+            piecewise_table['global_shift_y_px'][frame_i],
+            piecewise_table['global_shift_x_px'][frame_i],
+            ),
+        control_y=control_y,
+        control_x=control_x,
+        tile_size=tile_size,
+        )
+
+
 def _calculate_segmentation_references(
         nwb_path,
         percentiles=SEGMENTATION_REFERENCE_PERCENTILES,
+        channel='control',
         ):
+    if channel not in {'signal', 'control'}:
+        raise ValueError('segmentation reference channel must be signal or control')
     low_percentile, high_percentile = map(float, percentiles)
     if not 0 <= low_percentile < high_percentile <= 100:
         raise ValueError('segmentation percentiles must satisfy 0 <= low < high <= 100')
@@ -2802,17 +2939,31 @@ def _calculate_segmentation_references(
         if not len(frame_indices):
             raise ValueError('no analysis-valid frames remain for segmentation reference')
 
-        movie = file['processing/preprocessing/registered_control/data']
+        movie = file[f'processing/preprocessing/registered_{channel}/data']
         bounds = file['processing/preprocessing/registered_valid_bounds']
         shape = (movie.shape[2], movie.shape[1])
         total = np.zeros(shape, dtype=np.float64)
         count = np.zeros(shape, dtype=np.uint32)
+        piecewise_table = file['processing/preprocessing'].get(
+            'piecewise_registration')
         for frame_i in frame_indices:
-            y0 = int(bounds['control_y0'][frame_i])
-            y1 = int(bounds['control_y1'][frame_i])
-            x0 = int(bounds['control_x0'][frame_i])
-            x1 = int(bounds['control_x1'][frame_i])
             frame = np.asarray(movie[frame_i]).T
+            model_used = 'rigid'
+            if piecewise_table is not None:
+                model_used = _h5_text(
+                    piecewise_table['model_used'][frame_i])
+            if model_used == 'piecewise_rigid':
+                valid = _registration_valid_mask_from_h5(
+                    file, frame_i, channel, shape, bounds)
+                total[valid] += frame[valid]
+                count[valid] += 1
+                continue
+            if model_used != 'rigid':
+                raise ValueError(f'unknown registration model: {model_used}')
+            y0 = int(bounds[f'{channel}_y0'][frame_i])
+            y1 = int(bounds[f'{channel}_y1'][frame_i])
+            x0 = int(bounds[f'{channel}_x0'][frame_i])
+            x1 = int(bounds[f'{channel}_x1'][frame_i])
             total[y0:y1, x0:x1] += frame[y0:y1, x0:x1]
             count[y0:y1, x0:x1] += 1
 
@@ -2835,6 +2986,8 @@ def _calculate_segmentation_references(
     return {
         'mean_image': mean_image,
         'segmentation_image': segmentation_image,
+        'channel': channel,
+        'mean_reference_name': f'mean_{channel}_reference',
         'frame_indices': frame_indices.astype(np.int64),
         'low_percentile': low_percentile,
         'high_percentile': high_percentile,
@@ -2852,28 +3005,29 @@ def _write_segmentation_references(nwb_path, references):
         module.add(Images(
             name='segmentation_references',
             description=(
-                'registered control-channel references used to construct and '
-                'run ROI segmentation'),
+                f'registered {references["channel"]}-channel references used '
+                'to construct and run ROI segmentation'),
             images=[
                 GrayscaleImage(
-                    name='mean_control_reference',
+                    name=references['mean_reference_name'],
                     data=references['mean_image'].T,
                     description=(
                         f'mean of all {len(references["frame_indices"]):,} '
-                        'analysis-valid registered control frames'),
+                        f'analysis-valid registered {references["channel"]} '
+                        'frames'),
                     ),
                 GrayscaleImage(
                     name='segmentation_reference',
                     data=references['segmentation_image'].T,
                     description=(
-                        '8-bit percentile-clipped mean control reference used '
-                        'for ROI inference'),
+                        f'8-bit percentile-clipped mean {references["channel"]} '
+                        'reference used for ROI inference'),
                     ),
                 ],
             ))
         frames = DynamicTable(
             name='segmentation_reference_frames',
-            description='registered frames averaged into the mean control reference',
+            description='registered frames averaged into the mean reference',
             id=np.arange(len(references['frame_indices'])),
             )
         frames.add_column(
@@ -2889,6 +3043,7 @@ def _write_segmentation_references(nwb_path, references):
         columns = {
             'reference_path': 'NWB path of the inference reference',
             'source_reference_path': 'NWB path of the raw mean used as its source',
+            'source_channel': 'registered signal or control channel',
             'frame_count': 'number of analysis-valid registered frames averaged',
             'low_percentile': 'lower percentile used for clipping and rescaling',
             'high_percentile': 'upper percentile used for clipping and rescaling',
@@ -2903,8 +3058,9 @@ def _write_segmentation_references(nwb_path, references):
                 'processing/preprocessing/segmentation_references/'
                 'segmentation_reference'),
             source_reference_path=(
-                'processing/preprocessing/segmentation_references/'
-                'mean_control_reference'),
+                'processing/preprocessing/segmentation_references/' +
+                references['mean_reference_name']),
+            source_channel=references['channel'],
             frame_count=len(references['frame_indices']),
             low_percentile=references['low_percentile'],
             high_percentile=references['high_percentile'],
@@ -2920,7 +3076,8 @@ def _verify_segmentation_references(nwb_path, references):
     with NWBHDF5IO(nwb_path, 'r') as io:
         module = io.read().processing['preprocessing']
         stored_mean = np.asarray(
-            module['segmentation_references']['mean_control_reference'].data).T
+            module['segmentation_references'][
+                references['mean_reference_name']].data).T
         stored_segmentation = np.asarray(
             module['segmentation_references']['segmentation_reference'].data).T
         frame_indices = np.asarray(
@@ -2939,13 +3096,23 @@ def _verify_segmentation_references(nwb_path, references):
     for name in ('low_percentile', 'high_percentile', 'low_value', 'high_value'):
         if float(stored_metadata[name]) != references[name]:
             raise AssertionError(f'stored segmentation reference {name} changed')
+    stored_channel = stored_metadata['source_channel']
+    if isinstance(stored_channel, bytes):
+        stored_channel = stored_channel.decode()
+    if stored_channel != references['channel']:
+        raise AssertionError('stored segmentation reference channel changed')
 
 
 def _append_segmentation_references(
         nwb_path,
         percentiles=SEGMENTATION_REFERENCE_PERCENTILES,
+        channel='control',
         ):
-    references = _calculate_segmentation_references(nwb_path, percentiles)
+    references = _calculate_segmentation_references(
+        nwb_path,
+        channel=channel,
+        percentiles=percentiles,
+        )
     _write_segmentation_references(nwb_path, references)
     _verify_segmentation_references(nwb_path, references)
     return references
@@ -2954,6 +3121,7 @@ def _append_segmentation_references(
 def add_segmentation_references(
         nwb_path,
         percentiles=SEGMENTATION_REFERENCE_PERCENTILES,
+        channel='control',
         ):
     nwb_path = Path(nwb_path)
     partial_path = nwb_path.with_name(
@@ -2961,7 +3129,11 @@ def add_segmentation_references(
     if partial_path.exists():
         raise FileExistsError(f'partial output already exists: {partial_path}')
 
-    references = _calculate_segmentation_references(nwb_path, percentiles)
+    references = _calculate_segmentation_references(
+        nwb_path,
+        channel=channel,
+        percentiles=percentiles,
+        )
     original_size = nwb_path.stat().st_size
     copy_start = perf_counter()
     shutil.copyfile(nwb_path, partial_path)
@@ -3040,6 +3212,7 @@ def _add_full_registration(
             descriptions = {
                 'model_used': 'piecewise_rigid or rigid',
                 'fallback_reason': 'accepted or named field rejection reason',
+                'tile_size_px': 'piecewise spline tile spacing in pixels',
                 'global_shift_y_px': 'field-wide local adjustment along y',
                 'global_shift_x_px': 'field-wide local adjustment along x',
                 'accepted_tile_fraction': 'fraction of tiles retained for the field fit',
@@ -3142,6 +3315,7 @@ def preprocess_recording(
         pixel_size_um=None,
         session_start_time=None,
         segmentation_reference_percentiles=SEGMENTATION_REFERENCE_PERCENTILES,
+        segmentation_reference_channel='control',
         ):
     output_path = Path(output_path)
     partial_path = output_path.with_suffix('.partial.nwb')
@@ -3153,6 +3327,9 @@ def preprocess_recording(
         raise ValueError('registration_model must be rigid, piecewise or auto')
     if registration_channel not in {'signal', 'control'}:
         raise ValueError('registration_channel must be signal or control')
+    if segmentation_reference_channel not in {'signal', 'control'}:
+        raise ValueError(
+            'segmentation_reference_channel must be signal or control')
 
     start = perf_counter()
     recording = index_tiffs(
@@ -3251,6 +3428,8 @@ def preprocess_recording(
             piecewise_results = {
                 'model_used': np.empty(n_frames, dtype='<U16'),
                 'fallback_reason': np.empty(n_frames, dtype='<U24'),
+                'tile_size_px': np.full(
+                    n_frames, tile_reference['tile_size'], dtype=np.int16),
                 'global_shift_y_px': np.empty(n_frames, dtype=np.float32),
                 'global_shift_x_px': np.empty(n_frames, dtype=np.float32),
                 'accepted_tile_fraction': np.empty(n_frames, dtype=np.float32),
@@ -3282,7 +3461,7 @@ def preprocess_recording(
             control_data = file['processing/preprocessing/registered_control/data']
             frame_i = 0
             frame_iter = iter(read_tiffs(recording))
-            # NumPy, SciPy and OpenCV release the GIL here; four workers match the benchmark ceiling
+            # numpy, scipy and opencv release the GIL here; four workers match the benchmark ceiling
             with ThreadPoolExecutor(max_workers=4) as pool:
                 while pairs := list(islice(frame_iter, frame_batch_size)):
                     estimates_batch = list(pool.map(
@@ -3410,7 +3589,8 @@ def preprocess_recording(
             )
         segmentation_references = _append_segmentation_references(
             partial_path,
-            segmentation_reference_percentiles,
+            channel=segmentation_reference_channel,
+            percentiles=segmentation_reference_percentiles,
             )
 
     validation_errors = [str(error) for error in validate(path=partial_path)]
@@ -3433,6 +3613,7 @@ def preprocess_recording(
         'reference_fallback': bool(control_reference_info['reference_fallback']),
         'segmentation_reference_frames': len(
             segmentation_references['frame_indices']),
+        'segmentation_reference_channel': segmentation_references['channel'],
         'segmentation_reference_percentiles': (
             segmentation_references['low_percentile'],
             segmentation_references['high_percentile'],

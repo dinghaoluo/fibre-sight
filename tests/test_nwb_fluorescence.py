@@ -54,7 +54,7 @@ ROI_DICT = {
     }
 
 
-def _preprocessed_nwb(path, registration_models=None):
+def _preprocessed_nwb(path, registration_models=None, complete_piecewise=False):
     height, width = 7, 8
     y, x = np.indices((height, width))
     base = 10 * y + x
@@ -147,7 +147,67 @@ def _preprocessed_nwb(path, registration_models=None):
             description='piecewise_rigid or rigid',
             data=registration_models,
             )
+        if complete_piecewise:
+            piecewise_registration.add_column(
+                name='tile_size_px',
+                description='piecewise spline tile spacing',
+                data=np.full(3, 3, dtype=np.int16),
+                )
+            for name in ('global_shift_y_px', 'global_shift_x_px'):
+                piecewise_registration.add_column(
+                    name=name,
+                    description='piecewise field global shift',
+                    data=np.zeros(3, dtype=np.float32),
+                    )
         module.add(piecewise_registration)
+    if complete_piecewise:
+        module.add(TimeSeries(
+            name='rigid_translation',
+            data=np.zeros((3, 2), dtype=np.float32),
+            unit='pixels',
+            timestamps=paired_frames,
+            ))
+        registration_model = DynamicTable(
+            name='registration_model',
+            description='registration model metadata',
+            id=np.arange(1),
+            )
+        registration_model.add_column(
+            name='registration_channel',
+            description='channel used for motion',
+            data=['control'],
+            )
+        module.add(registration_model)
+        alignment = DynamicTable(
+            name='channel_alignment',
+            description='static signal-to-control translation',
+            id=np.arange(1),
+            )
+        alignment.add_column(name='dy_px', description='y offset', data=[0.0])
+        alignment.add_column(name='dx_px', description='x offset', data=[0.0])
+        module.add(alignment)
+        coefficients = np.zeros((3, 2, 5, 5), dtype=np.float32)
+        module.add(TimeSeries(
+            name='piecewise_spline_coefficients',
+            data=coefficients,
+            unit='pixels',
+            timestamps=paired_frames,
+            ))
+        grid = DynamicTable(
+            name='piecewise_spline_grid',
+            description='piecewise spline control points',
+            )
+        for name in ('y_index', 'x_index', 'y_px', 'x_px'):
+            grid.add_column(name=name, description=name)
+        for y_index, y_value in enumerate(np.arange(-3, 12, 3)):
+            for x_index, x_value in enumerate(np.arange(-3, 12, 3)):
+                grid.add_row(
+                    y_index=y_index,
+                    x_index=x_index,
+                    y_px=y_value,
+                    x_px=x_value,
+                    )
+        module.add(grid)
 
     quality_control = nwbfile.create_processing_module(
         name='quality_control',
@@ -288,15 +348,38 @@ class NWBFluorescenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'already exists'):
             extract_fluorescence(self.path, 'extraction', ROI_RUN)
 
-    def test_piecewise_registration_is_rejected(self):
+    def test_incomplete_piecewise_registration_is_rejected(self):
         piecewise_path = self.root / 'piecewise.nwb'
         _preprocessed_nwb(
             piecewise_path,
             registration_models=['rigid', 'piecewise_rigid', 'rigid'],
             )
 
-        with self.assertRaisesRegex(ValueError, 'exact valid-pixel masks'):
+        with self.assertRaisesRegex(ValueError, 'missing spline validity metadata'):
             extract_fluorescence(piecewise_path, 'extraction', ROI_RUN)
+
+    def test_piecewise_registration_uses_exact_valid_pixels(self):
+        piecewise_path = self.root / 'piecewise_complete.nwb'
+        _preprocessed_nwb(
+            piecewise_path,
+            registration_models=['rigid', 'piecewise_rigid', 'rigid'],
+            complete_piecewise=True,
+            )
+
+        result = extract_fluorescence(
+            piecewise_path,
+            'extraction',
+            ROI_RUN,
+            surround_method='fixed',
+            surround_inner_px=0,
+            surround_outer_px=1,
+            )
+        self.assertEqual(result['roi_count'], 2)
+        loaded = load_fluorescence_run(piecewise_path, 'extraction')
+        np.testing.assert_array_equal(
+            loaded['traces']['signal_roi_valid_fraction'],
+            np.ones((3, 2)),
+            )
 
     def test_dff_uses_raw_surround_subtraction_and_excludes_rejected_frames(self):
         extract_fluorescence(
