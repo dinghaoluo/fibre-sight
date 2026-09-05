@@ -1,10 +1,10 @@
 # How to Train Your Model™
 
-The bundled checkpoint covers only our lab's data. It has worked for multiple sensors and animals, but a different indicator, microscope, or labelling convention may need its own model. The training loop, loss experiments, and alternative architectures are all included in the package.
+The bundled checkpoint covers only our lab's data. It has worked for multiple sensors and animals, but a different indicator, microscope, or labelling convention may need its own model. The entire training workflow is included.
 
 ## label sessions
 
-Select a session's `channel-2 image` in the workbench, then open `label` and run `SEGMENT` to generate MSER proposals. Delete, merge, or fix those proposals, then click `export ROIs`. The current workbench cannot draw a missed fibre from scratch; add any missing ROIs in an external editor and import the resulting dictionary before export.
+Select a session's `channel-2 image` in the workbench, then open `segment` and run `SEGMENT` to generate MSER proposals. Delete, merge, or fix those proposals, then click `export ROIs`. The current workbench cannot draw a missed fibre from scratch; add any missing ROIs in an external editor and import the resulting dictionary before export.
 
 Arrange the results so each session directory holds both files:
 
@@ -20,13 +20,13 @@ A few practical notes from our own labelling rounds: dim, out-of-plane processes
 ## build a manifest
 
 ```
-fibre-sight-build-manifest
+build-manifest
 ```
 
 This scans the labelled sessions, writes `workspace/manifests/ch2_manifest.csv`, and prints the number of included sessions, the animals found, the total ROI count, and the split sizes. Splits are assigned at session level with a 15% validation and 15% test fraction by default:
 
 ```
-fibre-sight-build-manifest --val-fraction 0.2 --test-fraction 0.2 --seed 42
+build-manifest --val-fraction 0.2 --test-fraction 0.2 --seed 42
 ```
 
 Use `--no-splits` to write the manifest without splits and assign an animal-held-out split manually in the CSV. `--source-root` and `--out` move the input and output locations.
@@ -69,7 +69,7 @@ Set `train.device` to `mps`, `cuda`, or `cpu` when automatic selection is unsuit
 ## train
 
 ```
-fibre-sight-train --config workspace/my_recipe.yaml
+train --config workspace/my_recipe.yaml
 ```
 
 Each epoch prints training loss, validation loss, and validation Dice, and writes into `workspace/output/runs/<run_name>/`:
@@ -84,7 +84,7 @@ Selection on validation Dice is fixed in the training code, so the saved epoch i
 ## evaluate on the held-out split
 
 ```
-fibre-sight-evaluate \
+evaluate \
   --manifest workspace/manifests/ch2_manifest.csv \
   --checkpoint workspace/output/runs/<run_name>/best.pt \
   --split test \
@@ -99,7 +99,7 @@ Choose the operating point after the weights are fixed, and inspect overlays alo
 ## use the new checkpoint
 
 ```
-fibre-sight-predict \
+predict \
   --image path/to/ref_mat_ch2.npy \
   --checkpoint workspace/output/runs/<run_name>/best.pt \
   --threshold 0.25 \
@@ -155,4 +155,4 @@ All four recipes use the same manifest path and workspace layout. The comparison
 
 Training runs are seeded by `train.seed` in the recipe. The seed controls `numpy` and `torch` random state before model initialisation, so two runs with the same recipe and seed begin with the same initial weights and use the same indexed crop and augmentation sequence. This supports single-variable comparisons (attention gates on vs. off, different loss modes): change one thing in the YAML and keep the seed fixed. Accelerator kernels and differences between software or hardware stacks can still introduce numerical variation.
 
-The saved recipe records `rotation_90` and `noise_sd`. The two flip probabilities and the intensity jitter are fixed in the loader rather than exposed in YAML, so reconstructing the complete augmentation policy also requires the corresponding FibreSight source version.
+The saved recipe records `rotation_90` and `noise_sd`. The loader fixes the two flip probabilities and the intensity jitter; YAML does not expose them, so reconstructing the complete augmentation policy also requires the corresponding FibreSight source version.
