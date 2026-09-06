@@ -4,8 +4,8 @@ build-backend = 'setuptools.build_meta'
 
 [project]
 name = 'fibre-sight'
-version = '0.1.3'
-description = 'Channel-2 axon ROI prediction and curation workbench'
+version = '0.2.0'
+description = 'End-to-end two-photon axon imaging analysis with registration, U-Net ROI segmentation, curation, fluorescence extraction, and dF/F calculation'
 readme = 'README.md'
 license = 'MIT'
 license-files = ['LICENSE']
@@ -22,22 +22,32 @@ dependencies = [
   'matplotlib>=3.7',
   'numpy>=1.24',
   'opencv-python>=4.8',
+  'pandas>=2.0',
+  'pynwb>=4.1',
   'PyQt5>=5.15',
   'PyYAML>=6.0',
   'scikit-image>=0.21',
   'scipy>=1.10',
   'torch>=2.3',
+  'tifffile>=2024.2',
   'tqdm>=4.66',
 ]
 
 [project.gui-scripts]
-fibre-sight = 'fibre_sight.fibre_sight_workbench_gui:main'
+fibre-sight = 'fibre_sight.gui:main'
 
 [project.scripts]
-fibre-sight-build-manifest = 'fibre_sight.build_manifest:main'
-fibre-sight-evaluate = 'fibre_sight.evaluate:main'
-fibre-sight-predict = 'fibre_sight.predict_rois:main'
-fibre-sight-train = 'fibre_sight.train_unet:main'
+auto = 'fibre_sight.gui_worker:main'
+build-manifest = 'fibre_sight.build_manifest:main'
+dff = 'fibre_sight.stage_cli:dff_main'
+evaluate = 'fibre_sight.evaluate:main'
+fluorescence = 'fibre_sight.stage_cli:fluorescence_main'
+list-runs = 'fibre_sight.list_runs:main'
+plot-traces = 'fibre_sight.plot_traces:main'
+predict = 'fibre_sight.predict_rois:main'
+registration = 'fibre_sight.registration_cli:main'
+segment = 'fibre_sight.stage_cli:segment_main'
+train = 'fibre_sight.train_unet:main'
 
 [tool.setuptools]
 package-dir = {'' = 'src'}

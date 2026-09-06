@@ -1,10 +1,10 @@
 # How to Train Your Model™
 
-The bundled checkpoint covers only our lab's data. It has worked for multiple sensors and animals, but a different indicator, microscope, or labelling convention may need its own model. The training loop, loss experiments, and alternative architectures are all included in the package.
+The bundled checkpoint covers only our lab's data. It has worked for multiple sensors and animals, but a different indicator, microscope, or labelling convention may need its own model. The entire training workflow is included.
 
 ## label sessions
 
-Select a session's `channel-2 image` in the workbench, then open `label` and run `SEGMENT` to generate MSER proposals. Delete, merge, or fix those proposals, then click `export ROIs`. The current workbench cannot draw a missed fibre from scratch; add any missing ROIs in an external editor and import the resulting dictionary before export.
+Select a session's `channel-2 image` in the workbench, then open `segment` and run `SEGMENT` to generate MSER proposals. Delete, merge, or fix those proposals, then click `export ROIs`. The current workbench cannot draw a missed fibre from scratch; add any missing ROIs in an external editor and import the resulting dictionary before export.
 
 Arrange the results so each session directory holds both files:
 
@@ -20,13 +20,13 @@ A few practical notes from our own labelling rounds: dim, out-of-plane processes
 ## build a manifest
 
 ```
-fibre-sight-build-manifest
+build-manifest
 ```
 
 This scans the labelled sessions, writes `workspace/manifests/ch2_manifest.csv`, and prints the number of included sessions, the animals found, the total ROI count, and the split sizes. Splits are assigned at session level with a 15% validation and 15% test fraction by default:
 
 ```
-fibre-sight-build-manifest --val-fraction 0.2 --test-fraction 0.2 --seed 11
+build-manifest --val-fraction 0.2 --test-fraction 0.2 --seed 42
 ```
 
 Use `--no-splits` to write the manifest without splits and assign an animal-held-out split manually in the CSV. `--source-root` and `--out` move the input and output locations.
@@ -69,7 +69,7 @@ Set `train.device` to `mps`, `cuda`, or `cpu` when automatic selection is unsuit
 ## train
 
 ```
-fibre-sight-train --config workspace/my_recipe.yaml
+train --config workspace/my_recipe.yaml
 ```
 
 Each epoch prints training loss, validation loss, and validation Dice, and writes into `workspace/output/runs/<run_name>/`:
@@ -84,7 +84,7 @@ Selection on validation Dice is fixed in the training code, so the saved epoch i
 ## evaluate on the held-out split
 
 ```
-fibre-sight-evaluate \
+evaluate \
   --manifest workspace/manifests/ch2_manifest.csv \
   --checkpoint workspace/output/runs/<run_name>/best.pt \
   --split test \
@@ -99,7 +99,7 @@ Choose the operating point after the weights are fixed, and inspect overlays alo
 ## use the new checkpoint
 
 ```
-fibre-sight-predict \
+predict \
   --image path/to/ref_mat_ch2.npy \
   --checkpoint workspace/output/runs/<run_name>/best.pt \
   --threshold 0.25 \
@@ -110,6 +110,51 @@ fibre-sight-predict \
 Add `--no-tta` to disable four-view flip averaging, which is on by default. In the GUI, use `browse` beside the global `trained model` field to point at the new `best.pt` instead of the bundled checkpoint.
 
 A new checkpoint that predicts well enough to seed curation replaces MSER as the proposal route for the next labelling round.
+
+## use the training steps from Python
+
+The manifest, evaluation, and prediction stages can be called from a Python script when they need to sit inside a larger loop. Training itself is currently entered through `train --config`; that command loads the recipe, creates the run directory, and writes `best.pt`, `latest.pt`, the history table, and the training figure.
+
+```python
+from fibre_sight.evaluate import evaluate_sessions, write_results
+from fibre_sight.manifest import (
+    assign_session_splits,
+    read_manifest,
+    scan_source_root,
+    write_manifest,
+    )
+from fibre_sight.predict_rois import predict_roi_dict
+
+# build the same session-level split used by build-manifest
+sessions = scan_source_root('workspace/labelled_sessions')
+sessions = assign_session_splits(sessions, val_fraction=0.15, test_fraction=0.15, seed=42)
+write_manifest(sessions, 'workspace/manifests/ch2_manifest.csv')
+
+# evaluate one split and keep the per-session scores
+test_sessions = read_manifest(
+    'workspace/manifests/ch2_manifest.csv',
+    included_only=True,
+    split='test',
+    )
+results = evaluate_sessions(
+    test_sessions,
+    'workspace/output/runs/my_recipe/best.pt',
+    tta=True,
+    )
+write_results(results, 'workspace/output/test_metrics.csv')
+
+# predict one reference image with the trained checkpoint
+roi_dict, labelled, probability = predict_roi_dict(
+    'path/to/ref_mat_ch2.npy',
+    'workspace/output/runs/my_recipe/best.pt',
+    out_path='workspace/output/predicted_ROI_dict.npy',
+    threshold=0.25,
+    min_size=45,
+    tta=True,
+    )
+```
+
+`scan_source_root`, `assign_session_splits`, and `write_manifest` are the Python form of `build-manifest`; `evaluate_sessions` and `write_results` are the corresponding evaluation calls. `predict_roi_dict` saves the legacy ROI dictionary and also returns the dictionary, labelled components, and probability map for further processing. A `ROIPredictor` can be kept in memory when several images share one checkpoint.
 
 ## alternative architectures
 
@@ -155,4 +200,4 @@ All four recipes use the same manifest path and workspace layout. The comparison
 
 Training runs are seeded by `train.seed` in the recipe. The seed controls `numpy` and `torch` random state before model initialisation, so two runs with the same recipe and seed begin with the same initial weights and use the same indexed crop and augmentation sequence. This supports single-variable comparisons (attention gates on vs. off, different loss modes): change one thing in the YAML and keep the seed fixed. Accelerator kernels and differences between software or hardware stacks can still introduce numerical variation.
 
-The saved recipe records `rotation_90` and `noise_sd`. The two flip probabilities and the intensity jitter are fixed in the loader rather than exposed in YAML, so reconstructing the complete augmentation policy also requires the corresponding FibreSight source version.
+The saved recipe records `rotation_90` and `noise_sd`. The loader fixes the two flip probabilities and the intensity jitter; YAML does not expose them, so reconstructing the complete augmentation policy also requires the corresponding FibreSight source version.

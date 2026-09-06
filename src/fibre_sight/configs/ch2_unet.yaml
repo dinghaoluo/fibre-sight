@@ -1,4 +1,5 @@
 # Created on 9 April 2026
+# Modified on 14 August 2026 to make the training choices explicit
 # baseline 256-pixel crop recipe
 data:
   manifest: manifests/ch2_manifest.csv
@@ -10,7 +11,8 @@ data:
   foreground_fraction: 0.75
   normalise_percentiles: [1, 99.7]
   cache_images: true
-  # 1 August 2026: keep lossless rotations and modest noise as the working baseline.
+  target_mode: foreground
+  # 1 August 2026: keep lossless rotations and modest noise as the working baseline
   augmentation:
     rotation_90: true
     noise_sd: 0.02
@@ -20,8 +22,9 @@ model:
   out_channels: 1
   base_channels: 24
   depth: 4
+  attention_gates: false
 
-# BCE keeps false foreground costly; Dice stops the sparse fibre mask being treated as background.
+# BCE keeps false foreground costly; Dice stops the sparse mask becoming background
 loss:
   mode: bce_dice
   bce_weight: 1.0
@@ -37,11 +40,10 @@ train:
   num_workers: 0
   pin_memory: true
   amp: true
-  seed: 7
+  seed: 42
   device: auto
 
 postprocess:
   threshold: 0.5
   min_size: 30
   max_size:
-

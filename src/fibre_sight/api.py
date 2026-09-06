@@ -3,198 +3,155 @@ Created on 29 April 2026
 
 Modified on 3 June 2026
 Modified on 24 July 2026 to load the bundled channel-2 checkpoint
-model loading and prediction used by the workbench
+Modified on 14 August 2026
+Modified on 20 August 2026
+
+model prediction and immutable NWB analysis stages
 
 @author: Dinghao Luo
 '''
 
 #%% imports
-from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 
-import numpy as np
+from pynwb import NWBHDF5IO
 
-from ._device import resolve_device
-from ._repo import package_path
-from .config import load_config
-from .fibre_segger_params import recommend_fibre_segger_params
+from ._device import get_device
+from ._repo import PACKAGE_ROOT
+from .dff import calculate_dff, list_dff_runs, load_dff_run
+from .fluorescence import (
+    extract_fluorescence,
+    list_fluorescence_runs,
+    load_fluorescence_run,
+    )
+from .list_runs import list_analysis_runs
+from .nwb_segmentation import (
+    _append_roi_run_transactionally,
+    _check_new_run,
+    _checkpoint_sha256,
+    _preferred_reference_path,
+    _read_reference,
+    _segmentation_partial_path,
+    list_roi_runs,
+    load_roi_run,
+    save_curated_rois,
+    )
+from .plot_traces import plot_dff_traces
 from .postprocess import probability_to_roi_dict
-from .predict_rois import load_trained_model, predict_probability
-from .roi_io import save_roi_dict
+from .predict_rois import load_model, predict_probability
+from .preprocessing import add_segmentation_references, preprocess_recording
 
 
-#%% data structures
-@dataclass
-class AxonROIPrediction:
-    roi_dict: dict
-    labelled: np.ndarray
-    probability: np.ndarray
-    fibre_segger_params: dict
-    checkpoint: Path
-    threshold: float
-    min_size: int
-    tta: bool
+#%% defaults
+BUNDLED_CHECKPOINT = PACKAGE_ROOT / 'models' / 'fibre_sight_ch2_v1.pt'
+BUNDLED_THRESHOLD = 0.25
+BUNDLED_MIN_SIZE = 45
 
 
-#%% registry
-def load_model_registry(path=None):
-    if path is None:
-        path = package_path('configs', 'model_registry.yaml')
-    return load_config(path)
-
-
-def get_model_entry(model_name='ch2_v1', registry_path=None, required=True):
-    registry = load_model_registry(registry_path)
-    models = registry.get('models', {})
-    if model_name not in models:
-        if required:
-            raise KeyError(f'model not found in registry: {model_name}')
-        return {}
-    return models[model_name] or {}
-
-
-def get_default_checkpoint(model_name='ch2_v1', registry_path=None):
-    entry = get_model_entry(model_name, registry_path=registry_path)
-    checkpoint = Path(entry['checkpoint'])
-    if checkpoint.is_absolute():
-        return checkpoint
-    return package_path(checkpoint)
-
-
-#%% predictor
-class AxonROIPredictor:
+#%% prediction
+class ROIPredictor:
     def __init__(
             self,
             checkpoint_path=None,
-            model_name='ch2_v1',
-            registry_path=None,
             device='auto',
             threshold=None,
             min_size=None,
             tta=None,
             ):
-        self.model_name = model_name
-        self.registry_path = registry_path
-        self.entry = get_model_entry(
-            model_name,
-            registry_path=registry_path,
-            required=checkpoint_path is None,
+        self.checkpoint_path = (
+            Path(checkpoint_path) if checkpoint_path else BUNDLED_CHECKPOINT
             )
-        self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else get_default_checkpoint(
-            model_name,
-            registry_path=registry_path,
-            )
-        self.device = resolve_device(device)
-        self.model = None
-        self.checkpoint = None
+        self.device = get_device(device)
         self.threshold = threshold
         self.min_size = min_size
-        self.max_size = self.entry.get('max_size', None)
         self.tta = tta
+        self.max_size = None
+        self.model = None
+        self.checkpoint = None
 
     def load(self):
-        if not self.checkpoint_path.exists():
-            raise FileNotFoundError(f'model checkpoint not found: {self.checkpoint_path}')
-        self.model, self.checkpoint = load_trained_model(self.checkpoint_path, self.device)
-        post_cfg = dict(self.checkpoint.get('postprocess_config', {}))
-        # the registry holds the operating point I settled on after tuning;
-        # older checkpoints keep the defaults used during training
+        self.model, self.checkpoint = load_model(self.checkpoint_path, self.device)
+        postprocess = self.checkpoint['postprocess_config']
         if self.threshold is None:
-            self.threshold = float(self.entry.get('threshold', post_cfg.get('threshold', 0.5)))
-        else:
-            self.threshold = float(self.threshold)
+            self.threshold = postprocess['threshold']
         if self.min_size is None:
-            self.min_size = int(self.entry.get('min_size', post_cfg.get('min_size', 30)))
-        else:
-            self.min_size = int(self.min_size)
-        if self.max_size is None:
-            self.max_size = post_cfg.get('max_size', None)
+            self.min_size = postprocess['min_size']
         if self.tta is None:
-            self.tta = bool(self.entry.get('tta', False))
-        else:
-            self.tta = bool(self.tta)
-        return self
+            self.tta = postprocess['tta']
+        self.max_size = postprocess['max_size']
 
     def predict_image(self, image):
         if self.model is None:
             self.load()
 
-        data_cfg = self.checkpoint.get('data_config', {})
         probability = predict_probability(
             image,
             self.model,
             self.device,
-            normalise_percentiles=data_cfg.get('normalise_percentiles', [1, 99.7]),
+            normalise_percentiles=self.checkpoint['data_config']['normalise_percentiles'],
             tta=self.tta,
             )
-        # keep model output in the xpix/ypix dictionary used by the imaging pipeline
         roi_dict, labelled = probability_to_roi_dict(
             probability,
             threshold=self.threshold,
             min_size=self.min_size,
             max_size=self.max_size,
             )
-        params = recommend_fibre_segger_params(image, roi_dict=roi_dict)
-
-        return AxonROIPrediction(
-            roi_dict=roi_dict,
-            labelled=labelled,
-            probability=probability,
-            fibre_segger_params=params,
-            checkpoint=self.checkpoint_path,
-            threshold=self.threshold,
-            min_size=self.min_size,
-            tta=self.tta,
-            )
-
-    def predict_file(self, image_path, out_path=None):
-        image_path = Path(image_path)
-        image = np.load(image_path)
-        prediction = self.predict_image(image)
-
-        if out_path is not None:
-            save_roi_dict(prediction.roi_dict, out_path)
-
-        return prediction
+        return roi_dict, labelled, probability
 
 
-#%% convenience functions
-def predict_rois_for_gui(
-        image,
+#%% NWB segmentation
+def segment_recording(
+        nwb_path,
+        run_name,
+        *,
         checkpoint_path=None,
-        model_name='ch2_v1',
-        device='auto',
         threshold=None,
         min_size=None,
         tta=None,
-        ):
-    predictor = AxonROIPredictor(
-        checkpoint_path=checkpoint_path,
-        model_name=model_name,
-        device=device,
-        threshold=threshold,
-        min_size=min_size,
-        tta=tta,
-        )
-    return predictor.predict_image(image)
-
-
-def predict_roi_file_for_gui(
-        image_path,
-        out_path=None,
-        checkpoint_path=None,
-        model_name='ch2_v1',
         device='auto',
-        threshold=None,
-        min_size=None,
-        tta=None,
+        reference_path=None,
         ):
-    predictor = AxonROIPredictor(
+    nwb_path = Path(nwb_path)
+    partial_path = _segmentation_partial_path(nwb_path)
+    if partial_path.exists():
+        raise FileExistsError(f'partial output already exists: {partial_path}')
+
+    with NWBHDF5IO(nwb_path, 'r') as io:
+        nwbfile = io.read()
+        _check_new_run(nwbfile, run_name)
+        if reference_path is None:
+            reference_path = _preferred_reference_path(nwbfile)
+        reference = _read_reference(nwbfile, reference_path)
+
+    inference_start = perf_counter()
+    predictor = ROIPredictor(
         checkpoint_path=checkpoint_path,
-        model_name=model_name,
-        device=device,
         threshold=threshold,
         min_size=min_size,
         tta=tta,
+        device=device,
         )
-    return predictor.predict_file(image_path, out_path=out_path)
+    roi_dict, _, probability = predictor.predict_image(reference)
+    inference_time_s = perf_counter() - inference_start
+    checkpoint_path = predictor.checkpoint_path.resolve()
+    run_metadata = {
+        'run_name': run_name,
+        'run_type': 'proposed',
+        'source_run': '',
+        'reference_path': reference_path,
+        'checkpoint_path': str(checkpoint_path),
+        'checkpoint_sha256': _checkpoint_sha256(checkpoint_path),
+        'threshold': float(predictor.threshold),
+        'min_size': int(predictor.min_size),
+        'max_size': -1 if predictor.max_size is None else int(predictor.max_size),
+        'tta': bool(predictor.tta),
+        'device': str(predictor.device),
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        }
+    result = _append_roi_run_transactionally(
+        nwb_path, run_name, roi_dict, run_metadata, probability)
+    result['inference_time_s'] = inference_time_s
+    return result

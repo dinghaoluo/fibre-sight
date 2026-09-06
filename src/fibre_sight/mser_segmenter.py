@@ -2,6 +2,8 @@
 Created on 13 May 2026
 
 Modified on 23 June 2026
+Modified on 14 August 2026
+
 segment axon ROIs with MSER, adapted from the hand-curated FibreSegger workflow of 11 April 2025
 
 @author: Dinghao Luo
@@ -13,6 +15,8 @@ import cv2
 import numpy as np
 from scipy.ndimage import median_filter
 from skimage.measure import regionprops
+
+from .roi_io import roi_coordinates
 
 
 #%% parameters
@@ -104,15 +108,6 @@ PARAMETER_SPECS = [
         'decimals': 2,
     },
     {
-        'name': 'clip-percentile',
-        'kind': 'float',
-        'default': 99.0,
-        'minimum': 0.0,
-        'maximum': 100.0,
-        'step': 0.1,
-        'decimals': 2,
-    },
-    {
         'name': 'area min',
         'kind': 'int',
         'default': 30,
@@ -142,15 +137,9 @@ PARAMETER_TOOLTIPS = {
     'MSER min area': 'smallest MSER component area kept, in pixels',
     'MSER max area': 'largest MSER component area kept, in pixels',
     'aspect ratio min': 'minimum long-axis to short-axis ratio',
-    'clip-percentile': 'upper intensity percentile used before normalising',
     'area min': 'smallest final ROI area kept, in pixels',
     'MSER threshold': 'brightness cutoff used before MSER candidate selection',
 }
-
-
-def default_segment_params():
-    return {spec['name']: spec['default'] for spec in PARAMETER_SPECS}
-
 
 #%% image preparation
 def enhance_contrast_u8(image, tophat_kernel=11, clahe_clip=2.0):
@@ -161,9 +150,6 @@ def enhance_contrast_u8(image, tophat_kernel=11, clahe_clip=2.0):
     image01 = np.clip((image - low) / (high - low), 0, 1)
 
     kernel_size = int(tophat_kernel)
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     tophat = cv2.morphologyEx((image01 * 255).astype(np.uint8), cv2.MORPH_TOPHAT, kernel)
 
@@ -172,7 +158,7 @@ def enhance_contrast_u8(image, tophat_kernel=11, clahe_clip=2.0):
 
 
 #%% segmentation
-def run_mser_segmentation(image, params, fixed_rois=None):
+def segment_mser(image, params, fixed_rois=None):
     image = np.asarray(image)
     if image.ndim != 2:
         raise ValueError(f'expected a 2D image, got shape {image.shape}')
@@ -210,15 +196,11 @@ def run_mser_segmentation(image, params, fixed_rois=None):
 
 
 def _make_mser(params):
-    delta = int(max(1, round(params['MSER delta'])))
-    min_area = int(max(5, round(params['MSER min area'])))
-    max_area = int(max(min_area + 1, round(params['MSER max area'])))
-
-    # lab workstations still span both OpenCV constructor signatures
-    try:
-        mser = cv2.MSER_create(delta, min_area, max_area)
-    except TypeError:
-        mser = cv2.MSER_create(_delta=delta, _min_area=min_area, _max_area=max_area)
+    mser = cv2.MSER_create(
+        params['MSER delta'],
+        params['MSER min area'],
+        params['MSER max area'],
+        )
     mser.setMaxVariation(float(params['MSER max variation']))
     return mser
 
@@ -238,14 +220,8 @@ def _filter_candidates(labelled, params):
 
         eccentricity = region.eccentricity if np.isfinite(region.eccentricity) else 0.0
         solidity = region.solidity if np.isfinite(region.solidity) else 0.0
-        if hasattr(region, 'axis_minor_length'):
-            minor_length = region.axis_minor_length
-            major_length = region.axis_major_length
-        else:
-            minor_length = region.minor_axis_length
-            major_length = region.major_axis_length
-        minor_axis = minor_length if minor_length > 1e-6 else 1e-6
-        aspect_ratio = major_length / minor_axis
+        minor_axis = region.axis_minor_length if region.axis_minor_length > 1e-6 else 1e-6
+        aspect_ratio = region.axis_major_length / minor_axis
         perimeter = region.perimeter if region.perimeter > 1e-6 else 1e-6
         thinness = 4 * np.pi * region.area / (perimeter ** 2)
 
@@ -267,28 +243,10 @@ def _normalise_fixed_rois(fixed_rois, shape):
     if not fixed_rois:
         return []
 
-    if isinstance(fixed_rois, dict):
-        roi_iterable = fixed_rois.values()
-    else:
-        roi_iterable = fixed_rois
-
     cleaned = []
-    for roi in roi_iterable:
-        xpix = np.asarray(roi.get('xpix', []), dtype=np.int64).ravel()
-        ypix = np.asarray(roi.get('ypix', []), dtype=np.int64).ravel()
-        n_pix = min(len(xpix), len(ypix))
-        xpix = xpix[:n_pix]
-        ypix = ypix[:n_pix]
-        in_bounds = (
-            (xpix >= 0) &
-            (xpix < shape[1]) &
-            (ypix >= 0) &
-            (ypix < shape[0])
-        )
-        xpix = xpix[in_bounds]
-        ypix = ypix[in_bounds]
-        if len(xpix) > 0:
-            cleaned.append({'xpix': xpix, 'ypix': ypix})
+    for roi_id, roi in fixed_rois.items():
+        xpix, ypix = roi_coordinates(roi_id, roi, shape)
+        cleaned.append({'xpix': xpix, 'ypix': ypix})
     return cleaned
 
 

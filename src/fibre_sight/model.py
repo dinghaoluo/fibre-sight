@@ -2,6 +2,7 @@
 Created on 4 April 2026
 
 Modified on 2 August 2026 to add optional attention gates to the skip paths
+Modified on 14 August 2026
 
 small U-Net used for channel-2 axon masks
 
@@ -70,7 +71,7 @@ class Up(nn.Module):
     def __init__(self, in_channels, skip_channels, out_channels, attention_gates=False):
         super().__init__()
         self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        # 2 August 2026: gate only the skip path so the working decoder stays intact.
+        # 2 August 2026: attention sits on the skip path; the working decoder stays intact
         self.attention = (
             AttentionGate(skip_channels, out_channels)
             if attention_gates else None
@@ -109,7 +110,7 @@ class SmallUNet(nn.Module):
         if depth < 2:
             raise ValueError('depth must be at least 2')
 
-        # Keep the first working model small here; the 512-pixel trial widens it in its YAML recipe.
+        # the 512-pixel trial widens the first working model in its YAML recipe
         channels = [base_channels * (2 ** idx) for idx in range(depth)]
         self.in_conv = DoubleConv(in_channels, channels[0])
         self.downs = nn.ModuleList([
@@ -140,13 +141,7 @@ class SmallUNet(nn.Module):
 
 
 def build_model(config):
-    return SmallUNet(
-        in_channels=config.get('in_channels', 1),
-        out_channels=config.get('out_channels', 1),
-        base_channels=config.get('base_channels', 24),
-        depth=config.get('depth', 4),
-        attention_gates=config.get('attention_gates', False),
-        )
+    return SmallUNet(**config)
 
 
 def pad_to_match(x, reference):

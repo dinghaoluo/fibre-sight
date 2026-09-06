@@ -2,6 +2,8 @@
 Created on 5 April 2026
 
 Modified on 24 July 2026 to build ROI masks without the lab utility module
+Modified on 14 August 2026
+
 convert between xpix/ypix ROI dictionaries and labelled images
 
 @author: Dinghao Luo
@@ -11,6 +13,7 @@ convert between xpix/ypix ROI dictionaries and labelled images
 from pathlib import Path
 
 import numpy as np
+
 
 #%% loading
 def load_roi_dict(path):
@@ -27,91 +30,54 @@ def save_roi_dict(roi_dict, path):
 
 
 #%% conversion
-# xpix/ypix is the format used by the older imaging scripts, so labels made
-# here can return to the rest of the pipeline without a private model format
-def clean_roi_dict(roi_dict, shape):
-    cleaned = {}
-    invalid_entries = 0
-
-    for roi_id, roi in roi_dict.items():
-        try:
-            xpix = np.asarray(roi['xpix'], dtype=np.int64).ravel()
-            ypix = np.asarray(roi['ypix'], dtype=np.int64).ravel()
-        except (KeyError, TypeError, ValueError, OverflowError):
-            # malformed entries are counted and left out of exported labels
-            invalid_entries += 1
-            continue
-
-        same_length = len(xpix) == len(ypix)
-        if not same_length:
-            invalid_entries += 1
-            n_pix = min(len(xpix), len(ypix))
-            xpix = xpix[:n_pix]
-            ypix = ypix[:n_pix]
-
-        in_bounds = (
-            (xpix >= 0) &
-            (xpix < shape[1]) &
-            (ypix >= 0) &
-            (ypix < shape[0])
-            )
-        if not np.all(in_bounds):
-            invalid_entries += 1
-
-        xpix = xpix[in_bounds]
-        ypix = ypix[in_bounds]
-        if len(xpix) == 0:
-            continue
-
-        cleaned[roi_id] = {'xpix': xpix, 'ypix': ypix}
-
-    return cleaned, invalid_entries
+def roi_coordinates(roi_id, roi, shape):
+    xpix = np.asarray(roi['xpix'], dtype=np.int64).ravel()
+    ypix = np.asarray(roi['ypix'], dtype=np.int64).ravel()
+    if len(xpix) != len(ypix) or len(xpix) == 0:
+        raise ValueError(f'ROI {roi_id} has invalid coordinate lengths')
+    if (
+            np.any(xpix < 0) or np.any(xpix >= shape[1]) or
+            np.any(ypix < 0) or np.any(ypix >= shape[0])
+            ):
+        raise ValueError(f'ROI {roi_id} has coordinates outside the image')
+    return xpix, ypix
 
 
 def roi_dict_to_mask(roi_dict, shape):
-    cleaned, invalid_entries = clean_roi_dict(roi_dict, shape)
-    mask = np.zeros(shape, dtype=bool)
-    for roi in cleaned.values():
-        mask[roi['ypix'], roi['xpix']] = True
-    return mask.astype(bool), invalid_entries
+    labelled, _ = roi_dict_to_label(roi_dict, shape)
+    return labelled > 0
 
 
 def roi_dict_to_label(roi_dict, shape):
-    cleaned, invalid_entries = clean_roi_dict(roi_dict, shape)
     labelled = np.zeros(shape, dtype=np.int32)
     roi_areas = []
 
-    for new_id, roi in enumerate(cleaned.values(), start=1):
-        labelled[roi['ypix'], roi['xpix']] = new_id
-        roi_areas.append(len(roi['xpix']))
+    for new_id, (roi_id, roi) in enumerate(roi_dict.items(), start=1):
+        xpix, ypix = roi_coordinates(roi_id, roi, shape)
+        labelled[ypix, xpix] = new_id
+        roi_areas.append(len(xpix))
 
-    return labelled, roi_areas, invalid_entries
+    return labelled, roi_areas
 
 
 def labels_to_roi_dict(labelled):
-    labelled = np.asarray(labelled)
     roi_dict = {}
-
     next_id = 1
     for label_id in sorted(np.unique(labelled)):
         if label_id == 0:
             continue
         ypix, xpix = np.where(labelled == label_id)
-        if len(xpix) == 0:
-            continue
         roi_dict[next_id] = {
             'xpix': xpix.astype(np.int64),
             'ypix': ypix.astype(np.int64),
             }
         next_id += 1
-
     return roi_dict
 
 
 def roi_summary(roi_dict, shape):
-    labelled, roi_areas, invalid_entries = roi_dict_to_label(roi_dict, shape)
+    labelled, roi_areas = roi_dict_to_label(roi_dict, shape)
     mask = labelled > 0
-
     return {
         'roi_count': len(roi_areas),
         'positive_pixels': int(np.sum(mask)),
@@ -119,5 +85,4 @@ def roi_summary(roi_dict, shape):
         'median_roi_area_px': float(np.median(roi_areas)) if roi_areas else 0.0,
         'min_roi_area_px': int(np.min(roi_areas)) if roi_areas else 0,
         'max_roi_area_px': int(np.max(roi_areas)) if roi_areas else 0,
-        'invalid_roi_entries': int(invalid_entries),
         }

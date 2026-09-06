@@ -5,6 +5,8 @@ Modified on 2 June 2026
 Modified on 23 June 2026
 Modified on 23 July 2026 to keep held-out scoring in this script
 Modified on 24 July 2026 to use the bundled model and local output paths
+Modified on 14 August 2026
+
 score a trained model on labelled sessions
 
 @author: Dinghao Luo
@@ -17,16 +19,15 @@ import csv
 
 import numpy as np
 
-from ._device import resolve_device
-from ._formatting import print_files_saved
+from ._device import get_device
 from .manifest import read_manifest
 from .postprocess import probability_to_labels
-from .predict_rois import load_trained_model, predict_probability
+from .predict_rois import load_model, predict_probability
 from .roi_io import load_roi_dict, roi_dict_to_label
 
 
 #%% scoring
-# Pixel overlap and ROI counts answer different questions, so I kept both.
+# pixel overlap and ROI counts answer different questions, so I kept both
 def mask_scores(pred_mask, target_mask, eps=1e-8):
     pred_mask = np.asarray(pred_mask).astype(bool)
     target_mask = np.asarray(target_mask).astype(bool)
@@ -78,78 +79,74 @@ def parse_args():
 
 
 #%% evaluation
-def evaluate_rows(rows, checkpoint_path, threshold=None, min_size=None, device='auto', tta=False):
-    device = resolve_device(device)
+def evaluate_sessions(sessions, checkpoint_path, threshold=None, min_size=None, device='auto', tta=False):
+    device = get_device(device)
 
-    model, checkpoint = load_trained_model(checkpoint_path, device)
-    data_cfg = checkpoint.get('data_config', {})
-    post_cfg = dict(checkpoint.get('postprocess_config', {}))
+    model, checkpoint = load_model(checkpoint_path, device)
+    data = checkpoint['data_config']
+    postprocess = dict(checkpoint['postprocess_config'])
 
     if threshold is not None:
-        post_cfg['threshold'] = threshold
+        postprocess['threshold'] = threshold
     if min_size is not None:
-        post_cfg['min_size'] = min_size
+        postprocess['min_size'] = min_size
 
     results = []
-    for row in rows:
-        image = np.load(row['image_path'])
-        roi_dict = load_roi_dict(row['roi_path'])
-        target_labelled, _, _ = roi_dict_to_label(roi_dict, image.shape)
+    for session in sessions:
+        image = np.load(session['image_path'])
+        roi_dict = load_roi_dict(session['roi_path'])
+        target_labelled, _ = roi_dict_to_label(roi_dict, image.shape)
         target_mask = target_labelled > 0
 
         probability = predict_probability(
             image,
             model,
             device,
-            normalise_percentiles=data_cfg.get('normalise_percentiles', [1, 99.7]),
+            normalise_percentiles=data['normalise_percentiles'],
             tta=tta,
             )
         # held-out scoring uses the same postprocessing as saved ROI output
         pred_labelled = probability_to_labels(
             probability,
-            threshold=post_cfg.get('threshold', 0.5),
-            min_size=post_cfg.get('min_size', 30),
-            max_size=post_cfg.get('max_size', None),
+            threshold=postprocess['threshold'],
+            min_size=postprocess['min_size'],
+            max_size=postprocess['max_size'],
             )
         scores = mask_scores(pred_labelled > 0, target_mask > 0)
-        # Pixel overlap misses split and merged ROIs, so keep the component counts beside it.
+        # pixel overlap misses split and merged ROIs, so keep the component counts beside it
         scores.update(component_counts(pred_labelled, target_labelled))
         scores.update({
-            'session': row['session'],
-            'animal': row['animal'],
-            'split': row['split'],
+            'session': session['session'],
+            'animal': session['animal'],
+            'split': session['split'],
             })
         results.append(scores)
 
     return results
 
 
-def write_results(rows, path):
+def write_results(results, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    keys = sorted({key for row in rows for key in row.keys()})
-
     with open(path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(results)
 
 
 def print_summary(results):
-    if len(results) == 0:
-        print('no rows evaluated')
-        return
-
     for key in ['dice', 'f2', 'iou', 'precision', 'recall']:
-        values = [row[key] for row in results]
+        values = [session_scores[key] for session_scores in results]
         print(f'{key}: {np.mean(values):.4f} +/- {np.std(values):.4f}')
 
 
 def main():
     args = parse_args()
-    rows = read_manifest(args.manifest, included_only=True, split=args.split)
-    results = evaluate_rows(
-        rows,
+    sessions = read_manifest(args.manifest, included_only=True, split=args.split)
+    if not sessions:
+        raise ValueError(f'no {args.split} sessions in {args.manifest}')
+    results = evaluate_sessions(
+        sessions,
         args.checkpoint,
         threshold=args.threshold,
         min_size=args.min_size,
@@ -163,9 +160,7 @@ def main():
 
     write_results(results, out_path)
     print_summary(results)
-    print_files_saved([
-        ('evaluation', out_path),
-    ])
+    print(f'saved {out_path}')
 
 
 if __name__ == '__main__':

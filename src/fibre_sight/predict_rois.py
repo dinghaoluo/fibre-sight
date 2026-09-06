@@ -3,6 +3,8 @@ Created on 22 April 2026
 
 Modified on 23 June 2026
 Modified on 24 July 2026 to use the bundled checkpoint by default
+Modified on 14 August 2026
+
 run a trained model on channel-2 references and save ROI dictionaries
 
 @author: Dinghao Luo
@@ -13,10 +15,11 @@ from pathlib import Path
 import argparse
 
 import numpy as np
+import torch
 
-from ._device import resolve_device
-from ._repo import package_path
-from .image_ops import robust_normalise
+from ._device import get_device
+from ._repo import PACKAGE_ROOT
+from .image_ops import normalise
 from .model import build_model
 from .postprocess import probability_to_roi_dict
 from .roi_io import save_roi_dict
@@ -29,7 +32,7 @@ def parse_args():
     parser.add_argument(
         '--checkpoint',
         type=Path,
-        default=package_path('models', 'fibre_sight_ch2_v1.pt'),
+        default=PACKAGE_ROOT / 'models' / 'fibre_sight_ch2_v1.pt',
         )
     parser.add_argument('--out', type=Path, default=None)
     parser.add_argument('--threshold', type=float, default=None)
@@ -44,11 +47,9 @@ def parse_args():
 
 
 #%% prediction
-def load_trained_model(checkpoint_path, device):
-    import torch
-
+def load_model(checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model = build_model(checkpoint.get('model_config', {}))
+    model = build_model(checkpoint['model_config'])
     model.load_state_dict(checkpoint['model_state'])
     model.to(device)
     model.eval()
@@ -56,40 +57,28 @@ def load_trained_model(checkpoint_path, device):
 
 
 def predict_probability(image, model, device, normalise_percentiles=(1, 99.7), tta=False):
-    import torch
-
-    image = robust_normalise(
+    image = normalise(
         image,
         low=normalise_percentiles[0],
         high=normalise_percentiles[1],
         )
-    tensor = torch.from_numpy(image[None, None, ...].astype(np.float32)).to(device)
+    tensor = torch.from_numpy(image[None, None, ...]).to(device)
 
     with torch.no_grad():
-        probability = predict_tensor_probability(tensor, model, tta=tta)
-
+        probability = _predict_tensor(tensor, model, tta=tta)
     return probability[0, 0].detach().cpu().numpy()
 
 
-def predict_tensor_probability(tensor, model, tta=False):
-    import torch
-
+def _predict_tensor(tensor, model, tta=False):
     if not tta:
         return torch.sigmoid(model(tensor)[:, :1])
 
-    # average the four flip views without interpolating the thin ROI shapes
+    # the four flip views return to the original pixel grid before averaging
     predictions = []
     for dims in [(), (2,), (3,), (2, 3)]:
-        if dims:
-            input_tensor = torch.flip(tensor, dims=dims)
-        else:
-            input_tensor = tensor
-
+        input_tensor = torch.flip(tensor, dims=dims) if dims else tensor
         probability = torch.sigmoid(model(input_tensor)[:, :1])
-        if dims:
-            probability = torch.flip(probability, dims=dims)
-        predictions.append(probability)
-
+        predictions.append(torch.flip(probability, dims=dims) if dims else probability)
     return torch.mean(torch.stack(predictions), dim=0)
 
 
@@ -102,34 +91,31 @@ def predict_roi_dict(
         device='auto',
         tta=False,
         ):
-    device = resolve_device(device)
-
-    model, checkpoint = load_trained_model(checkpoint_path, device)
-    data_cfg = checkpoint.get('data_config', {})
-    post_cfg = dict(checkpoint.get('postprocess_config', {}))
-
-    if threshold is not None:
-        post_cfg['threshold'] = threshold
-    if min_size is not None:
-        post_cfg['min_size'] = min_size
+    device = get_device(device)
+    model, checkpoint = load_model(checkpoint_path, device)
+    postprocess = checkpoint['postprocess_config']
+    if threshold is None:
+        threshold = postprocess['threshold']
+    if min_size is None:
+        min_size = postprocess['min_size']
 
     image = np.load(image_path)
     probability = predict_probability(
         image,
         model,
         device,
-        normalise_percentiles=data_cfg.get('normalise_percentiles', [1, 99.7]),
+        normalise_percentiles=checkpoint['data_config']['normalise_percentiles'],
         tta=tta,
         )
     roi_dict, labelled = probability_to_roi_dict(
         probability,
-        threshold=post_cfg.get('threshold', 0.5),
-        min_size=post_cfg.get('min_size', 30),
-        max_size=post_cfg.get('max_size', None),
+        threshold=threshold,
+        min_size=min_size,
+        max_size=postprocess['max_size'],
         )
 
     if out_path is None:
-        recname = Path(image_path).name.split('_ref_mat')[0]
+        recname = Path(image_path).stem.removesuffix('_ref_mat_ch2')
         out_path = Path(image_path).parent / f'{recname}_ROI_dict.npy'
 
     save_roi_dict(roi_dict, out_path)

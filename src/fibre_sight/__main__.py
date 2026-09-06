@@ -1,13 +1,15 @@
 '''
 Created on 24 July 2026
 
-launch the FibreSight workbench
+Modified on 14 August 2026
+
+launch the FibreSight GUI
 
 @author: Dinghao Luo
 '''
 
 #%% imports
-from .fibre_sight_workbench_gui import main
+from .gui import main
 
 
 #%% entry point

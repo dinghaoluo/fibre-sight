@@ -32,7 +32,6 @@ The older MSER route remains in the workbench because it was the proposal method
 | `thinness maximum` | `0.8` | Compactness ceiling; lower values favour thinner regions. |
 | `tophat kernel` | `11` pixels | Scale of the background-removal filter used before MSER. |
 | `CLAHE clip` | `2.0` | Strength of local contrast equalisation. |
-| `intensity clip` | `99.0` | Upper intensity percentile used before MSER normalisation. |
 
 Fixed ROIs are written into the label image before a new MSER pass, so a hand decision survives later changes to these controls.
 
@@ -62,7 +61,7 @@ Training augmentation used independent horizontal and vertical flips, lossless r
 
 The selected model is the package's `SmallUNet`: one input channel, one foreground-logit output channel, four resolution levels and base width `24`, giving channel widths of 24, 48, 96 and 192. Each level uses two 3 × 3 convolution, batch-normalisation and ReLU blocks; downsampling uses max pooling, whilst the decoder uses transposed convolution and skip connections.
 
-The loss was the equally weighted sum of binary cross-entropy with logits and soft Dice loss. AdamW used a learning rate of `3e-4`, weight decay of `1e-5` and batch size `8`; training ran for 80 epochs with automatic mixed precision when CUDA was available. The complete recipe remains in [`ch2_unet.yaml`](src/fibre_sight/configs/ch2_unet.yaml).
+The loss was the equally weighted sum of binary cross-entropy with logits and soft Dice loss. AdamW used a learning rate of `3e-4`, weight decay of `1e-5` and batch size `8`; training ran for 80 epochs with automatic mixed precision when CUDA was available. The architecture, optimisation and augmentation choices remain in [`ch2_unet.yaml`](src/fibre_sight/configs/ch2_unet.yaml); the supplied recipe now uses the project seed of `42`, whilst the released checkpoint used `7` as recorded above.
 
 ## checkpoint selection and training history
 
@@ -108,10 +107,62 @@ Three alternative recipes remain beside the selected baseline. Each changed one 
 
 **`ch2_unet_512.yaml`** doubled the crop size to 512 pixels and widened the base channels to 32, giving the network more spatial context per patch. This was a sanity check that the 256-pixel baseline was not leaving performance on the table; the smaller model remained the released checkpoint.
 
-**`ch2_unet_attention.yaml`** added attention gates to the skip connections of the standard `SmallUNet` whilst keeping the 256-pixel crop, base width 24, BCE + Dice loss, and seed 7 unchanged. The gate projects skip features and the upsampled decoder features into a shared low-dimensional space (half the minimum of skip and gate channels), applies ReLU then a 1×1 convolution to a single-channel sigmoid score, and multiplies that score back onto the skip path before concatenation. The decoder path itself is unmodified; only the skip contribution is gated. In our tests the attention-gated variant performed comparably to the standard U-Net on the same data. The recipe is included for cases where the training data contains more heterogeneous backgrounds and the skip connections might benefit from learned suppression of irrelevant features.
+**`ch2_unet_attention.yaml`** added attention gates to the skip connections of the standard `SmallUNet` whilst keeping the 256-pixel crop, base width 24, BCE + Dice loss, and the baseline seed unchanged. The gate projects skip features and the upsampled decoder features into a shared low-dimensional space (half the minimum of skip and gate channels), applies ReLU then a 1×1 convolution to a single-channel sigmoid score, and multiplies that score back onto the skip path before concatenation. The decoder path itself is unmodified; only the skip contribution is gated. In our tests the attention-gated variant performed comparably to the standard U-Net on the same data. The recipe is included for cases where the training data contains more heterogeneous backgrounds and the skip connections might benefit from learned suppression of irrelevant features.
 
-The 256-pixel ungated baseline remained the released model. The comparison stopped with these working trials whilst the labelling and curation loop was still changing. The full [training guide](TRAINING.md) describes each recipe and how to write a new one.
+The 256-pixel ungated baseline remained the released model. The comparison stopped with these working trials whilst the labelling and curation loop was still changing. [How to Train Your Model™](TRAINING.md) describes each recipe and how to write a new one.
 
 ## scope
 
 The checkpoint was trained and tested within one dLight acquisition source. Percentile normalisation handles simple changes in signal scale. A new indicator, microscope point-spread function, field size, background texture, or labelling convention changes the spatial problem and remains outside that correction. Images from another domain need hand-labelled checks; repeated misses in the confidence map are evidence for retraining, whilst below-threshold responses can be explored with the prediction controls at the top of this file.
+
+## full-movie segmentation reference
+
+Movie preprocessing keeps `processing/preprocessing/registration_references/control_reference` as the two-pass control-channel anchor used for registration. After registration and quality control, it averages every final `analysis_valid` frame from the chosen segmentation channel into `processing/preprocessing/segmentation_references/mean_signal_reference` or `mean_control_reference`. Rigid frames use their exact rectangular support; piecewise frames reconstruct the per-pixel support from the stored spline field and channel offset. `registered_valid_bounds` remains as the enclosing rectangle, and the exact paired-frame indices are stored in `processing/preprocessing/segmentation_reference_frames`.
+
+The mean is clipped and rescaled from the 1st to 97th percentile, converted to 8-bit, and stored separately as `processing/preprocessing/segmentation_references/segmentation_reference`. The historical training references also passed through an 8-bit percentile transform before checkpoint inference; they used `p1-p99`. The full-session mean left faint axons too dim at that upper percentile, so `p1-p97` is now the preprocessing default. The checkpoint still applies its saved `p1-p99.7` inference normalisation to the stored 8-bit image.
+
+`processing/preprocessing/segmentation_reference_metadata` records the source reference path, frame count, requested percentiles, realised intensity cut-offs and output dtype. `segment_recording(...)` uses the 8-bit segmentation reference by default and records its exact NWB path with the immutable ROI run. Older files fall back first to `processing/preprocessing/registration_references/proposal_reference`, when present, then to the registration anchor. The segmentation reference changes the checkpoint input without changing the released `0.25` threshold or `45`-pixel minimum.
+
+## fluorescence extraction and dF/F
+
+Fluorescence extraction and dF/F calculation are separate immutable NWB stages. Extraction measures the mean, median, interquartile range and valid-pixel fraction for each ROI and its surrounding pixels in both channels. 'Surround' is used as the general name because 'annulus' describes one available geometry, whilst 'neuropil' names biological tissue which cannot be inferred from these pixels.
+
+Adaptive surrounds use four-connected pixel growth. The first five pixels around an ROI are excluded; every curated ROI pixel is then removed, and the outer boundary grows in five-pixel steps until more than 350 surrounding pixels are available or the image boundary has been reached. This reproduces the geometry used by Suite2p, with the five-pixel inner exclusion inherited from `lc-ca1-project`. Fixed mode instead selects pixels whose Euclidean distance from the ROI lies between the chosen inner and outer radii. Overlapping ROIs remain separate, but neither surround can include pixels assigned to any curated ROI.
+
+The derived stage selects either the raw mean (default) or median. For each channel it calculates independent ROI, surround and surround-corrected traces. Surround subtraction happens before baseline estimation:
+
+```text
+F_corrected = F_roi - coefficient * F_surround
+dFF = (F - F0) / F0
+```
+
+The default coefficient is `0.7`; it is fixed for the run and is never fitted separately for each ROI. `F0` is a centred, reflectively padded rolling 20th percentile over 300 seconds. NaNs are omitted from each percentile. dF/F is undefined where `F0` is zero or negative, which can occur after surround subtraction of signed ScanImage counts; those samples are stored as NaN. Frames rejected by `processing/quality_control/registration_qc/analysis_valid` are also stored as NaN, excluded from every baseline, and never interpolated in the canonical traces. No temporal median filter is applied.
+
+The same `analysis_valid` mask excludes abrupt photometric changes. Preprocessing takes the absolute frame-to-frame change in fitted gain and offset for both channels. Each recording-specific boundary is the calibration median plus the larger of a fixed minimum rise (`0.15` for gain and `0.4` counts for offset) or six scaled MADs. The rule is evaluated only where the frame and its neighbours retain credible motion estimates, and where canonical and local spatial correspondence remain above their respective boundaries. It therefore catches sharp optical contamination without relabelling ordinary registration loss as a photometric event. Both edges of a one-frame excursion can carry the `photometric_artifact` reason; they enter dF/F as NaN and do not contribute to `F0`.
+
+Signal and control channels receive the same independent calculation. Control correction defaults to `none`. The optional deterministic mode subtracts surround-corrected control dF/F from surround-corrected signal dF/F; it does not subtract raw green and red counts, fit a coefficient, or treat tdTomato as an isosbestic channel. The dLight, GRABNE and nLight papers establish different sensor kinetics and acquisition contexts; Hamid *et al.* analysed tdTomato separately, whilst Keevers and Jean-Richard-dit-Bressel show how regression choices can change fibre-photometry results and Zhang *et al.* show the remaining haemodynamic limits. FibreSight therefore stores the uncorrected channel traces alongside any optional control-corrected result.
+
+| parameter or decision | default | basis |
+| --- | ---: | --- |
+| surround geometry | adaptive | Suite2p-style four-connected growth [1] |
+| inner surround exclusion | `5 px` | `lc-ca1-project` Suite2p configuration; Suite2p's general default is smaller [1] |
+| adaptive target | more than `350` pixels | Suite2p minimum surrounding-pixel rule [1] |
+| adaptive growth step | `5 px` | Suite2p mask construction [1] |
+| raw ROI statistic | mean | selectable analysis choice; median is retained as an alternative |
+| surround coefficient | `0.7` | Suite2p and the existing `lc-ca1-project` axonal pipeline [1] |
+| baseline | centred rolling 20th percentile | existing `lc-ca1-project` axonal pipeline; this exact percentile is not presented as a cross-sensor standard |
+| baseline window | `300 s` | `9,000` frames at 30 Hz in `lc-ca1-project` |
+| temporal median filter | none | no canonical filter in the source axonal pipeline |
+| control correction | none | sensor and control-channel methods differ across preparations [2-8] |
+| optional control correction | signal dF/F minus control dF/F | fixed, reproducible alternative; no per-ROI regression [6, 7] |
+
+## fluorescence references
+
+1. Pachitariu M, Stringer C, Dipoppa M, *et al.* (2017). Suite2p: beyond 10,000 neurons with standard two-photon microscopy. *bioRxiv*. [doi:10.1101/061507](https://doi.org/10.1101/061507).
+2. Patriarchi T, Cho JR, Merten K, *et al.* (2018). Ultrafast neuronal imaging of dopamine dynamics with designed genetically encoded sensors. *Science* 360(6396):eaat4422. [doi:10.1126/science.aat4422](https://doi.org/10.1126/science.aat4422).
+3. Feng J, Zhang C, Lischinsky JE, *et al.* (2019). A genetically encoded fluorescent sensor for rapid and specific *in vivo* detection of norepinephrine. *Neuron* 102(4):745-761.e8. [doi:10.1016/j.neuron.2019.02.037](https://doi.org/10.1016/j.neuron.2019.02.037).
+4. Feng J, Dong H, Lischinsky JE, *et al.* (2024). Monitoring norepinephrine release *in vivo* using next-generation GRABNE sensors. *Neuron* 112(12):1930-1942.e6. [doi:10.1016/j.neuron.2024.03.001](https://doi.org/10.1016/j.neuron.2024.03.001).
+5. Kagiampaki Z, Weng Y, Zhang C, *et al.* (2023). Sensitive multicolor indicators for monitoring norepinephrine *in vivo*. *Nature Methods* 20(9):1426-1436. [doi:10.1038/s41592-023-01959-z](https://doi.org/10.1038/s41592-023-01959-z).
+6. Hamid AA, Frank MJ and Moore CI (2021). Wave-like dopamine dynamics as a mechanism for spatiotemporal credit assignment. *Cell* 184(10):2733-2749.e16. [doi:10.1016/j.cell.2021.03.046](https://doi.org/10.1016/j.cell.2021.03.046).
+7. Keevers N and Jean-Richard-dit-Bressel P (2025). Obtaining artifact-corrected signals in fiber photometry *via* isosbestic signals, robust regression, and dF/F calculations. *Neurophotonics* 12(2):025003. [doi:10.1117/1.NPh.12.2.025003](https://doi.org/10.1117/1.NPh.12.2.025003).
+8. Zhang Y, Yee P, Zacharias NM, *et al.* (2022). Spectral fiber photometry derives hemoglobin concentration changes for accurate measurement of fluorescent sensor activity. *Cell Reports Methods* 2(7):100243. [doi:10.1016/j.crmeth.2022.100243](https://doi.org/10.1016/j.crmeth.2022.100243).

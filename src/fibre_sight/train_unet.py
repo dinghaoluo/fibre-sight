@@ -6,6 +6,9 @@ Modified on 23 June 2026
 Modified on 23 July 2026 to keep the loss experiments beside the training loop
 Modified on 24 July 2026 to use packaged recipes and local run directories
 Modified on 1 August 2026 to seed comparable runs and expose augmentation choices
+Modified on 14 August 2026
+Modified on 20 August 2026
+
 train the small U-Net and keep its run record
 
 @author: Dinghao Luo
@@ -13,7 +16,6 @@ train the small U-Net and keep its run record
 
 #%% imports
 from contextlib import nullcontext
-from datetime import datetime
 from pathlib import Path
 import argparse
 import csv
@@ -21,19 +23,18 @@ import csv
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from ._device import resolve_device
+from ._device import get_device
 from ._formatting import mpl_formatting
-from ._repo import default_figure_root, get_workspace_root, package_path
-from .config import get_section, load_config, resolve_path, save_config
-from .dataset import AxonROIDataset
+from ._repo import FIGURE_ROOT, PACKAGE_ROOT, WORKSPACE_ROOT
+from .config import load_recipe, resolve_path, save_recipe
+from .dataset import ROIDataset
 from .model import build_model
 
-WORKSPACE_ROOT = get_workspace_root()
-
-
 #%% loss
-# BCE was the first baseline; Dice helped once the foreground occupied only a small part of each crop.
+# the first baseline used BCE; Dice helped with the sparse foreground
 def soft_dice_loss(logits, targets, eps=1e-6):
     probs = torch.sigmoid(logits)
     dims = tuple(range(1, probs.ndim))
@@ -42,18 +43,6 @@ def soft_dice_loss(logits, targets, eps=1e-6):
     denominator = torch.sum(probs, dim=dims) + torch.sum(targets, dim=dims)
     dice = (2 * intersection + eps) / (denominator + eps)
     return 1 - dice.mean()
-
-
-def bce_dice_loss(logits, targets, bce_weight=1.0, dice_weight=1.0):
-    bce = F.binary_cross_entropy_with_logits(logits, targets)
-    dice = soft_dice_loss(logits, targets)
-    loss = bce_weight * bce + dice_weight * dice
-
-    return loss, {
-        'loss': float(loss.detach().cpu()),
-        'bce': float(bce.detach().cpu()),
-        'dice_loss': float(dice.detach().cpu()),
-        }
 
 
 def soft_tversky_loss(logits, targets, alpha=0.3, beta=0.7, eps=1e-6):
@@ -69,7 +58,7 @@ def soft_tversky_loss(logits, targets, alpha=0.3, beta=0.7, eps=1e-6):
 
 
 def segmentation_loss(logits, targets, config):
-    mode = config.get('mode', 'bce_dice')
+    mode = config['mode']
     channel_weights = config.get('channel_weights', None)
     pos_weight = config.get('pos_weight', None)
 
@@ -98,14 +87,14 @@ def segmentation_loss(logits, targets, config):
         seg = soft_tversky_loss(
             logits,
             targets,
-            alpha=config.get('tversky_alpha', 0.3),
-            beta=config.get('tversky_beta', 0.7),
+            alpha=config['tversky_alpha'],
+            beta=config['tversky_beta'],
             )
         seg_name = 'tversky_loss'
     else:
         raise ValueError(f'unknown loss mode: {mode}')
 
-    loss = config.get('bce_weight', 1.0) * bce + config.get('seg_weight', 1.0) * seg
+    loss = config['bce_weight'] * bce + config['seg_weight'] * seg
     return loss, {
         'loss': float(loss.detach().cpu()),
         'bce': float(bce.detach().cpu()),
@@ -119,107 +108,78 @@ def parse_args():
     parser.add_argument(
         '--config',
         type=Path,
-        default=package_path('configs', 'ch2_unet.yaml'),
+        default=PACKAGE_ROOT / 'configs' / 'ch2_unet.yaml',
         )
     return parser.parse_args()
 
 
 #%% setup
-def get_device(device_name):
-    return resolve_device(device_name)
-
-
 def set_random_seed(seed):
-    seed = int(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
-def use_pinned_memory(config, device):
-    train_cfg = get_section(config, 'train')
-    return bool(train_cfg.get('pin_memory', True) and device.type == 'cuda')
+def make_dataloaders(config, device):
+    data = config['data']
+    training = config['train']
+    manifest_path = resolve_path(data['manifest'], WORKSPACE_ROOT)
+    normalise_percentiles = data['normalise_percentiles']
+    augmentation = data['augmentation']
 
-
-def make_dataloaders(config, device=None):
-    from torch.utils.data import DataLoader
-
-    data_cfg = get_section(config, 'data')
-    train_cfg = get_section(config, 'train')
-    if device is None:
-        device = get_device(train_cfg.get('device', 'auto'))
-
-    manifest_path = resolve_path(data_cfg['manifest'], WORKSPACE_ROOT)
-    normalise_percentiles = data_cfg.get('normalise_percentiles', [1, 99.7])
-    augmentation_cfg = data_cfg.get('augmentation', {})
-
-    train_dataset = AxonROIDataset(
+    train_dataset = ROIDataset(
         manifest_path,
-        split=data_cfg.get('train_split', 'train'),
-        patch_size=data_cfg.get('patch_size', 256),
-        patches_per_image=data_cfg.get('patches_per_image', 24),
-        foreground_fraction=data_cfg.get('foreground_fraction', 0.75),
+        split=data['train_split'],
+        patch_size=data['patch_size'],
+        patches_per_image=data['patches_per_image'],
+        foreground_fraction=data['foreground_fraction'],
         normalise_percentiles=normalise_percentiles,
         augment=True,
-        rotation_90=augmentation_cfg.get('rotation_90', True),
-        noise_sd=augmentation_cfg.get('noise_sd', 0.02),
-        cache_images=data_cfg.get('cache_images', False),
-        target_mode=data_cfg.get('target_mode', 'foreground'),
-        support_radius=data_cfg.get('support_radius', 3),
-        seed=train_cfg.get('seed', 7),
+        rotation_90=augmentation['rotation_90'],
+        noise_sd=augmentation['noise_sd'],
+        cache_images=data['cache_images'],
+        target_mode=data['target_mode'],
+        support_radius=data.get('support_radius', 3),
+        seed=training['seed'],
         )
-    val_dataset = AxonROIDataset(
+    val_dataset = ROIDataset(
         manifest_path,
-        split=data_cfg.get('val_split', 'val'),
-        patch_size=data_cfg.get('patch_size', 256),
-        patches_per_image=max(1, data_cfg.get('val_patches_per_image', 8)),
-        foreground_fraction=data_cfg.get('foreground_fraction', 0.75),
+        split=data['val_split'],
+        patch_size=data['patch_size'],
+        patches_per_image=data['val_patches_per_image'],
+        foreground_fraction=data['foreground_fraction'],
         normalise_percentiles=normalise_percentiles,
         augment=False,
-        cache_images=data_cfg.get('cache_images', False),
-        target_mode=data_cfg.get('target_mode', 'foreground'),
-        support_radius=data_cfg.get('support_radius', 3),
-        seed=train_cfg.get('seed', 7) + 1000,
+        cache_images=data['cache_images'],
+        target_mode=data['target_mode'],
+        support_radius=data.get('support_radius', 3),
+        seed=training['seed'] + 1000,
         )
 
     loader_args = {
-        'batch_size': train_cfg.get('batch_size', 8),
-        'num_workers': train_cfg.get('num_workers', 0),
-        'pin_memory': use_pinned_memory(config, device),
+        'batch_size': training['batch_size'],
+        'num_workers': training['num_workers'],
+        'pin_memory': training['pin_memory'] and device.type == 'cuda',
         }
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_args)
-    # validation keeps the image unchanged; only crop selection moves with the epoch
+    # a fixed crop set makes validation epochs directly comparable
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_args)
 
     return train_dataset, val_dataset, train_loader, val_loader
 
 
 def prepare_run_dir(config):
-    train_cfg = get_section(config, 'train')
-    out_root = resolve_path(train_cfg.get('out_dir', 'output/runs'), WORKSPACE_ROOT)
-    run_name = train_cfg.get('run_name', '')
-
-    if not run_name:
-        run_name = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-    run_dir = out_root / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
-    save_config(config, run_dir / 'config.yaml')
-    return run_dir
-
-
-def prepare_figure_run_dir(run_name):
-    run_dir = default_figure_root() / 'runs' / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    training = config['train']
+    run_dir = resolve_path(training['out_dir'], WORKSPACE_ROOT) / training['run_name']
+    run_dir.mkdir(parents=True)
+    save_recipe(config, run_dir / 'config.yaml')
     return run_dir
 
 
 #%% training
 def train_one_epoch(model, loader, optimiser, scaler, device, config, epoch):
-    from tqdm import tqdm
-
     model.train()
     loader.dataset.set_epoch(epoch)
-    rows = []
+    batches = []
     amp = use_amp(config, device)
 
     for batch in tqdm(loader, desc=f'train {epoch}', leave=False):
@@ -229,7 +189,11 @@ def train_one_epoch(model, loader, optimiser, scaler, device, config, epoch):
         optimiser.zero_grad(set_to_none=True)
         with autocast_context(amp):
             logits = model(images)
-            loss, loss_parts = loss_from_config(logits, masks, config)
+            loss, loss_parts = segmentation_loss(
+                logits,
+                masks,
+                config['loss'],
+                )
 
         if amp:
             scaler.scale(loss).backward()
@@ -239,18 +203,14 @@ def train_one_epoch(model, loader, optimiser, scaler, device, config, epoch):
             loss.backward()
             optimiser.step()
 
-        rows.append(loss_parts)
+        batches.append(loss_parts)
 
-    return average_rows(rows)
+    return average_batches(batches)
 
 
 def validate(model, loader, device, config, epoch):
-    import torch
-    from tqdm import tqdm
-
     model.eval()
-    loader.dataset.set_epoch(epoch)
-    rows = []
+    batches = []
     amp = use_amp(config, device)
 
     with torch.no_grad():
@@ -260,22 +220,19 @@ def validate(model, loader, device, config, epoch):
 
             with autocast_context(amp):
                 logits = model(images)
-                _, loss_parts = loss_from_config(logits, masks, config)
+                _, loss_parts = segmentation_loss(
+                    logits,
+                    masks,
+                    config['loss'],
+                    )
 
             loss_parts['pixel_dice'] = batch_dice(logits, masks)
-            rows.append(loss_parts)
+            batches.append(loss_parts)
 
-    return average_rows(rows)
-
-
-def loss_from_config(logits, masks, config):
-    loss_cfg = get_section(config, 'loss', {'bce_weight': 1.0, 'dice_weight': 1.0})
-    return segmentation_loss(logits, masks, loss_cfg)
+    return average_batches(batches)
 
 
 def batch_dice(logits, masks, threshold=0.5, eps=1e-8):
-    import torch
-
     pred = torch.sigmoid(logits[:, :1]) >= threshold
     target = masks[:, :1] >= 0.5
     dims = tuple(range(1, pred.ndim))
@@ -287,30 +244,26 @@ def batch_dice(logits, masks, threshold=0.5, eps=1e-8):
 
 
 def use_amp(config, device):
-    train_cfg = get_section(config, 'train')
-    return bool(train_cfg.get('amp', True) and device.type == 'cuda')
+    return config['train']['amp'] and device.type == 'cuda'
 
 
 def autocast_context(enabled):
     if not enabled:
         return nullcontext()
 
-    import torch
     return torch.amp.autocast('cuda')
 
 
 #%% output
 def save_checkpoint(path, model, optimiser, epoch, best_score, config):
-    import torch
-
     checkpoint = {
         'epoch': epoch,
         'best_score': best_score,
         'model_state': model.state_dict(),
         'optimiser_state': optimiser.state_dict(),
-        'model_config': get_section(config, 'model'),
-        'data_config': get_section(config, 'data'),
-        'postprocess_config': get_section(config, 'postprocess'),
+        'model_config': config['model'],
+        'data_config': config['data'],
+        'postprocess_config': config['postprocess'],
         'config': config,
         }
     torch.save(checkpoint, path)
@@ -319,10 +272,9 @@ def save_checkpoint(path, model, optimiser, epoch, best_score, config):
 def write_history(history, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    keys = sorted({key for row in history for key in row.keys()})
 
     with open(path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        writer = csv.DictWriter(f, fieldnames=history[0].keys())
         writer.writeheader()
         writer.writerows(history)
 
@@ -332,78 +284,131 @@ def plot_history(history, path):
 
     mpl_formatting()
 
-    epochs = [row['epoch'] for row in history]
-    fig, axes = plt.subplots(1, 2, figsize=(7, 3), constrained_layout=True)
+    epochs = np.asarray([stats['epoch'] for stats in history])
+    training_loss = np.asarray([stats['train_loss'] for stats in history])
+    validation_loss = np.asarray([stats['val_loss'] for stats in history])
+    validation_dice = np.asarray([
+        stats['val_pixel_dice'] for stats in history])
+    selected_index = int(np.argmax(validation_dice))
+    selected_epoch = epochs[selected_index]
+    selected_dice = validation_dice[selected_index]
 
-    axes[0].plot(epochs, [row['train_loss'] for row in history], label='train')
-    axes[0].plot(epochs, [row['val_loss'] for row in history], label='val')
+    training_colour = '#1A1A1C'
+    validation_colour = '#009E73'
+    fig, axes = plt.subplots(
+        1, 2, figsize=(9.5, 3.4), constrained_layout=True)
+
+    axes[0].plot(
+        epochs, training_loss,
+        color=training_colour, linewidth=1.4, label='training')
+    axes[0].plot(
+        epochs, validation_loss,
+        color=validation_colour, linewidth=1.4, label='validation')
+    axes[0].set_title('loss')
     axes[0].set_xlabel('epoch')
-    axes[0].set_ylabel('loss')
+    axes[0].set_ylabel('BCE + Dice loss')
     axes[0].legend(frameon=False)
 
-    axes[1].plot(epochs, [row.get('val_pixel_dice', np.nan) for row in history])
+    dice_range = np.ptp(validation_dice)
+    lower_margin = max(0.2 * dice_range, 0.03)
+    upper_margin = max(0.08 * dice_range, 0.01)
+    dice_bottom = max(0, validation_dice.min() - lower_margin)
+    dice_top = min(1, validation_dice.max() + upper_margin)
+    annotation_top = dice_bottom + 0.18 * (dice_top - dice_bottom)
+
+    axes[1].plot(
+        epochs, validation_dice,
+        color=validation_colour, linewidth=1.4)
+    axes[1].vlines(
+        selected_epoch,
+        annotation_top,
+        selected_dice,
+        color='0.45',
+        linestyle=':',
+        linewidth=0.9,
+        )
+    axes[1].scatter(
+        selected_epoch,
+        selected_dice,
+        color=validation_colour,
+        s=38,
+        zorder=3,
+        )
+    axes[1].text(
+        selected_epoch,
+        dice_bottom + 0.05 * (dice_top - dice_bottom),
+        f'selected epoch {selected_epoch}\nDice {selected_dice:.4f}',
+        ha='center',
+        va='bottom',
+        fontsize=8,
+        )
+    axes[1].set_title('validation overlap')
     axes[1].set_xlabel('epoch')
-    axes[1].set_ylabel('validation Dice')
+    axes[1].set_ylabel('pixel Dice')
+    axes[1].set_ylim(dice_bottom, dice_top)
+
+    for axis in axes:
+        axis.grid(axis='y', color='0.90', linewidth=0.6)
+        axis.spines[['top', 'right']].set_visible(False)
+        if len(epochs) == 1:
+            axis.set_xlim(selected_epoch - 0.5, selected_epoch + 0.5)
+            axis.set_xticks([selected_epoch])
 
     fig.savefig(path, dpi=200, bbox_inches='tight')
     plt.close(fig)
 
 
-def average_rows(rows):
-    if len(rows) == 0:
-        return {}
-
-    keys = rows[0].keys()
+def average_batches(batches):
+    keys = batches[0].keys()
     return {
-        key: float(np.mean([row[key] for row in rows]))
+        key: float(np.mean([batch[key] for batch in batches]))
         for key in keys
         }
 
 
 #%% main
 def main():
-    import torch
-
     args = parse_args()
-    config = load_config(args.config)
-    train_cfg = get_section(config, 'train')
-    # 1 August 2026: seed model initialisation and loader shuffling for cleaner comparisons.
-    set_random_seed(train_cfg.get('seed', 7))
-    device = get_device(train_cfg.get('device', 'auto'))
+    config = load_recipe(args.config)
+    training = config['train']
+    # 1 August 2026: seed model initialisation and loader shuffling for cleaner comparisons
+    set_random_seed(training['seed'])
+    device = get_device(training['device'])
     run_dir = prepare_run_dir(config)
-    figure_run_dir = prepare_figure_run_dir(run_dir.name)
+    figure_run_dir = FIGURE_ROOT / 'runs' / run_dir.name
+    figure_run_dir.mkdir(parents=True, exist_ok=True)
 
     print(f'training on {device}')
     print(f'run directory: {run_dir}')
 
     train_dataset, val_dataset, train_loader, val_loader = make_dataloaders(config, device)
-    print(f'train sessions: {len(train_dataset.rows)}')
-    print(f'validation sessions: {len(val_dataset.rows)}')
+    print(f'train sessions: {len(train_dataset.sessions)}')
+    print(f'validation sessions: {len(val_dataset.sessions)}')
 
-    model = build_model(get_section(config, 'model')).to(device)
+    model = build_model(config['model']).to(device)
     optimiser = torch.optim.AdamW(
         model.parameters(),
-        lr=train_cfg.get('learning_rate', 3e-4),
-        weight_decay=train_cfg.get('weight_decay', 1e-5),
+        lr=training['learning_rate'],
+        weight_decay=training['weight_decay'],
         )
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp(config, device))
 
     history = []
     best_score = -np.inf
-    epochs = int(train_cfg.get('epochs', 80))
+    epochs = training['epochs']
 
     for epoch in range(1, epochs + 1):
         train_stats = train_one_epoch(model, train_loader, optimiser, scaler, device, config, epoch)
         val_stats = validate(model, val_loader, device, config, epoch)
 
-        row = {'epoch': epoch}
-        row.update({f'train_{key}': value for key, value in train_stats.items()})
-        row.update({f'val_{key}': value for key, value in val_stats.items()})
-        history.append(row)
+        epoch_stats = {'epoch': epoch}
+        epoch_stats.update({f'train_{key}': value for key, value in train_stats.items()})
+        epoch_stats.update({f'val_{key}': value for key, value in val_stats.items()})
+        history.append(epoch_stats)
 
-        val_score = row.get('val_pixel_dice', -np.inf)
-        train_loss = row['train_loss']
-        val_loss = row['val_loss']
+        val_score = epoch_stats['val_pixel_dice']
+        train_loss = epoch_stats['train_loss']
+        val_loss = epoch_stats['val_loss']
         print(
             f'epoch {epoch:03d} | '
             f'train loss {train_loss:.4f} | '
@@ -411,7 +416,7 @@ def main():
             f'val Dice {val_score:.4f}'
             )
 
-        # Keep the checkpoint with the best validation Dice; this is the mask overlap I inspect.
+        # keep the checkpoint with the best validation Dice, the mask overlap I inspect
         if val_score > best_score:
             best_score = val_score
             save_checkpoint(run_dir / 'best.pt', model, optimiser, epoch, best_score, config)
