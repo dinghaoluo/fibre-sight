@@ -793,7 +793,7 @@ def _resource_use(process):
 
     try:
         family = [process, *process.children(recursive=True)]
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
         return 0, 0, 0
     rss = []
     threads = 0
@@ -802,7 +802,7 @@ def _resource_use(process):
             rss.append(member.memory_info().rss)
             threads += member.num_threads()
         # 15 August 2026: the sampler cannot read several protected MATLAB helpers on macOS
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError):
             continue
     # 15 August 2026: process-tree RSS counts shared pages twice
     return max(rss, default=0), sum(rss), threads
@@ -1599,15 +1599,18 @@ def run_reference_suite(root=SUITE_ROOT):
             print(f'{case_i:02d}/{len(cases)}  {case_name}  {method}')
             log_root = case['root'] / 'logs'
             log_root.mkdir(parents=True, exist_ok=True)
-            with (log_root / f'{method}_reference_convergence.txt').open('w') as log:
-                subprocess.run(
+            log_path = log_root / f'{method}_reference_convergence.txt'
+            with log_path.open('w') as log:
+                result = subprocess.run(
                     _reference_command(method, case['root']),
                     cwd=PROJECT_ROOT,
                     env=_method_environment(method, root),
-                    check=True,
+                    check=False,
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     )
+            if result.returncode:
+                print(f'{case_name}  {method} failed; see {log_path}')
 
 
 #%% suite measurements
@@ -1638,10 +1641,24 @@ def measure_suite(root=SUITE_ROOT):
     rows = {name: [] for name in outputs}
     for case in benchmark_cases(root):
         case_name = case['case']
+        case_root = case['root']
         metrics_path = case['root'] / 'metrics.csv'
+        reference_path = case_root / 'reference_metrics.csv'
+        convergence_path = case_root / 'method_reference_convergence.csv'
+        base_reference = case['source'] in BASE_SOURCES
+        if not metrics_path.exists() or (
+                base_reference
+                and (not reference_path.exists() or not convergence_path.exists())
+                ):
+            with np.load(case['root'] / 'truth.npz') as saved:
+                truth = {name: saved[name] for name in saved.files}
         if not metrics_path.exists():
             print(f'measuring {case_name}')
-            benchmark.measure(case['root'], METHODS, compare_references=False)
+            benchmark.measure(case_root, METHODS, compare_references=False)
+        if base_reference and not reference_path.exists():
+            benchmark.measure_references(case_root, truth, METHODS)
+        if base_reference and not convergence_path.exists():
+            benchmark.measure_reference_convergence(case_root, truth)
         for name in outputs:
             path = case['root'] / name
             if path.exists():
@@ -1903,10 +1920,11 @@ def summarise_source_groups(root=SUITE_ROOT, figure_root=EXAMPLE_ROOT):
                         position + jitter, visible, s=14,
                         color=METHOD_COLOURS[method], alpha=0.35)
                     mean = float(advantage.mean())
+                    plotted_mean = float(np.clip(mean, lower, upper))
                     axis.errorbar(
-                        position, mean,
-                        yerr=[[mean - max(float(advantage.min()), lower)],
-                              [min(float(advantage.max()), upper) - mean]],
+                        position, plotted_mean,
+                        yerr=[[plotted_mean - visible.min()],
+                              [visible.max() - plotted_mean]],
                         fmt='D', markersize=5, capsize=3,
                         color=METHOD_COLOURS[method], zorder=3,
                         )
@@ -1951,7 +1969,8 @@ def summarise_source_groups(root=SUITE_ROOT, figure_root=EXAMPLE_ROOT):
     figure.get_layout_engine().set(rect=(0, 0.08, 1, 0.86))
     figure.text(
         0.5, 0.045,
-        'positive values mean lower FibreSight error; diamonds and bars show the mean and observed range; open triangles mark clipped values',
+        'positive values mean lower FibreSight error; diamonds and bars show '
+        'the mean and observed range; open triangles mark clipped values',
         ha='center', fontsize=8)
     figure.savefig(
         figure_root / 'registration_benchmark_source_groups.png',
@@ -2800,6 +2819,15 @@ def measure_quality_suite(root=SUITE_ROOT):
     from fibre_sight.preprocessing import measure_quality
 
     root = Path(root)
+    fields = [
+        'case_order', 'case', 'source', 'frames', 'status', 'error',
+        'truth_focal_frames', 'detected_focal_frames', 'overlap_frames',
+        'ambiguous_frames', 'out_of_range_frames', 'analysis_valid_frames',
+        'truth_focal_episodes', 'detected_focal_episodes',
+        'detected_episode_durations_s', 'minimum_canonical_gradient_ncc',
+        'minimum_local_gradient_ncc', 'minimum_control_gain',
+        'median_axial_similarity', 'local_reference_fallback_blocks',
+        ]
     rows = []
     for case in benchmark_cases(root):
         if case['recipe'] != 'focal_change':
@@ -2821,8 +2849,21 @@ def measure_quality_suite(root=SUITE_ROOT):
                 }
             for frame_i in range(len(movie))
             ]
-        quality = measure_quality(result['reference'], movie, estimates, 30)
         focal_truth = np.asarray(truth['focal'], dtype=bool)
+        try:
+            quality = measure_quality(result['reference'], movie, estimates, 30)
+        except ValueError as error:
+            rows.append({
+                'case_order': case['case_order'],
+                'case': case['case'],
+                'source': case['source'],
+                'frames': len(movie),
+                'status': 'failed',
+                'error': str(error),
+                'truth_focal_frames': int(focal_truth.sum()),
+                **{field: np.nan for field in fields[7:]},
+                })
+            continue
         focal_detected = quality['recommended_state'] == 'focal_loss'
         overlap = focal_truth & focal_detected
         finite_gain = quality['control_gain'][np.isfinite(quality['control_gain'])]
@@ -2832,6 +2873,8 @@ def measure_quality_suite(root=SUITE_ROOT):
             'case': case['case'],
             'source': case['source'],
             'frames': len(movie),
+            'status': 'ok',
+            'error': '',
             'truth_focal_frames': int(focal_truth.sum()),
             'detected_focal_frames': int(focal_detected.sum()),
             'overlap_frames': int(overlap.sum()),
@@ -2856,7 +2899,7 @@ def measure_quality_suite(root=SUITE_ROOT):
 
     output = root / 'quality_metrics.csv'
     with output.open('w', newline='') as file:
-        writer = DictWriter(file, fieldnames=rows[0])
+        writer = DictWriter(file, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
     return rows
