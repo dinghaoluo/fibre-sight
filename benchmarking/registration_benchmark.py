@@ -73,7 +73,23 @@ def _normalise(image):
 
 
 def make_planes(control, below, above):
-    from scipy.ndimage import gaussian_filter
+    from scipy.ndimage import gaussian_filter, zoom
+
+    shape = control.shape
+    if below.shape != shape:
+        below = zoom(
+            below,
+            (shape[0] / below.shape[0], shape[1] / below.shape[1]),
+            order=1,
+            prefilter=False,
+        )
+    if above.shape != shape:
+        above = zoom(
+            above,
+            (shape[0] / above.shape[0], shape[1] / above.shape[1]),
+            order=1,
+            prefilter=False,
+        )
 
     control = _normalise(control)
     below = _normalise(below)
@@ -420,7 +436,7 @@ def make_benchmark(
     # 15 August 2026: write truth.npz last so an interrupted movie is incomplete
     (root / 'truth.npz').unlink(missing_ok=True)
     control = np.load(SOURCE_ROOT / source)
-    outer_names = [name for name in EXAMPLE_REFERENCES if name != source]
+    outer_names = [name for name in EXAMPLE_REFERENCES if name != source][:2]
     outer = [np.load(SOURCE_ROOT / name) for name in outer_names]
     below, above = outer
     planes = make_planes(control, below, above)
@@ -1921,10 +1937,56 @@ def measure_reference_convergence(root, truth):
 
 
 #%% review movie
-def make_rigid_comparison_movie(
-        root=BENCHMARK_ROOT,
-        path=EXAMPLE_ROOT / 'rigid_registration_benchmark.mp4',
-        ):
+def _piecewise_offsets(result, truth):
+    tile_y = np.asarray(result['tile_y'])
+    tile_x = np.asarray(result['tile_x'])
+    frame = np.arange(len(truth['shift_y']))
+    truth_y, truth_x = displacement_at(truth, frame, tile_y, tile_x)
+    estimate_y = np.asarray(result['local_y'])
+    estimate_x = np.asarray(result['local_x'])
+    if 'shift_y' in result:
+        estimate_y = estimate_y + result['shift_y'][:, None]
+        estimate_x = estimate_x + result['shift_x'][:, None]
+    calibration = (frame < len(frame) // 2) & truth['estimable']
+    return (
+        np.median(estimate_y[calibration] - truth_y[calibration]),
+        np.median(estimate_x[calibration] - truth_x[calibration]),
+        )
+
+
+def _piecewise_movement(result, frame_i, shape, offsets, cubic=False):
+    import cv2
+
+    tile_y = np.unique(result['tile_y'])
+    tile_x = np.unique(result['tile_x'])
+    movement_y = np.asarray(result['local_y'][frame_i])
+    movement_x = np.asarray(result['local_x'][frame_i])
+    if 'shift_y' in result:
+        movement_y = movement_y + result['shift_y'][frame_i]
+        movement_x = movement_x + result['shift_x'][frame_i]
+
+    grid_y = np.empty((len(tile_y), len(tile_x)), dtype=np.float32)
+    grid_x = np.empty_like(grid_y)
+    for tile_i, (y, x) in enumerate(zip(result['tile_y'], result['tile_x'])):
+        iy = np.searchsorted(tile_y, y)
+        ix = np.searchsorted(tile_x, x)
+        grid_y[iy, ix] = movement_y[tile_i] - offsets[0]
+        grid_x[iy, ix] = movement_x[tile_i] - offsets[1]
+
+    sample_y = np.interp(np.arange(shape[0]), tile_y, np.arange(len(tile_y)))
+    sample_x = np.interp(np.arange(shape[1]), tile_x, np.arange(len(tile_x)))
+    map_x, map_y = np.meshgrid(sample_x, sample_y)
+    interpolation = cv2.INTER_CUBIC if cubic else cv2.INTER_LINEAR
+    dense_y = cv2.remap(
+        grid_y, map_x.astype(np.float32), map_y.astype(np.float32),
+        interpolation, borderMode=cv2.BORDER_REPLICATE)
+    dense_x = cv2.remap(
+        grid_x, map_x.astype(np.float32), map_y.astype(np.float32),
+        interpolation, borderMode=cv2.BORDER_REPLICATE)
+    return dense_y, dense_x
+
+
+def _make_registration_comparison_movie(root, path, model):
     import av
     import cv2
     from fibre_sight.preprocessing import warp_frame
@@ -1934,15 +1996,19 @@ def make_rigid_comparison_movie(
     with np.load(root / 'truth.npz') as saved:
         truth = {name: saved[name] for name in saved.files}
 
-    names = ['fibresight_rigid', 'suite2p_rigid', 'caiman_rigid']
+    names = [f'fibresight_{model}', f'suite2p_{model}', f'caiman_{model}']
     results = []
     calibration = (np.arange(len(movie)) < len(movie) // 2) & truth['estimable']
     known = np.column_stack([truth['shift_y'], truth['shift_x']])
     for name in names:
         with np.load(root / f'{name}.npz') as saved:
-            movement = np.column_stack([saved['shift_y'], saved['shift_x']])
-        offset = np.median(movement[calibration] - known[calibration], axis=0)
-        results.append((movement, offset))
+            result = {field: saved[field] for field in saved.files}
+        if model == 'rigid':
+            movement = np.column_stack([result['shift_y'], result['shift_x']])
+            offset = np.median(movement[calibration] - known[calibration], axis=0)
+            results.append((movement, offset))
+        else:
+            results.append((result, _piecewise_offsets(result, truth)))
 
     sample = np.asarray(movie[np.linspace(0, len(movie) - 1, 100, dtype=int)])
     low, high = np.percentile(sample, [0.1, 99.9])
@@ -1956,47 +2022,78 @@ def make_rigid_comparison_movie(
     shown_width = 3 * width // 4
     margin = 8
     gutter = 16
-    title_height = 28
+    title_height = 48
     stream.width = 2 * margin + 4 * shown_width + 3 * gutter
     stream.height = shown_height + 2 * margin + title_height
     stream.pix_fmt = 'yuv420p'
 
-    labels = ['raw', 'FibreSight rigid', 'Suite2p rigid', 'CaImAn rigid']
-    sections = [('rigid benchmark', 0, min(900, len(movie)))]
-    for section, start, stop in sections:
-        for frame_i in range(start, stop):
-            frame = movie[frame_i]
-            panels = [np.asarray(frame, dtype=np.float32)]
-            for movement, offset in results:
+    labels = [
+        'raw', f'FibreSight {model}', f'Suite2p {model}', f'CaImAn {model}']
+    for frame_i in range(min(900, len(movie))):
+        frame = movie[frame_i]
+        panels = [np.asarray(frame, dtype=np.float32)]
+        for method_i, (result, offset) in enumerate(results):
+            if model == 'rigid':
+                movement = result
                 correction = -movement[frame_i] + offset
                 registered, _ = warp_frame(frame, *correction)
-                panels.append(registered)
+            else:
+                movement_y, movement_x = _piecewise_movement(
+                    result, frame_i, frame.shape, offset, cubic=method_i == 2)
+                y, x = np.mgrid[:frame.shape[0], :frame.shape[1]].astype(np.float32)
+                registered = cv2.remap(
+                    np.asarray(frame, dtype=np.float32),
+                    x + movement_x,
+                    y + movement_y,
+                    cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=np.nan,
+                    )
+            panels.append(registered)
 
-            shown = []
-            for panel, label in zip(panels, labels):
-                panel = np.nan_to_num((panel - low) / (high - low), nan=0)
-                panel = np.clip(255 * panel, 0, 255).astype(np.uint8)
-                panel = cv2.resize(panel, (shown_width, shown_height), interpolation=cv2.INTER_AREA)
-                panel = cv2.cvtColor(panel, cv2.COLOR_GRAY2BGR)
-                cv2.putText(panel, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-                cv2.putText(panel, label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                shown.append(panel)
-            canvas = np.full((stream.height, stream.width, 3), 24, dtype=np.uint8)
+        shown = []
+        for panel in panels:
+            panel = np.nan_to_num((panel - low) / (high - low), nan=0)
+            panel = np.clip(255 * panel, 0, 255).astype(np.uint8)
+            panel = cv2.resize(
+                panel, (shown_width, shown_height), interpolation=cv2.INTER_AREA)
+            shown.append(cv2.cvtColor(panel, cv2.COLOR_GRAY2BGR))
+
+        canvas = np.full((stream.height, stream.width, 3), 24, dtype=np.uint8)
+        cv2.putText(
+            canvas, f'{model} registration', (margin, 20),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (235, 235, 235), 1,
+            )
+        for panel_i, (panel, label) in enumerate(zip(shown, labels)):
+            x = margin + panel_i * (shown_width + gutter)
             cv2.putText(
-                canvas, section, (margin, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                canvas, label, (x, margin + title_height - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
                 0.5, (235, 235, 235), 1,
                 )
-            for panel_i, panel in enumerate(shown):
-                x = margin + panel_i * (shown_width + gutter)
-                y = margin + title_height
-                canvas[y:y + shown_height, x:x + shown_width] = panel
-            video_frame = av.VideoFrame.from_ndarray(canvas, format='bgr24')
-            for packet in stream.encode(video_frame):
-                video.mux(packet)
+            y = margin + title_height
+            canvas[y:y + shown_height, x:x + shown_width] = panel
+        video_frame = av.VideoFrame.from_ndarray(canvas, format='bgr24')
+        for packet in stream.encode(video_frame):
+            video.mux(packet)
     for packet in stream.encode():
         video.mux(packet)
     video.close()
     return path
+
+
+def make_rigid_comparison_movie(
+        root=BENCHMARK_ROOT,
+        path=EXAMPLE_ROOT / 'rigid_registration_benchmark.mp4',
+        ):
+    return _make_registration_comparison_movie(root, path, 'rigid')
+
+
+def make_piecewise_comparison_movie(
+        root=BENCHMARK_ROOT,
+        path=EXAMPLE_ROOT / 'piecewise_registration_benchmark.mp4',
+        ):
+    return _make_registration_comparison_movie(root, path, 'piecewise')
 
 
 #%% errors

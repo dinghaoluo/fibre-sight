@@ -30,6 +30,7 @@ from benchmarking.registration_benchmark import (
     _gradient_ncc,
     _normalise,
     _patchwarp_grid,
+    _piecewise_movement,
     _pyflowreg_grid,
     _write_patchwarp_tiff,
     _warp,
@@ -210,6 +211,18 @@ class RegistrationBenchmarkTests(unittest.TestCase):
             planes = make_planes(control, *outer)
             np.testing.assert_allclose(planes[2], _normalise(control))
 
+    def test_outer_planes_follow_a_smaller_control_shape(self):
+        control = np.arange(128 * 128, dtype=np.float32).reshape(128, 128)
+        outer = [
+            np.arange(256 * 256, dtype=np.float32).reshape(256, 256),
+            np.flipud(np.arange(256 * 256, dtype=np.float32).reshape(256, 256)),
+            ]
+
+        planes = make_planes(control, *outer)
+
+        self.assertEqual(planes.shape, (5, 128, 128))
+        np.testing.assert_allclose(planes[2], _normalise(control))
+
     def test_synthetic_movement_enters_and_leaves_softly(self):
         truth = motion_truth(2000, (64, 80))
         rigid_step = np.hypot(np.diff(truth['shift_y']), np.diff(truth['shift_x']))
@@ -329,6 +342,21 @@ class RegistrationBenchmarkTests(unittest.TestCase):
         self.assertEqual((offset_y, offset_x), (5, -2))
         np.testing.assert_allclose(error, [0, 0, np.sqrt(5), np.sqrt(5)])
         np.testing.assert_array_equal(valid, estimable)
+
+    def test_piecewise_movie_interpolates_saved_tile_movement(self):
+        result = {
+            'tile_y': np.array([1, 1, 3, 3]),
+            'tile_x': np.array([1, 3, 1, 3]),
+            'local_y': np.array([[0, 2, 4, 6]], dtype=np.float32),
+            'local_x': np.array([[6, 4, 2, 0]], dtype=np.float32),
+            }
+        offsets = (0, 0)
+
+        movement_y, movement_x = _piecewise_movement(
+            result, 0, (5, 5), offsets)
+
+        np.testing.assert_allclose(movement_y[[0, 2, 4], [0, 2, 4]], [0, 3, 6])
+        np.testing.assert_allclose(movement_x[[0, 2, 4], [0, 2, 4]], [6, 3, 0])
 
     def test_reference_comparison_removes_position_and_intensity(self):
         from scipy import ndimage as ndi

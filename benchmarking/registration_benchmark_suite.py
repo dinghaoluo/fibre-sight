@@ -619,6 +619,16 @@ def make_rigid_review_movie(
     return benchmark.make_rigid_comparison_movie(case['root'], path=path)
 
 
+def make_piecewise_review_movie(
+        root=SUITE_ROOT,
+        path=EXAMPLE_ROOT / 'piecewise_registration_benchmark.mp4',
+        ):
+    case = next(
+        case for case in benchmark_cases(root)
+        if case['source'] == SOURCES[0] and case['recipe'] == 'local_deformation')
+    return benchmark.make_piecewise_comparison_movie(case['root'], path=path)
+
+
 #%% method processes
 def _run_method(method, root):
     root = Path(root)
@@ -3167,6 +3177,8 @@ def main():
         make_review_movie(suite_root)
     elif args.step == 'review-rigid':
         make_rigid_review_movie(suite_root)
+    elif args.step == 'review-piecewise':
+        make_piecewise_review_movie(suite_root)
     elif args.step == 'references':
         run_reference_suite(suite_root)
     elif args.step == 'run-intensity':
