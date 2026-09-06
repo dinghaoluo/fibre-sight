@@ -2,6 +2,12 @@
 
 This is the working record for the motion-correction comparisons. The expanded benchmark uses the ten reference images under `benchmarking/sources/`, four synthetic movement recipes, a seed derived from `42`, and a fixed first-half boundary at observation 1000. The second half remains held out when the displacement error is scored.
 
+The two `lab-session-1` references are central 256 × 256 crops of the supplied PNGs.
+The FibreSight rows, source-group summaries, figures, and review movies below
+were regenerated from those public arrays on 3 September 2026. The benchmark
+suite was rerun after the crop change; 19 external runs exited non-zero and
+remain recorded in the resource table.
+
 ## methods
 
 The completed comparison now includes:
@@ -21,7 +27,7 @@ FibreSight rigid uses `whitening=0` in the base comparison. The original photon 
 The external sources are kept under `workspace/dev/sources/`, which is ignored with the generated benchmark data. The source anchors recorded for the scored methods are:
 
 ```text
-FibreSight v0.1.3      20dc18a092a13cbf36749302e53b7a1b5bc9be31 (dirty worktree)
+FibreSight v0.2.0      current checkout (dirty worktree)
 PatchWarp v1.3.3       7cac6307b6d3aa107baecd86d8085823b437fbb1
 PyFlowReg v0.1.0a9     126d1996c24b330bec20e7268937f9122fd2f4ab
 ```
@@ -34,9 +40,10 @@ The public synthetic benchmark needs the ten `.npy` images under `benchmarking/s
 
 ![Ten public source images used by the registration benchmark](examples/benchmark_source_gallery.png)
 
-The completed base results were produced with these local interpreters and tools:
+The FibreSight and external rows were produced with the pinned environments
+below. The local interpreter launches `benchmarking.registration_benchmark_suite`:
 
-- FibreSight 0.1.3 under the Python interpreter that launches `benchmarking.registration_benchmark_suite`;
+- FibreSight 0.2.0 under the Python interpreter that launches `benchmarking.registration_benchmark_suite`;
 - Suite2p 0.11.1 under Python 3.10.20 at `workspace/dev/envs/suite2p-0.11.1/bin/python`;
 - CaImAn 1.12.2 under Python 3.10.20 at `workspace/dev/envs/caiman-1.12.2/bin/python`;
 - PyFlowReg 0.1.0a9 under Python 3.11.15 at `workspace/dev/envs/pyflowreg-0.1.0a9/bin/python`;
@@ -45,7 +52,7 @@ The completed base results were produced with these local interpreters and tools
 
 ## benchmark matrix
 
-The expanded base suite has 40 movies: ten saved reference images crossed with `ordinary_motion`, `large_motion`, `local_deformation`, and `focal_change`. Each movie has 2000 observations, 65 control-channel photons, and 18% total bleaching. All rigid methods, Suite2p piecewise, PyFlowReg piecewise, and FibreSight piecewise completed all 40 cases. CaImAn piecewise completed 28 cases; PatchWarp affine completed 33. The 19 failed external runs remain in `resources.csv` with non-zero exit codes.
+The expanded base suite has 40 movies: ten saved reference images crossed with `ordinary_motion`, `large_motion`, `local_deformation`, and `focal_change`. Each movie has 2000 observations, 65 control-channel photons, and 18% total bleaching. FibreSight rigid and piecewise runs completed all 40 cases. The external outputs cover 40 Suite2p rigid cases, 40 Suite2p piecewise cases, 40 CaImAn rigid cases, 28 CaImAn piecewise cases, 40 PatchWarp rigid cases, 33 PatchWarp affine cases, and 40 PyFlowReg piecewise cases. The 19 failed external runs remain in `resources.csv` with non-zero exit codes.
 
 The intensity suite has 42 distinct movies and 408 method runs:
 
@@ -56,81 +63,81 @@ The same source and motion recipe use the same seed across photon or bleaching l
 
 ## expanded base results
 
-The completed base run gives the following held-out 95th-percentile displacement errors. Each mean first averages the four recipe values within a source image, then averages the complete source means.
+The held-out 95th-percentile displacement errors are below. Each mean first averages the four recipe values within a source image, then averages the complete source means. The rows use the runs recorded above; incomplete external methods contribute only their complete source means.
 
 | Method | Cases | Complete sources | Mean p95 error (px) |
 |---|---:|---:|---:|
-| FibreSight rigid | 40 | 10 | 0.682166 |
-| FibreSight piecewise | 40 | 10 | 0.802346 |
-| Suite2p rigid | 40 | 10 | 1.329460 |
-| Suite2p piecewise | 40 | 10 | 1.990556 |
-| CaImAn rigid | 40 | 10 | 0.754679 |
-| CaImAn piecewise | 28 | 7 | 1.612746 |
-| PatchWarp rigid | 40 | 10 | 0.678434 |
-| PatchWarp affine | 33 | 7 | 1.672767 |
-| PyFlowReg piecewise | 40 | 10 | 3.697241 |
+| FibreSight rigid | 40 | 10 | 0.442757 |
+| FibreSight piecewise | 40 | 10 | 0.514340 |
+| Suite2p rigid | 40 | 10 | 0.793597 |
+| Suite2p piecewise | 40 | 10 | 1.267313 |
+| CaImAn rigid | 40 | 10 | 0.464851 |
+| CaImAn piecewise | 28 | 7 | 1.618834 |
+| PatchWarp rigid | 40 | 10 | 0.458152 |
+| PatchWarp affine | 33 | 7 | 1.887478 |
+| PyFlowReg piecewise | 40 | 10 | 2.471898 |
 
-The missing CaImAn and PatchWarp values are treated as absent scores. Means and intervals use complete source means, so a source contributes only when all four recipes completed for that method. The resource table remains the record of failures; they are not converted into large finite errors.
+The missing external values are treated as absent scores. Means and intervals use complete source means, so a source contributes only when all four recipes completed for that method. The resource table remains the record of failures; they are not converted into large finite errors.
 
 The rigid comparisons fit one constant reference offset on observations 0 to 999 and score observations 1000 to 1999. Positive advantage means that the competitor has a larger error than FibreSight:
 
 | Rigid competitor | Competitor mean p95 (px) | Advantage (px) | 95% t interval |
 |---|---:|---:|---:|
-| Suite2p | 1.329460 | 0.647294 | -0.022722 to 1.317309 |
-| CaImAn | 0.754679 | 0.072513 | -0.109223 to 0.254249 |
-| PatchWarp | 0.678434 | -0.003732 | -0.046733 to 0.039269 |
+| Suite2p | 0.793597 | 0.350840 | 0.323459 to 0.378222 |
+| CaImAn | 0.464851 | 0.022093 | -0.034217 to 0.078404 |
+| PatchWarp | 0.458152 | 0.015395 | -0.008897 to 0.039687 |
 
-All three source-level rigid intervals cross zero. The case-level Wilcoxon test resolves FibreSight against Suite2p and CaImAn after Bonferroni correction, but the ten source anatomies remain the relevant unit for an anatomical generalisation.
+The Suite2p source-level interval is positive; the CaImAn and PatchWarp intervals cross zero. The case-level Wilcoxon test resolves FibreSight against Suite2p after Bonferroni correction, but not against CaImAn or PatchWarp; the ten source anatomies remain the relevant unit for an anatomical generalisation.
 
 ## piecewise results
 
 FibreSight first estimates an 80-pixel overlapping tile grid around its rigid position. Each retained 7 by 7 correlation surface supplies a two-dimensional precision matrix; PIV normalised-median validation removes inconsistent vectors. A confidence-weighted cubic B-spline then separates one unpenalised global adjustment from the local field. Calibration observations 0 to 999 froze the spatial penalty at 10 and the coefficient-magnitude penalty at 1. No temporal smoothing enters the field.
 
-The applied field must retain at least 60% of tiles, stay within 3 px of the rigid correction, keep neighbouring tile predictions within 3 px, and keep the sampling-map Jacobian inside 0.80 to 1.25. Rejected frames use the rigid correction and retain a named reason. Across the expanded suite, 5,782 of 80,000 frames use this fallback. The largest source totals are 2,001 frames for DANDI jGCaMP8s and 1,755 for Allen VIS 01; this is part of the measured behaviour, since the field safeguards are active much more often on some anatomies.
+The applied field must retain at least 60% of tiles, stay within 3 px of the rigid correction, keep neighbouring tile predictions within 3 px, and keep the sampling-map Jacobian inside 0.80 to 1.25. Rejected frames use the rigid correction and retain a named reason. Across the expanded suite, 2,294 of 80,000 frames use this fallback. The largest source total is 1,748 frames for Allen VIS 01, followed by 286 for Allen VIS 02; this is part of the measured behaviour, since the field safeguards are active much more often on some anatomies.
 
-The two 512-pixel labmate sources also exercised the reference fallback in all eight cases. The relaxed pass supplied 992 to 1,000 aligned candidates, from which 500 time-balanced frames were accepted. Five hundred remains the stable target; it is no longer a hard processing threshold when only 50 to 499 usable frames remain. Fewer than 50 usable frames still stops reference construction.
+The two 256-pixel `lab-session-1` sources also exercised the reference fallback in all eight cases. The relaxed pass supplied 992 to 1,000 aligned candidates, from which 500 time-balanced frames were accepted. Five hundred remains the stable target; it is no longer a hard processing threshold when only 50 to 499 usable frames remain. Fewer than 50 usable frames still stops reference construction.
 
 Pooled held-out confidence rejects 96.25% of raw tile errors above 1 px and 2.49% of clean tiles, passing the declared 95% detection and 5% clean-rejection limits. Every held-out non-rigid cell passes the 0.20 px median and 0.50 px p95 endpoint gates. Seven of nine deformation-free cells pass the 0.10 px median and 0.25 px local p95 gates; the other two p95 values are 0.256 and 0.251 px.
 
-On the common 7 by 7 grid, FibreSight's mean held-out p95 error is 0.802346 px across ten complete sources, compared with 1.990556 for Suite2p piecewise and 3.697241 for PyFlowReg. FibreSight's source-level advantage over Suite2p is 1.188210 px (95% t interval 0.145726 to 2.230694); the lower bound is now positive. The 40-case Wilcoxon p-value is 1.27e-10 before correction and 5.09e-10 after correction for four piecewise comparisons.
+On the common 7 by 7 grid, FibreSight's mean held-out p95 error is 0.514340 px across ten complete sources, compared with 1.267313 for Suite2p piecewise and 2.471898 for PyFlowReg. FibreSight's source-level advantage over Suite2p is 0.752972 px (95% t interval 0.096080 to 1.409865); the lower bound is positive. The 40-case Wilcoxon p-value is 2.00e-10 before correction and 8.00e-10 after correction for four piecewise comparisons.
 
 ![Held-out rigid and piecewise registration error across the public benchmark](examples/registration_benchmark_comparison.png)
 
-CaImAn piecewise and PatchWarp affine failed enough public cases that their comparisons use seven complete sources. FibreSight's advantage is 1.028027 px against CaImAn (95% interval 0.391416 to 1.664638; 28 paired cases) and 1.173012 px against PatchWarp (0.400907 to 1.945117; 33 paired cases). The PyFlowReg comparison uses all ten sources and gives an advantage of 2.894895 px (0.579315 to 5.210474). These intervals describe the cases each method could estimate; the separate failure counts remain part of the result.
+CaImAn piecewise and PatchWarp affine failed enough public cases that their comparisons use seven sources; PyFlowReg completed all ten. FibreSight's advantage is 1.079743 px against CaImAn (95% interval 0.388864 to 1.770621; 28 paired cases), 1.450300 px against PatchWarp (0.091497 to 2.809102; 33 paired cases), and 1.957558 px against PyFlowReg (0.539682 to 3.375434; 40 paired cases). These intervals describe the cases each method could estimate; the separate failure counts remain part of the result.
 
-Automatic model selection compares calibration-half gradient NCC, spatially cross-validated tile-residual p95, valid area, measured signal/control residual alignment, and accepted-or-named-fallback coverage. Four interleaved tile folds fit on three spatial classes and score the fourth. Synthetic truth is opened afterwards, solely to score the choice. On the 40-case suite, whose saved movies contain only the control channel, `auto` selects piecewise registration for three cases and rigid registration for 37; its mean held-out p95 error is 0.630996 px.
+Automatic model selection compares calibration-half gradient NCC, spatially cross-validated tile-residual p95, valid area, measured signal/control residual alignment, and accepted-or-named-fallback coverage. Four interleaved tile folds fit on three spatial classes and score the fourth. Synthetic truth is opened afterwards, solely to score the choice. On the 40-case suite, whose saved movies contain only the control channel, `auto` selects piecewise registration for three cases and rigid registration for 37; its mean held-out p95 error is 0.391587 px.
 
 The independent validation uses a separate seed branch, 1,000 frames per case, and newly generated signal and control movies for the original three references and four motion recipes. `auto` selects piecewise registration in two of 12 cases, with both choices improving on rigid; the other ten cases retain rigid. Its mean held-out p95 error is 0.316378 px, compared with 0.435837 px for rigid, 0.245210 px for forced piecewise, and 0.192131 px for the lower-error model chosen afterwards from truth. The selector misses four piecewise gains, three during focal-change recipes and one during local deformation, because their gradient-NCC gains remain below the frozen 0.01 boundary. The largest missed gain is 0.586877 px. Every case supplies focus evidence, and the measured cross-channel residual passes every comparison. The generated channels share one static coordinate system; the coordinate direction for a non-zero signal/control offset is tested separately in `test_preprocessing.py`. I have kept the 0.01 boundary unchanged after this held-out inspection. `auto` therefore remains the planned default: this validation found no harmful escalation beyond rigid, although its conservative boundary leaves measurable piecewise improvement unused.
 
-Across the expanded suite, FibreSight's rigid and field subprocesses have a median combined wall time of 76.989 s. Maximum process RSS is 1.796 GiB for rigid registration and 1.321 GiB for the field pass, below the 2 GiB working limit. The 512-pixel sources determine both maxima.
+Across the expanded suite, FibreSight's rigid and field subprocesses have a median combined wall time of 70.787 s. Maximum process RSS is 0.733 GiB for rigid registration and 0.493 GiB for the field pass, below the 2 GiB working limit.
 
 Two-sided Wilcoxon signed-rank tests use the 40 held-out case-level p95 errors. The three p-values are corrected together with the Bonferroni method:
 
 | Rigid competitor | Raw p | Bonferroni p |
 |---|---:|---:|
 | Suite2p | 9.09e-12 | 2.73e-11 |
-| CaImAn | 0.013558 | 0.040673 |
-| PatchWarp | 0.062184 | 0.186552 |
+| CaImAn | 0.048164 | 0.144493 |
+| PatchWarp | 0.084155 | 0.252464 |
 
 The accuracy figure gives the corrected numerical value for every comparison. `suite_comparisons.csv` retains the Wilcoxon statistic, raw p-value, corrected p-value, and `n=40`.
 
 ## anatomy and image properties
 
-The ten references comprise three fibre images, six somatic images, and one mesoscale olfactory-bulb image. For a second descriptive comparison, each source is scaled and squared in the same way as the latent image used for synthetic photon sampling; the mean Sobel magnitude then divides the sources at the median, 0.142607, into five lower-gradient and five higher-gradient images. Positive values below mean that the competitor has the larger p95 error:
+The ten references comprise three fibre images, six somatic images, and one mesoscale olfactory-bulb image. For a second descriptive comparison, each source is scaled and squared in the same way as the latent image used for synthetic photon sampling; the mean Sobel magnitude then divides the sources at the median, 0.171875, into five lower-gradient and five higher-gradient images. Positive values below mean that the competitor has the larger p95 error:
 
 | Comparison | Fibre | Somatic | Lower gradient | Higher gradient |
 |---|---:|---:|---:|---:|
-| FibreSight rigid vs Suite2p rigid | 0.344 (n=3) | 0.851 (n=6) | 0.359 (n=5) | 0.936 (n=5) |
-| FibreSight rigid vs CaImAn rigid | 0.006 (n=3) | 0.114 (n=6) | 0.157 (n=5) | -0.012 (n=5) |
-| FibreSight rigid vs PatchWarp rigid | 0.015 (n=3) | -0.017 (n=6) | 0.013 (n=5) | -0.021 (n=5) |
-| FibreSight piecewise vs Suite2p piecewise | 0.185 (n=3) | 1.840 (n=6) | 1.296 (n=5) | 1.080 (n=5) |
-| FibreSight piecewise vs CaImAn piecewise | 0.377 (n=3) | 1.517 (n=4) | 1.517 (n=4) | 0.377 (n=3) |
-| FibreSight piecewise vs PatchWarp affine | 0.691 (n=3) | 1.534 (n=4) | 1.534 (n=4) | 0.691 (n=3) |
-| FibreSight piecewise vs PyFlowReg piecewise | 1.374 (n=3) | 3.951 (n=6) | 2.666 (n=5) | 3.123 (n=5) |
+| FibreSight rigid vs Suite2p rigid | 0.344 (n=3) | 0.355 (n=6) | 0.344 (n=5) | 0.358 (n=5) |
+| FibreSight rigid vs CaImAn rigid | 0.006 (n=3) | 0.029 (n=6) | -0.018 (n=5) | 0.062 (n=5) |
+| FibreSight rigid vs PatchWarp rigid | 0.015 (n=3) | 0.013 (n=6) | 0.024 (n=5) | 0.007 (n=5) |
+| FibreSight piecewise vs Suite2p piecewise | 0.185 (n=3) | 1.113 (n=6) | 0.918 (n=5) | 0.588 (n=5) |
+| FibreSight piecewise vs CaImAn piecewise | 0.377 (n=3) | 1.607 (n=4) | 1.332 (n=4) | 0.744 (n=3) |
+| FibreSight piecewise vs PatchWarp affine | 0.691 (n=3) | 2.019 (n=4) | 1.613 (n=4) | 1.234 (n=3) |
+| FibreSight piecewise vs PyFlowReg piecewise | 1.374 (n=3) | 2.385 (n=6) | 2.954 (n=5) | 0.961 (n=5) |
 
-FibreSight rigid is close to CaImAn and PatchWarp on the three fibre references. Its advantage over CaImAn is larger in the lower-gradient half, 0.157 px, and disappears in the higher-gradient half, -0.012 px. FibreSight piecewise has lower error than Suite2p in both gradient halves; the difference is 0.185 px on the fibre references and 1.840 px on the somatic references. These subgroup values are descriptive: the fibre group has three images from the existing FibreSight examples, the two Zhuoyang Ye channels share one field of view, and the mesoscale group has one image.
+FibreSight rigid is close to CaImAn and PatchWarp on the three fibre references. The CaImAn comparison is slightly lower for FibreSight in the lower-gradient half, -0.018 px, and higher in the higher-gradient half, 0.062 px. FibreSight piecewise has lower error than Suite2p in both gradient halves; the difference is 0.185 px on the fibre references, 1.113 px on the somatic references, 0.918 px in the lower-gradient half, and 0.588 px in the higher-gradient half. These subgroup values are descriptive: the fibre group has three images from the existing FibreSight examples, the two Zhuoyang Ye channels share one field of view, and the mesoscale group has one image.
 
-Stored array sides of 128, 256, and 512 pixels are recorded in `source_group_metrics.csv`, but they are not physical zoom groups; several sources have no micrometres-per-pixel or field-of-view width in the saved provenance. The gradient split is also not an SNR split. Every base movie uses 65 control photons, and the separate photon sweep remains the direct noise comparison. CaImAn piecewise has seven complete sources and PatchWarp affine has seven; neither completed the mesoscale source, and each contributes four of the six somatic sources to this table. The figure keeps those missing counts visible instead of filling the failed runs with arbitrary finite errors.
+Stored array sides of 128, 256, and 512 pixels are recorded in `source_group_metrics.csv`, but they are not physical zoom groups; several sources have no micrometres-per-pixel or field-of-view width in the saved provenance. The gradient split is also not an SNR split. Every base movie uses 65 control photons, and the separate photon sweep remains the direct noise comparison. CaImAn piecewise and PatchWarp affine have seven complete sources; neither completed the mesoscale source. The subgroup table keeps each method's available source count visible instead of filling failed runs with arbitrary finite errors.
 
 Six separately measured reference constructors are included in the convergence figure at 50, 200, 500, and 1000 input frames. This direct reference-construction analysis remains the complete original three-source, 12-case pass; partial rows from later public-source experiments are excluded from the figure and its statistics. The table below is the 1000-frame row:
 
@@ -143,7 +150,7 @@ Six separately measured reference constructors are included in the convergence f
 | PatchWarp rigid | 0.984863 |
 | PyFlowReg piecewise | 0.984639 |
 
-The lower 95% bound of FibreSight's paired gradient-NCC advantage is positive against each of the other five constructors. Reference construction takes 14.750 s for FibreSight, 8.935 s for Suite2p, and 10.083 s for CaImAn rigid when averaged across the 12 cases. Reference-derived held-out p95 errors are statistically tied: FibreSight is 0.110815 px, compared with 0.115078 for Suite2p (advantage interval -0.002166 to 0.010691), 0.108781 for CaImAn rigid (-0.014703 to 0.010633), and 0.108451 for PatchWarp rigid (-0.005062 to 0.000333). A closer average image and a better per-frame transform remain separate measurements. Suite2p piecewise and PatchWarp affine have no additional convergence row in this harness.
+The lower 95% bound of FibreSight's paired gradient-NCC advantage is positive against each of the other five constructors. Reference construction takes 12.666 s for FibreSight, 8.041 s for Suite2p, and 8.706 s for CaImAn rigid when averaged across the 12 cases. Reference-derived held-out p95 errors are statistically tied: FibreSight is 0.110815 px, compared with 0.115078 for Suite2p (advantage interval -0.002166 to 0.010691), 0.108781 for CaImAn rigid (-0.014703 to 0.010633), and 0.108451 for PatchWarp rigid (-0.005062 to 0.000333). A closer average image and a better per-frame transform remain separate measurements. Suite2p piecewise and PatchWarp affine have no additional convergence row in this benchmark setup.
 
 ## intensity sweeps
 
@@ -219,6 +226,7 @@ python -m benchmarking.registration_benchmark_suite quality
 python -m benchmarking.registration_benchmark_suite summarise
 python -m benchmarking.registration_benchmark_suite review
 python -m benchmarking.registration_benchmark_suite review-rigid
+python -m benchmarking.registration_benchmark_suite review-piecewise
 python -m benchmarking.registration_benchmark_suite run-piecewise
 python -m benchmarking.registration_benchmark_suite measure-piecewise
 python -m benchmarking.registration_benchmark_suite measure-auto
@@ -242,7 +250,7 @@ python -m benchmarking.registration_benchmark_suite run-intensity --frames 2000
 python -m benchmarking.registration_benchmark_suite summarise-intensity
 ```
 
-The real-recording sanity check reads the optional 4000-page TIFF at `workspace/dev/1000_85%_z3_fov4_00001_00001.tif`. Pages alternate in one-based signal-control order: page 1 is signal channel 1, page 2 is control channel 2, and so on. The paired sampling frequency is 30 Hz, and `make-real` writes the 2000 control observations to a separate benchmark TIFF. The four rigid methods are then run on that control movie. This recording is local lab data; it is not needed to rebuild the public synthetic benchmark.
+The real-recording sanity check reads the optional 4000-page TIFF at `workspace/dev/lab-session-2.tif`. Pages alternate in one-based signal-control order: page 1 is signal channel 1, page 2 is control channel 2, and so on. The paired sampling frequency is 30 Hz, and `make-real` writes the 2000 control observations to a separate benchmark TIFF. The four rigid methods are then run on that control movie. This recording is local lab data; it is not needed to rebuild the public synthetic benchmark.
 
 ```sh
 python -m benchmarking.registration_benchmark_suite make-real
@@ -301,7 +309,7 @@ The ignored base directory, `workspace/registration-benchmark-suite/`, contains:
 - `source_group_metrics.csv` and `source_group_comparisons.csv` for the descriptive anatomy, latent-gradient, and stored-array-size comparisons;
 - one directory per source and recipe, containing `control.tif`, `truth.npz`, and one `.npz` result for each completed method;
 - `metrics.csv`, `piecewise_metrics.csv`, and `logs/*.txt` inside each case;
-- reference-convergence arrays and tables for the cases where that separate pass was run. The expanded registration comparison does not manufacture convergence rows for external methods which failed or were not rerun.
+- reference-convergence arrays and tables for the cases where that separate pass was run. The expanded registration comparison does not manufacture convergence rows for external methods which failed.
 
 The ignored intensity directory, `workspace/registration-benchmark-intensity/`, contains `intensity_resources.csv`, `photon_metrics.csv`, `bleaching_metrics.csv`, `piecewise_photon_resources.csv`, and `piecewise_photon_metrics.csv`. Completed movie directories retain their logs, the small reference-convergence record, and a `.complete` marker; the 251 MiB TIFF, truth array, and method results are removed after measurement.
 
@@ -309,7 +317,7 @@ The ignored real-data directory, `workspace/registration-benchmark-real/`, conta
 
 The ignored focal directory, `workspace/registration-benchmark-focal/`, contains the three controlled-defocus movies, truth arrays, FibreSight results, per-frame QC arrays, `focal_metrics.csv`, and `focal_threshold_calibration.csv`. The base suite's `quality` command writes `quality_metrics.csv` for the unrelated-anatomy diagnostic. Both commands keep every observation and report an `analysis_valid` mask; neither interpolates or deletes focal intervals.
 
-`preprocess_recording(...)` writes the registered signal and control movies, recording index, references, transforms, QC fields, focal intervals, and axial-similarity trace into one NWB file. The optional `benchmarking/nwb_storage_proof.py` replays the 200-frame float32/int16 comparison on the local `with-jumps` recording; that private recording is not required for the public synthetic benchmark.
+`preprocess_recording(...)` writes the registered signal and control movies, recording index, references, transforms, QC fields, focal intervals, and axial-similarity trace into one NWB file. The optional `benchmarking/nwb_storage_proof.py` replays the 200-frame float32/int16 comparison on the local `lab-session-3` recording; that private recording is not required for the public synthetic benchmark.
 
 The NWB locations are fixed as follows:
 
@@ -335,20 +343,21 @@ The figures and review movies kept under `examples/` are:
 - `registration_benchmark_source_groups.png`, made by `summarise-piecewise` from the completed rigid and piecewise tables;
 - `registration_benchmark_noise.png`, `registration_benchmark_whitening.png`, and `registration_benchmark_bleaching.png`, made by `summarise-intensity`;
 - `registration_benchmark_focal_candidates.png`, made by `measure-focal` from all 24 controlled-defocus episodes and any false candidates;
-- `rigid_registration_benchmark.mp4`, the earlier single-reference review movie;
+- `rigid_registration_benchmark.mp4`, the earlier single-reference rigid review movie;
+- `piecewise_registration_benchmark.mp4`, the matching local-deformation competitor movie;
 - `registration_benchmark_suite.mp4`, made by `python -m benchmarking.registration_benchmark_suite review` from the original 12 source-recipe cases.
 
 The plotting functions register the bundled fonts under `src/fibre_sight/assets/fonts/mononoki/` and set Matplotlib's family to `mononoki` before making these figures.
 
 The MP4s are small review records derived from the example references and are meant to be tracked. The full generated TIFFs and arrays stay under the ignored `workspace/` directory.
 
-The real contact sheet is `workspace/registration-benchmark-real/real_disagreement.png`. It contains frames from the ignored private TIFF and stays local with that recording. One local pass over the separate `with-jumps` recording produced 19 candidate episodes, each about 0.57 to 0.60 s long; there are no manual episode labels, so recall, false-positive rate, and onset accuracy remain unavailable. Neither lab recording is required for synthetic reproduction. Manual episode boundaries from the real recording are still needed for those three measurements; controlled Gaussian blur establishes behaviour under known optics-inspired changes, and real defocus may have different spectral signatures.
+The real contact sheet is `workspace/registration-benchmark-real/real_disagreement.png`. It contains frames from the ignored private TIFF and stays local with that recording. One local pass over the separate `lab-session-3` recording produced 19 candidate episodes, each about 0.57 to 0.60 s long; there are no manual episode labels, so recall, false-positive rate, and onset accuracy remain unavailable. Neither lab recording is required for synthetic reproduction. Manual episode boundaries from the real recording are still needed for those three measurements; controlled Gaussian blur establishes behaviour under known optics-inspired changes, and real defocus may have different spectral signatures.
 
 ## claim boundary
 
-The statistical unit is the source image. Each source contributes one value after its four motion recipes have been averaged; the expanded complete comparisons have ten source means and nine degrees of freedom. The sources include axonal and somatic images, structural and activity-dependent channels, visual cortex and olfactory bulb data, and public Allen and DANDI material. Two paired labmate channels come from one field of view, so ten images do not represent ten independent animals.
+The statistical unit is the source image. Each source contributes one value after its four motion recipes have been averaged; the expanded complete comparisons have ten source means and nine degrees of freedom. The sources include axonal and somatic images, structural and activity-dependent channels, visual cortex and olfactory bulb data, and public Allen and DANDI material. The two paired `lab-session-1` channels come from one field of view, so ten images do not represent ten independent animals.
 
-Held-out p95 displacement error was the declared primary piecewise metric. FibreSight's paired source-level advantage over Suite2p piecewise now has a positive lower 95% bound (0.145726 px), as do the complete-source comparisons with CaImAn piecewise, PatchWarp affine, and PyFlowReg. This supports the narrower claim that FibreSight piecewise has lower held-out p95 error on this synthetic ten-image matrix. It does not establish superiority on real motion, unknown optics, other sampling rates, or recordings outside these source anatomies. The rigid source-level intervals still cross zero for Suite2p, CaImAn, and PatchWarp.
+Held-out p95 displacement error was the declared primary piecewise metric. FibreSight's paired source-level advantage over Suite2p piecewise now has a positive lower 95% bound (0.096080 px), as do the complete-source comparisons with CaImAn piecewise, PatchWarp affine, and PyFlowReg. This supports the narrower claim that FibreSight piecewise has lower held-out p95 error on this synthetic ten-image matrix. It does not establish superiority on real motion, unknown optics, other sampling rates, or recordings outside these source anatomies. The rigid source-level intervals cross zero for CaImAn and PatchWarp, whilst the Suite2p interval is positive.
 
 The `focal_change` planes use the other saved references and provide no calibrated defocus, scattering, or z displacement in micrometres. The `optical_defocus` movies retain the same anatomy and supply a controlled blur validation, but Gaussian convolution and contrast scaling remain a simplified optical model. A single-plane recording cannot turn either similarity trace into physical z displacement.
 
@@ -374,10 +383,10 @@ git clone https://github.com/ryhattori/PatchWarp workspace/dev/sources/PatchWarp
 git -C workspace/dev/sources/PatchWarp checkout 7cac6307b6d3aa107baecd86d8085823b437fbb1
 ```
 
-The scored Flow-Registration row uses the pinned PyFlowReg checkout above. The original MATLAB Flow-Registration toolbox is outside this harness and does not need to be downloaded; MATLAB is required here for PatchWarp.
+The scored Flow-Registration row uses the pinned PyFlowReg checkout above. The original MATLAB Flow-Registration toolbox is outside this benchmark setup and does not need to be downloaded; MATLAB is required here for PatchWarp.
 
 The generated `truth.npz` records the source image, recipe, seed, sampling frequency, valid bounds, displacement field, focal episodes, and ambiguity mask. The controlled-defocus truth also records blur sigma, contrast loss, blank frames, and saturated frames. Its `focal_quality.npz` adds the calibration masks, selected MAD factor, package version, Git commit, and dirty state. `cases.csv`, the resource logs, and the remaining method outputs record the other provenance. Re-running from clean benchmark directories regenerates the movies and leaves the source arrays untouched.
 
-The current records identify FibreSight as version 0.1.3 at commit `20dc18a092a13cbf36749302e53b7a1b5bc9be31`; the benchmark was produced from a dirty worktree, so the hash alone cannot reconstruct the exact source snapshot. Exact environment lockfiles are also absent, so the commands above pin the main packages and source commits but not every transitive dependency. The three external Python environments use fixed repo-relative paths; FibreSight uses the interpreter that launches the harness, and `MATLAB_PATH` can select another MATLAB executable.
+The current records identify FibreSight as version 0.2.0 from a dirty checkout; the benchmark was produced before the release commit, so the final commit hash will need to be recorded when the release is made. Exact environment lockfiles are also absent, so the commands above pin the main packages and source commits but not every transitive dependency. The three external Python environments use fixed repo-relative paths; FibreSight uses the interpreter that launches the benchmark setup, and `MATLAB_PATH` can select another MATLAB executable.
 
 The benchmark compares these implementations under the declared settings. A single-plane recording provides no physical z trajectory.
