@@ -68,8 +68,8 @@ therefore the public average FOV image, with that limitation kept explicit.
 
 | array | session / asset | channel | attribution | acquisition / download | extraction and processing |
 | --- | --- | --- | --- | --- | --- |
-| `labmate-tdtomato-soma.npy` | `A744-20240625-01` | tdTomato, structural control | Zhuoyang Ye | not applicable; `A744-20240625-01_channel2.png` was supplied directly | centre 512 × 512 crop of the source PNG, converted to float64 |
-| `labmate-gcamp-soma.npy` | `A744-20240625-01` | GCaMP, activity-dependent signal | Zhuoyang Ye | not applicable; `A744-20240625-01_channel1.png` was supplied directly | centre 512 × 512 crop of the source PNG, converted to float64 |
+| `lab-session-1-channel-2.npy` | `lab-session-1` | channel 2, structural control | Zhuoyang Ye | not applicable; supplied PNG, channel 2 | further centre 256 × 256 crop of the supplied PNG, converted to float64 |
+| `lab-session-1-channel-1.npy` | `lab-session-1` | channel 1, activity-dependent signal | Zhuoyang Ye | not applicable; supplied PNG, channel 1 | further centre 256 × 256 crop of the supplied PNG, converted to float64 |
 
 These two arrays are paired channels from the same field of view. The tdTomato
 image is the structural control and the GCaMP image is the signal channel; the
@@ -82,16 +82,17 @@ The source arrays live beside this file under `benchmarking/sources/`, with a
 same-stem PNG beside every array for quick visual inspection. Those PNGs are
 display derivatives scaled to the 1st and 99th intensity percentiles; they are
 not used by the benchmark. The public archive arrays are saved as `float32`
-NumPy arrays. The two Zhuoyang Ye arrays retain `float64` because the supplied
-PNGs were converted directly from their greyscale pixel values. The Allen
-images are cropped to the central 256 × 256 FOV for the benchmark; the DANDI
-references are cropped or padded to square FOVs because their source movies
-are 512 × 128 and the olfactory average image is 502 × 120. The benchmark
-generator reads all ten arrays from this directory.
+NumPy arrays, except for the two Zhuoyang Ye arrays, which retain `float64`
+because the supplied PNGs were converted directly from their greyscale pixel
+values before the additional central crop. The Allen images are cropped to the
+central 256 × 256 FOV for the benchmark; the DANDI references are cropped or
+padded to square FOVs because their source movies are 512 × 128 and the
+olfactory average image is 502 × 120. The benchmark generator reads all ten
+arrays from this directory.
 
 ## validation
 
-The gallery was generated on 17 August 2026. Every array is two dimensional
+The gallery was regenerated on 3 September 2026. Every array is two dimensional
 and finite. The public archive arrays are `float32`; the two Zhuoyang Ye arrays
 are `float64`.
 
@@ -102,8 +103,8 @@ are `float64`.
 | `dandi-jgcamp8f-soma.npy` | 128 × 128 | 1 to 775 | 146.73 | 0.239428 |
 | `dandi-jgcamp8s-soma.npy` | 128 × 128 | 7.5 to 730.5 | 157.68 | 0.457796 |
 | `dandi-olfactory-bulb.npy` | 128 × 128 | -5.20 to 3918.79 | 38.83 | 0.275935 |
-| `labmate-tdtomato-soma.npy` | 512 × 512 | 27 to 255 | 37.87 | 0.193750 |
-| `labmate-gcamp-soma.npy` | 512 × 512 | 38 to 255 | 18.95 | 0.143950 |
+| `lab-session-1-channel-2.npy` | 256 × 256 | 30 to 235 | 38.47 | 0.223471 |
+| `lab-session-1-channel-1.npy` | 256 × 256 | 39 to 208 | 18.77 | 0.140183 |
 
 For comparison, the three existing demo references have raw mean Sobel
 magnitudes of 71.37, 84.75, and 121.30; their per-image scaled values are
