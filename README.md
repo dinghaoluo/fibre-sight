@@ -217,7 +217,7 @@ The checkpoint was trained on channel-2 references acquired and processed within
 
 ## workspace
 
-Working data stay outside the package. A clone uses `workspace/` at the repository root by default:
+Working data are designed to stay on the local disk, meaning that `workspace/` is git-ignored and is the default output path:
 
 ```text
 workspace/
