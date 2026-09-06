@@ -17,6 +17,9 @@ import re
 from pynwb import NWBHDF5IO
 
 from .api import (
+    BUNDLED_CHECKPOINT,
+    BUNDLED_MIN_SIZE,
+    BUNDLED_THRESHOLD,
     calculate_dff,
     extract_fluorescence,
     list_dff_runs,
@@ -25,7 +28,22 @@ from .api import (
     preprocess_recording,
     segment_recording,
     )
+from .dff import (
+    BASELINE_PERCENTILE,
+    BASELINE_WINDOW_S,
+    CONTROL_CORRECTION,
+    STATISTIC,
+    SURROUND_COEFFICIENT,
+    )
+from .fluorescence import (
+    SURROUND_INNER_PX,
+    SURROUND_METHOD,
+    SURROUND_MIN_PIXELS,
+    SURROUND_OUTER_PX,
+    )
 from .nwb_segmentation import _checkpoint_sha256
+from .preprocessing import SEGMENTATION_REFERENCE_PERCENTILES
+from . import __version__
 
 
 #%% session record
@@ -479,16 +497,153 @@ def run_session(log_path):
 
 
 #%% command line
+def _direct_session_config(args):
+    signal_dir = args.session_path.expanduser().resolve()
+    if not signal_dir.is_dir():
+        raise ValueError(f'TIFF folder does not exist: {signal_dir}')
+    signal_paths = natural_tiff_paths(signal_dir)
+    if not signal_paths:
+        raise ValueError(f'no TIFF files found in {signal_dir}')
+
+    multiplexed = args.layout == 'interleaved'
+    control_paths = []
+    if not multiplexed:
+        if args.control_tiff_dir is None:
+            raise ValueError('--control-tiff-dir is required for separate TIFF folders')
+        control_dir = args.control_tiff_dir.expanduser().resolve()
+        if not control_dir.is_dir():
+            raise ValueError(f'TIFF folder does not exist: {control_dir}')
+        control_paths = natural_tiff_paths(control_dir)
+        if len(control_paths) != len(signal_paths):
+            raise ValueError('signal and control TIFF folders contain different file counts')
+
+    if args.output is None:
+        raise ValueError('--output is required when running from a TIFF folder')
+    output_path = args.output.expanduser().resolve()
+    checkpoint_path = args.checkpoint.expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise ValueError(f'checkpoint does not exist: {checkpoint_path}')
+    low, high = args.reference_low_percentile, args.reference_high_percentile
+    if low >= high:
+        raise ValueError('reference percentiles must satisfy lower < upper')
+
+    signal_records = fingerprint_paths(signal_paths)
+    control_records = fingerprint_paths(control_paths)
+    return {
+        'schema_version': SESSION_SCHEMA_VERSION,
+        'fibre_sight_version': __version__,
+        'output_path': str(output_path),
+        'source_files': signal_records + control_records,
+        'signal_files': signal_records,
+        'control_files': control_records,
+        'source': {
+            'multiplexed': multiplexed,
+            'sampling_frequency_hz': args.sampling_frequency,
+            'signal_channel': args.signal_channel,
+            'control_channel': args.control_channel,
+            'signal_label': args.signal_label,
+            'control_label': args.control_label,
+            'pixel_size_um': args.pixel_size,
+            },
+        'registration': {
+            'model': args.registration_model,
+            'channel': args.registration_channel,
+            },
+        'segmentation': {
+            'run_name': args.proposal_run,
+            'reference_channel': args.reference_channel,
+            'reference_low_percentile': low,
+            'reference_high_percentile': high,
+            'checkpoint_path': str(checkpoint_path),
+            'checkpoint_file': fingerprint_paths([checkpoint_path])[0],
+            'threshold': args.threshold,
+            'min_size': args.min_size,
+            'tta': not args.no_tta,
+            'device': args.device,
+            },
+        'extraction': {
+            'run_name': args.fluorescence_run,
+            'roi_run': args.roi_run,
+            'surround_method': args.surround_method,
+            'surround_inner_px': args.surround_inner_px,
+            'surround_outer_px': args.surround_outer_px,
+            'surround_min_pixels': args.surround_min_pixels,
+            },
+        'dff': {
+            'run_name': args.dff_run,
+            'fluorescence_run': args.fluorescence_run,
+            'statistic': args.statistic,
+            'baseline_percentile': args.baseline_percentile,
+            'baseline_window_s': args.baseline_window_s,
+            'surround_coefficient': args.surround_coefficient,
+            'control_correction': args.control_correction,
+            },
+        }
+
+
+def _add_direct_arguments(parser):
+    parser.add_argument('--output', type=Path, help='NWB output path')
+    parser.add_argument('--control-tiff-dir', type=Path)
+    parser.add_argument('--layout', choices=('interleaved', 'separate'), default='interleaved')
+    parser.add_argument('--signal-channel', type=int, default=1)
+    parser.add_argument('--control-channel', type=int, default=2)
+    parser.add_argument('--sampling-frequency', type=float, default=30)
+    parser.add_argument('--signal-label', default='signal')
+    parser.add_argument('--control-label', default='control')
+    parser.add_argument('--pixel-size', type=float)
+    parser.add_argument('--registration-model', choices=('rigid', 'piecewise', 'auto'), default='auto')
+    parser.add_argument('--registration-channel', choices=('signal', 'control'), default='control')
+    parser.add_argument('--reference-channel', choices=('signal', 'control'), default='control')
+    parser.add_argument('--reference-low-percentile', type=float, default=SEGMENTATION_REFERENCE_PERCENTILES[0])
+    parser.add_argument('--reference-high-percentile', type=float, default=SEGMENTATION_REFERENCE_PERCENTILES[1])
+    parser.add_argument('--checkpoint', type=Path, default=BUNDLED_CHECKPOINT)
+    parser.add_argument('--threshold', type=float, default=BUNDLED_THRESHOLD)
+    parser.add_argument('--min-size', type=int, default=BUNDLED_MIN_SIZE)
+    parser.add_argument('--no-tta', action='store_true')
+    parser.add_argument('--device', choices=('auto', 'cpu', 'mps', 'cuda'), default='auto')
+    parser.add_argument('--proposal-run', default='proposal_auto')
+    parser.add_argument('--roi-run', default='proposal_auto')
+    parser.add_argument('--fluorescence-run', default='fluorescence_auto')
+    parser.add_argument('--surround-method', choices=('adaptive', 'fixed'), default=SURROUND_METHOD)
+    parser.add_argument('--surround-inner-px', type=int, default=SURROUND_INNER_PX)
+    parser.add_argument('--surround-outer-px', type=int, default=SURROUND_OUTER_PX)
+    parser.add_argument('--surround-min-pixels', type=int, default=SURROUND_MIN_PIXELS)
+    parser.add_argument('--dff-run', default='dff_auto')
+    parser.add_argument('--statistic', choices=('mean', 'median'), default=STATISTIC)
+    parser.add_argument('--baseline-percentile', type=float, default=BASELINE_PERCENTILE)
+    parser.add_argument('--baseline-window-s', type=float, default=BASELINE_WINDOW_S)
+    parser.add_argument('--surround-coefficient', type=float, default=SURROUND_COEFFICIENT)
+    parser.add_argument('--control-correction', choices=('none', 'subtract_dff'), default=CONTROL_CORRECTION)
+
+
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('log_path', type=Path)
+    parser = argparse.ArgumentParser(
+        description='run an automatic FibreSight session from TIFFs or a session log',
+        )
+    parser.add_argument('session_path', type=Path, help='TIFF folder or .fibresight.jsonl log')
+    _add_direct_arguments(parser)
     return parser.parse_args()
+
+
+def run_direct_session(args):
+    config = _direct_session_config(args)
+    log_path = Path(config['output_path']).with_suffix('.fibresight.jsonl')
+    if log_path.exists():
+        if latest_session_config(log_path) != config:
+            raise ValueError(
+                f'session log already exists with different settings: {log_path}')
+    else:
+        append_session_event(log_path, {'event': 'configured', 'config': config})
+    run_session(log_path)
 
 
 def main():
     args = parse_args()
     try:
-        run_session(args.log_path)
+        if args.session_path.suffix.casefold() == '.jsonl':
+            run_session(args.session_path)
+        else:
+            run_direct_session(args)
     except Exception as exc:
         print(f'automatic session failed: {exc}', flush=True)
         raise SystemExit(1) from exc

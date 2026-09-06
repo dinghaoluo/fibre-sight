@@ -497,7 +497,7 @@ class NWBFluorescenceTests(unittest.TestCase):
         output = StringIO()
         with patch(
                 'sys.argv',
-                ['fibre-sight-list-runs', str(self.path), '--kind', 'dff'],
+                ['list-runs', str(self.path), '--kind', 'dff'],
                 ), redirect_stdout(output):
             list_runs_main()
         lines = output.getvalue().splitlines()
