@@ -1,14 +1,23 @@
 # FibreSight
 
 [![tests](https://github.com/dinghaoluo/fibre-sight/actions/workflows/tests.yml/badge.svg)](https://github.com/dinghaoluo/fibre-sight/actions/workflows/tests.yml)
+[![licence](https://img.shields.io/github/license/dinghaoluo/fibre-sight)](LICENSE)
+[![latest release](https://img.shields.io/github/v/release/dinghaoluo/fibre-sight)](https://github.com/dinghaoluo/fibre-sight/releases/latest)
 
 FibreSight follows paired two-photon recordings from interleaved TIFF pages through registration, axonal ROI segmentation and curation, fluorescence extraction, and dF/F. The registered movies, quality-control decisions, reference images, ROI runs and derived traces remain together in one NWB file. A GUI handles proposal inspection and curation; the Python API and command-line tools handle the recording-scale stages.
 
-The repository also contains the complete training route for a different image domain, from MSER-assisted labelling to U-Net training and session-held-out evaluation. [How to Train Your Model™](TRAINING.md) documents that route.
+Most established two-photon analysis software and algorithms were developed for somatic calcium recordings, where the high signal-to-noise and the regularity of cell shapes supply ample image structure for motion correction and ROI identification. Axon imaging is usually analysed using the same workflow, but with less information, since a labelled process may occupy only a few pixels, its sensor fluorescence may be faint, and residual motion or an offset between structural and functional channels can change the pixels assigned to a trace.
+
+**FibreSight is an integrated workbench that presents the end-to-end registration-ROI-extraction-dF/F pipeline as a single, NWB-supported package, specifically optimised for axon imaging.** Roughly, a full-pipeline run consists of 5 steps: a) TIFF movie ingestion, b) registration, c) frame quality-control, d) axon ROI segmentation, and e) extraction & dF/F calculation.
+
+Being optimised for axon imaging, specifically, entails two features:
+
+- Firstly, **registration**, both rigid and piecewise, performs well enough for regular somatic calcium imaging data, but significantly better for axon imaging data compared to pre-existing algorithms. In the current public benchmark, FibreSight's rigid registration matched [PatchWarp](https://github.com/ryhattori/PatchWarp), and its piecewise method had the lowest held-out displacement error amongst the competing non-rigid algorithms, including but not limited to [Suite2p](https://github.com/Mouseland/suite2p) and [CaImAn](https://github.com/flatironinstitute/caiman).
+- Secondly, a U-Net convolutional neural network supports high-accuracy **auto-segmentation of axon ROIs**, and a similarly-performant Attention U-Net model is provided as well. If needs be, one can also train their own model using the bundled training pipeline, which walks through manual curation of training data, training manifest preparation, and training and validation.
+
+A full run can be triggered within the `AUTO` tab, whereas command-line tools expose the same recording stages for scripted runs. The bundled U-Net checkpoint works out of the box on images resembling its training data. See the [model card](MODEL_CARD.md) and [methods record](METHODS.md) for more detail on the checkpoint. [How to Train Your Model™](TRAINING.md), on the other hand, provides a step-by-step guide to training a new model from scratch.
 
 ![FibreSight workbench with predicted ROI outlines and curation controls](docs/images/fibre-sight-workbench.png)
-
-The bundled checkpoint was developed from 53 hand-labelled two-photon sessions containing 1,296 curated ROIs. It reached 0.926 foreground-pixel recall on nine session-held-out images from the same four animals and acquisition source; its operating point deliberately favours over-proposal. The [model card](MODEL_CARD.md) and [methods record](METHODS.md) give the full evaluation and its limits.
 
 ## quick start
 
@@ -40,7 +49,7 @@ fibre-sight
 
 Training and inference default to automatic device selection: PyTorch uses CUDA when it is available, then Apple's MPS backend on Apple silicon, then CPU. MPS requires a native arm64 Python interpreter and macOS 12.3 or later; `python -c "import platform; print(platform.machine())"` should print `arm64`.
 
-## complete recording pipeline
+## full TIFF-to-dF/F pipeline
 
 This is the main recording route:
 
@@ -48,15 +57,62 @@ This is the main recording route:
 paired TIFF pages -> registered NWB -> proposed ROIs -> curated ROIs -> fluorescence -> dF/F
 ```
 
-Every analysis run is named and immutable. A later curation or dF/F choice produces another run in the same NWB file instead of silently replacing the earlier one.
+The full-pipeline run can be triggered either within the GUI's `auto` tab or using CLI.
 
-![Full-session FibreSight workflow from interleaved TIFFs to stimulation-aligned dLight and tdTomato traces](examples/full_session_demo_workflow.png)
+![Complete automatic run from the command line](docs/images/complete-run-console.gif)
 
-This example follows internal session `A126i-20250606-02`: six interleaved TIFF files, 10,548 paired frames, rigid registration, a 9,994-frame `p1-p97` tdTomato segmentation reference, 45 proposals from the bundled checkpoint, and stimulation-off-aligned dLight and tdTomato traces. The brief image-wide tdTomato excursions recover 23 stimulation periods directly from the movie. Of the 45 proposed ROIs, 42 had a positive mean dLight change from 0.1 to 1.0 s after offset; the median was `+0.142`, compared with `+0.004` in tdTomato. The TIFFs and 4.9 GB NWB file are not distributed. [`benchmarking/full_session_demo.py`](benchmarking/full_session_demo.py) records the session-specific alignment and plotting choices.
+### full-pipeline run using CLI
+
+The GUI's `auto` tab provides an intuitive layout to set various parameters and start a full-pipeline run. Alternatively, to run a session using CLI, simply give `auto` the input folder and an NWB output path:
+
+```sh
+# TIFFs -> registered NWB -> proposals -> fluorescence -> dF/F
+auto /path/to/session --output workspace/output/session.nwb
+
+# n.b.: if the signal and control TIFFs are stored
+# in separate folders, add these two arguments
+auto /path/to/session --layout separate \
+    --control-tiff-dir /path/to/control \
+    --output workspace/output/session.nwb
+```
+
+*n.b.: If the signal and control TIFFs are stored in separate folders, add `--layout separate --control-tiff-dir /path/to/control`.*
+
+The command writes a `.fibresight.jsonl` session log beside the NWB file. To resume an interrupted run, rerun the same command; the log is loaded automatically and completed stages whose outputs match it are retained. A log can also be passed directly to the `auto` command:
+
+```sh
+auto /path/to/session.fibresight.jsonl
+```
+
+The adjustable command-line parameters are:
+
+- **recording**: `--layout`, `--control-tiff-dir`, `--signal-channel`, `--control-channel`, `--sampling-frequency`, `--signal-label`, `--control-label`, and `--pixel-size`;
+- **output and registration**: `--output`, `--registration-model` (`rigid`, `piecewise`, or `auto`), and `--registration-channel`;
+- **segmentation**: `--reference-channel`, `--reference-low-percentile`, `--reference-high-percentile`, `--checkpoint`, `--threshold`, `--min-size`, `--no-tta`, and `--device` (`auto`, `cpu`, `mps`, or `cuda`);
+- **fluorescence**: `--proposal-run`, `--roi-run`, `--fluorescence-run`, `--surround-method` (`adaptive` or `fixed`), `--surround-inner-px`, `--surround-outer-px`, and `--surround-min-pixels`;
+- **dF/F**: `--dff-run`, `--statistic` (`mean` or `median`), `--baseline-percentile`, `--baseline-window-s`, `--surround-coefficient`, and `--control-correction` (`none` or `subtract_dff`).
+
+In addition, stages of the full pipeline can be called individually as well. Here are a few important calls:
+
+```sh
+# registration only
+registration /path/to/session --output workspace/output/session.nwb
+
+# ROI prediction which only requires the reference image
+# the reference is constructed during registration
+predict --image /path/to/reference.npy \
+    --checkpoint /path/to/model.pt \
+    --out workspace/output/predicted_ROI_dict.npy
+
+# inspect all the previous runs stored in an NWB file
+list-runs workspace/output/session.nwb
+```
+
+Every analysis run is named and immutable. A later curation or dF/F choice produces another run in the same NWB file instead of replacing the earlier one. This was done to encourage reproducibility and traceability.
 
 ### registration
 
-`preprocess_recording(...)` indexes the TIFF pages without loading the complete recording into memory, estimates one shared motion trajectory from the chosen registration channel, applies it to both channels, and writes the registered movies and frame-level QC into NWB. Its separate segmentation reference averages all analysis-valid control frames, clips the full-session mean at `p1-p97`, and retains the exact source-frame and intensity provenance.
+`preprocess_recording(...)` indexes the TIFF pages without loading the complete recording into memory, estimates either one shared rigid motion trajectory or a piecewise field from the chosen registration channel, applies the correction to both channels, and writes the registered movies and frame-level QC into NWB. Its separate segmentation reference averages all analysis-valid frames from the chosen segmentation channel, clips the full-session mean at `p1-p97`, and retains the exact source-frame and intensity provenance.
 
 ```python
 from pathlib import Path
@@ -75,17 +131,17 @@ preprocess_recording(
     sampling_frequency_hz=30,
     signal_label='dLight',
     control_label='tdTomato',
-    registration_model='rigid',
+    registration_model='auto',
     )
 
 segment_recording(nwb_path, 'proposal_v1')
 ```
 
-Rigid registration is the correct choice for the complete extraction route at present. Piecewise and automatic model selection are available for registration analysis, but fluorescence extraction refuses a file containing accepted piecewise-rigid frames: exact warped-pixel support is not yet stored for those frames.
+`registration_model='auto'` compares rigid and piecewise registration during calibration and uses the piecewise method only when its held-out gains meet the recorded thresholds. The exact warped-pixel support is reconstructed from the stored spline field during segmentation-reference construction and fluorescence extraction, so an accepted piecewise run can continue through dF/F.
 
 ![Held-out rigid and piecewise registration error across ten public source images](examples/registration_benchmark_comparison.png)
 
-Ten public reference images are crossed with four motion recipes; grey lines connect matching cases and diamonds mark method means. The [benchmark notes](BENCHMARK.md) record the method versions, incomplete external runs and claim boundaries. The [rigid comparison movie](examples/rigid_registration_benchmark.mp4) shows raw, FibreSight, Suite2p and CaImAn in that order.
+Ten public reference images are crossed with four motion recipes; grey lines connect matching cases and diamonds mark method means. The [benchmark notes](BENCHMARK.md) record the method versions, incomplete external runs and claim boundaries. The [rigid](examples/rigid_registration_benchmark.mp4) and [piecewise](examples/piecewise_registration_benchmark.mp4) comparison movies show raw, FibreSight, Suite2p and CaImAn in that order.
 
 ### segmentation and curation
 
@@ -93,7 +149,11 @@ Ten public reference images are crossed with four motion recipes; grey lines con
 
 Start `fibre-sight`, select the NWB file under `channel-2 image`, choose `proposal_v1`, then inspect, delete or merge its ROIs. Enter `curated_v1` as the new run name and click `save curated run`. The proposal remains unchanged; the curated run records it as its source.
 
-Canvas and ROI-table selections remain linked. The workbench supports multiselection, deletion, merging, undo, pan and zoom, adjustable black and white points, dark and light modes, and adjustable interface text size. A proposal probability map can be rebuilt at another threshold without another model pass.
+Canvas and ROI-table selections are linked. The workbench supports multiselection, deletion, merging, undo, pan, and zoom, adjustable black and white points, dark and light modes, and adjustable interface text size. A proposal probability map can be rebuilt at another threshold without another model pass.
+
+The bundled test crop follows the shorter prediction route from the command line:
+
+![Prediction from the command line](docs/images/cli-prediction.gif)
 
 ### fluorescence extraction and dF/F
 
@@ -123,25 +183,27 @@ Extraction stores ROI and surrounding-pixel statistics for both channels. The dF
 Three unlabelled 256 × 256 crops are included under `examples/`: two come from sessions in the training split, and `lab-fibresight-demo-test.npy` comes from one of the nine test sessions. Each array has a same-stem PNG preview. This small route tests checkpoint inference without a TIFF movie or NWB file:
 
 ```sh
-fibre-sight-predict --image examples/lab-fibresight-demo-test.npy --out workspace/output/demo_predicted_ROI_dict.npy
+predict --image examples/lab-fibresight-demo-test.npy --out workspace/output/demo_predicted_ROI_dict.npy
 ```
 
-The command uses the bundled checkpoint, chooses the available compute device, prints the number of proposed ROIs, and creates `workspace/output/` when needed. To inspect the same crop in the GUI, start `fibre-sight`, select the `.npy` under `channel-2 image`, open `predict`, then click `predict`. Predictions and edits are written under `workspace/output/`; the six shipped `.npy` and PNG files remain unchanged.
+The command uses the bundled checkpoint, chooses the available compute device, prints the number of proposed ROIs, and creates `workspace/output/` when needed. To inspect the same crop in the GUI, start `fibre-sight`, select the `.npy` under `channel-2 image`, open `segment`, then click `predict`. Predictions and edits are written under `workspace/output/`; the six shipped `.npy` and PNG files remain unchanged.
 
 ![FibreSight workflow overview across launch, prediction, labelling, and training](docs/images/workflow-overview.gif)
 
 Higher `prediction threshold` values retain fewer, more confident ROIs. `minimum ROI area (pixels)` removes small connected components after thresholding. The `confidence` view shows the probability map beneath the ROI outlines; `ROI on / ROI off` hides those outlines without changing the current view. The [methods record](METHODS.md#prediction-controls) gives the defaults and direction of every prediction and MSER control.
 
+The [pipeline demos](examples/README.md#pipeline-demos) show the other end of the workflow: the console messages from a complete automatic run and the same prediction route from the command line.
+
 ## checkpoint performance
 
 The released checkpoint reached its best validation Dice of `0.7822` at epoch 37 of 80. On nine session-held-out test sessions from the same four animals and acquisition source, the released operating point (`0.25` threshold, `45` minimum pixels, four-view TTA) gives:
 
-| metric | mean |
-| --- | ---: |
-| Dice | 0.7227 |
-| recall | 0.9261 |
+| metric    | mean   |
+| --------- | ------:|
+| Dice      | 0.7227 |
+| recall    | 0.9261 |
 | precision | 0.5958 |
-| F2 | 0.8312 |
+| F2        | 0.8312 |
 
 The operating point favours recall over precision. A false-positive proposal can be selected and deleted in the workbench; a missed axon must currently be drawn outside the workbench and imported.
 
@@ -179,33 +241,87 @@ ROI dictionaries use a legacy pickled NumPy format. `scan labelled sessions` wri
 
 ## command-line tools
 
-Installing FibreSight adds six command-line tools alongside the GUI:
+Installing FibreSight adds these command-line tools alongside the GUI:
 
 ```text
-fibre-sight-build-manifest
-fibre-sight-train
-fibre-sight-predict
-fibre-sight-evaluate
-fibre-sight-list-runs
-fibre-sight-plot-traces
+auto
+registration
+segment
+fluorescence
+dff
+predict
+build-manifest
+train
+evaluate
+list-runs
+plot-traces
 ```
 
 Each command accepts `--help`. The same tools can be run as modules, for example `python -m fibre_sight.predict_rois --help`.
 
-To inspect the immutable ROI, fluorescence, and dF/F runs in an NWB file:
+`registration` takes a TIFF folder and writes the registered NWB file; `segment`, `fluorescence`, and `dff` continue named runs in that file; `predict` takes a reference `.npy` image and writes an ROI dictionary. The remaining commands build manifests, train or evaluate checkpoints, inspect runs, or plot traces.
 
-```sh
-fibre-sight-list-runs recording.nwb
+The same stages are available as Python functions, so they can be placed inside a larger analysis script or loop:
+
+```python
+from pathlib import Path
+
+import numpy as np
+
+from fibre_sight.api import (
+    BUNDLED_CHECKPOINT,
+    ROIPredictor,
+    calculate_dff,
+    extract_fluorescence,
+    preprocess_recording,
+    segment_recording,
+    )
+from fibre_sight.list_runs import list_analysis_runs
+from fibre_sight.plot_traces import plot_dff_traces
+from fibre_sight.predict_rois import predict_roi_dict
+
+tiff_paths = sorted(Path('/path/to/session').glob('*.tif'))
+nwb_path = Path('workspace/output/session.nwb')
+
+# recording stages
+preprocess_recording(
+    tiff_paths,
+    nwb_path,
+    signal_channel=1,
+    control_channel=2,
+    multiplexed=True,
+    sampling_frequency_hz=30,
+    registration_model='auto',
+    )
+segment_recording(nwb_path, 'proposal_v1')
+extract_fluorescence(nwb_path, 'fluorescence_v1', 'proposal_v1')
+calculate_dff(nwb_path, 'dff_v1', 'fluorescence_v1')
+
+# image-only prediction
+predict_roi_dict(
+    '/path/to/reference.npy',
+    BUNDLED_CHECKPOINT,
+    out_path='workspace/output/predicted_ROI_dict.npy',
+    tta=True,  # test-time augmentation
+    )
+
+# use a predictor when several images share one loaded model
+predictor = ROIPredictor(BUNDLED_CHECKPOINT, tta=True)
+image = np.load('/path/to/reference.npy')
+roi_dict, labelled, probability = predictor.predict_image(image)
+
+runs = list_analysis_runs(nwb_path)
+plot_dff_traces(nwb_path, 'dff_v1', 'workspace/output/dff_trace_qa.png')
 ```
 
-To inspect selected traces from a derived dF/F run:
+In addition, to inspect selected traces from a derived dF/F run:
 
 ```sh
-fibre-sight-plot-traces recording.nwb dff_v1 \
+plot-traces recording.nwb dff_v1 \
     --out workspace/output/dff_trace_qa.png --roi-id 1 --roi-id 2
 ```
 
-Training recipes are kept under `src/fibre_sight/configs/`. The [training guide](TRAINING.md) describes each recipe and how to write a new one.
+Training recipes are kept under `src/fibre_sight/configs/`. [How to Train Your Model™](TRAINING.md) describes each recipe and how to write a new one.
 
 ## verification
 
