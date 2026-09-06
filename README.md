@@ -4,7 +4,7 @@
 [![licence](https://img.shields.io/github/license/dinghaoluo/fibre-sight)](LICENSE)
 [![latest release](https://img.shields.io/github/v/release/dinghaoluo/fibre-sight)](https://github.com/dinghaoluo/fibre-sight/releases/latest)
 
-FibreSight follows paired two-photon recordings from interleaved TIFF pages through registration, axonal ROI segmentation and curation, fluorescence extraction, and dF/F. The registered movies, quality-control decisions, reference images, ROI runs and derived traces remain together in one NWB file. A GUI handles proposal inspection and curation; the Python API and command-line tools handle the recording-scale stages.
+<img src="src/fibre_sight/assets/fibresight_icon.ico" alt="FibreSight icon" width="112" align="right">
 
 Most established two-photon analysis software and algorithms were developed for somatic calcium recordings, where the high signal-to-noise and the regularity of cell shapes supply ample image structure for motion correction and ROI identification. Axon imaging is usually analysed using the same workflow, but with less information, since a labelled process may occupy only a few pixels, its sensor fluorescence may be faint, and residual motion or an offset between structural and functional channels can change the pixels assigned to a trace.
 
