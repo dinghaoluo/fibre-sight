@@ -336,7 +336,7 @@ python -m unittest discover -s tests -v
 If FibreSight contributes to published work, please cite the software version used:
 
 ```text
-Luo, D. (2026). FibreSight (Version 0.1.3) [Computer software]. https://github.com/dinghaoluo/fibre-sight
+Luo, D. (2026). FibreSight (Version 0.2.0) [Computer software]. https://github.com/dinghaoluo/fibre-sight
 ```
 
 GitHub's `Cite this repository` menu generates other citation formats from [`CITATION.cff`](CITATION.cff).
