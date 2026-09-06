@@ -37,7 +37,7 @@ from fibre_sight.preprocessing import (
 
 #%% paths and recording window
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RAW_ROOT = PROJECT_ROOT / 'workspace' / 'dev' / 'with-jumps'
+RAW_ROOT = PROJECT_ROOT / 'workspace' / 'dev' / 'lab-session-3'
 FLOAT32_PATH = PROJECT_ROOT / 'workspace' / 'dev' / 'nwb_float32.partial.nwb'
 INT16_PATH = PROJECT_ROOT / 'workspace' / 'dev' / 'nwb_int16.partial.nwb'
 FRAME_START = 550
@@ -537,7 +537,7 @@ def stored_qc_states(path, result, integer=False):
 
 
 def run_storage_proof():
-    raw_tiffs = sorted(RAW_ROOT.glob('920_*.tif'))
+    raw_tiffs = sorted(RAW_ROOT.glob('*.tif'))
     recording = index_tiffs(
         raw_tiffs,
         signal_channel=1,

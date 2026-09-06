@@ -33,7 +33,7 @@ INTENSITY_ROOT = PROJECT_ROOT / 'workspace' / 'registration-benchmark-intensity'
 REAL_ROOT = PROJECT_ROOT / 'workspace' / 'registration-benchmark-real'
 FOCAL_ROOT = PROJECT_ROOT / 'workspace' / 'registration-benchmark-focal'
 AUTO_ROOT = PROJECT_ROOT / 'workspace' / 'registration-auto-validation'
-REAL_TIFF = PROJECT_ROOT / 'workspace' / 'dev' / '1000_85%_z3_fov4_00001_00001.tif'
+REAL_TIFF = PROJECT_ROOT / 'workspace' / 'dev' / 'lab-session-2.tif'
 FIBRESIGHT_PYTHON = Path(sys.executable)
 SUITE2P_PYTHON = PROJECT_ROOT / 'workspace' / 'dev' / 'envs' / 'suite2p-0.11.1' / 'bin' / 'python'
 CAIMAN_PYTHON = PROJECT_ROOT / 'workspace' / 'dev' / 'envs' / 'caiman-1.12.2' / 'bin' / 'python'
@@ -48,8 +48,8 @@ SOURCES = (
     'dandi-jgcamp8f-soma.npy',
     'dandi-jgcamp8s-soma.npy',
     'dandi-olfactory-bulb.npy',
-    'labmate-tdtomato-soma.npy',
-    'labmate-gcamp-soma.npy',
+    'lab-session-1-channel-2.npy',
+    'lab-session-1-channel-1.npy',
     )
 SOURCE_ANATOMY = {
     'lab-fibresight-demo-train-01.npy': 'fibre',
@@ -60,8 +60,8 @@ SOURCE_ANATOMY = {
     'dandi-jgcamp8f-soma.npy': 'somatic',
     'dandi-jgcamp8s-soma.npy': 'somatic',
     'dandi-olfactory-bulb.npy': 'mesoscale',
-    'labmate-tdtomato-soma.npy': 'somatic',
-    'labmate-gcamp-soma.npy': 'somatic',
+    'lab-session-1-channel-2.npy': 'somatic',
+    'lab-session-1-channel-1.npy': 'somatic',
     }
 BASE_SOURCES = SOURCES[:3]
 AUTO_SOURCES = (
@@ -1338,8 +1338,8 @@ def summarise_piecewise_suite(
         'dandi-jgcamp8f-soma.npy': 'jGCaMP8f',
         'dandi-jgcamp8s-soma.npy': 'jGCaMP8s',
         'dandi-olfactory-bulb.npy': 'olfactory',
-        'labmate-tdtomato-soma.npy': 'tdTomato',
-        'labmate-gcamp-soma.npy': 'GCaMP',
+        'lab-session-1-channel-2.npy': 'session 1 ch2',
+        'lab-session-1-channel-1.npy': 'session 1 ch1',
         }
     sources = list(dict.fromkeys(case.split('/')[0] for case in cases))
     source_centres = [
@@ -3152,7 +3152,7 @@ def main():
             'validate-auto',
             'summarise-piecewise',
             'run-piecewise-intensity',
-            'quality', 'review-rigid',
+            'quality', 'review-rigid', 'review-piecewise',
             'method', 'reference', 'tile', 'measure-tile', 'field', 'measure-field',
             ])
     parser.add_argument('method', nargs='?')
