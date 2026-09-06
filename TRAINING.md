@@ -111,6 +111,51 @@ Add `--no-tta` to disable four-view flip averaging, which is on by default. In t
 
 A new checkpoint that predicts well enough to seed curation replaces MSER as the proposal route for the next labelling round.
 
+## use the training steps from Python
+
+The manifest, evaluation, and prediction stages can be called from a Python script when they need to sit inside a larger loop. Training itself is currently entered through `train --config`; that command loads the recipe, creates the run directory, and writes `best.pt`, `latest.pt`, the history table, and the training figure.
+
+```python
+from fibre_sight.evaluate import evaluate_sessions, write_results
+from fibre_sight.manifest import (
+    assign_session_splits,
+    read_manifest,
+    scan_source_root,
+    write_manifest,
+    )
+from fibre_sight.predict_rois import predict_roi_dict
+
+# build the same session-level split used by build-manifest
+sessions = scan_source_root('workspace/labelled_sessions')
+sessions = assign_session_splits(sessions, val_fraction=0.15, test_fraction=0.15, seed=42)
+write_manifest(sessions, 'workspace/manifests/ch2_manifest.csv')
+
+# evaluate one split and keep the per-session scores
+test_sessions = read_manifest(
+    'workspace/manifests/ch2_manifest.csv',
+    included_only=True,
+    split='test',
+    )
+results = evaluate_sessions(
+    test_sessions,
+    'workspace/output/runs/my_recipe/best.pt',
+    tta=True,
+    )
+write_results(results, 'workspace/output/test_metrics.csv')
+
+# predict one reference image with the trained checkpoint
+roi_dict, labelled, probability = predict_roi_dict(
+    'path/to/ref_mat_ch2.npy',
+    'workspace/output/runs/my_recipe/best.pt',
+    out_path='workspace/output/predicted_ROI_dict.npy',
+    threshold=0.25,
+    min_size=45,
+    tta=True,
+    )
+```
+
+`scan_source_root`, `assign_session_splits`, and `write_manifest` are the Python form of `build-manifest`; `evaluate_sessions` and `write_results` are the corresponding evaluation calls. `predict_roi_dict` saves the legacy ROI dictionary and also returns the dictionary, labelled components, and probability map for further processing. A `ROIPredictor` can be kept in memory when several images share one checkpoint.
+
 ## alternative architectures
 
 ### attention-gated U-Net
