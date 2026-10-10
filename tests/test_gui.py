@@ -144,7 +144,7 @@ def viewport(window):
 
     assert [
         window.tabs.tabText(index) for index in range(window.tabs.count())
-        ] == ['AUTO', 'train', 'segment']
+        ] == ['AUTO', 'train', 'segment', 'MSER']
 
     auto_controls = (
         window.auto_tiff_dir_line,
@@ -226,9 +226,13 @@ def viewport(window):
         assert top_left.x() + button.width() <= bar.width()
         assert top_left.y() + button.height() <= bar.height()
 
-    window.mser_advanced_button.setChecked(True)
+    window.tabs.setCurrentIndex(3)
     app.processEvents()
-    assert window.segment_button.isVisible()
+    assert window.segment_button.visibleRegion().contains(
+        window.segment_button.rect()
+        )
+    assert window.activity_tabs.currentIndex() == 0
+    assert window.activity_tabs.tabText(0) == 'trace inspector'
 
     window.tabs.setCurrentIndex(1)
     app.processEvents()

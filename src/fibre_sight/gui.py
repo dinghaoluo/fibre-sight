@@ -387,12 +387,14 @@ class FibreSightGUI(QMainWindow):
         self.auto_tab.setObjectName('autoTab')
         self.auto_tab_scroll, self.auto_tab_content = self._make_scroll_tab()
         self.predict_tab, self.predict_tab_content = self._make_scroll_tab()
+        self.mser_tab, self.mser_tab_content = self._make_scroll_tab()
         # predict fits inside the rounded Qt tab at its minimum width
         self.predict_tab.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.training_tab, self.training_tab_content = self._make_scroll_tab()
         self.tabs.addTab(self.auto_tab, 'AUTO')
         self.tabs.addTab(self.training_tab, 'train')
         self.tabs.addTab(self.predict_tab, 'segment')
+        self.tabs.addTab(self.mser_tab, 'MSER')
         self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.tabs.tabBar().setExpanding(False)
         self.tabs.tabBar().setUsesScrollButtons(True)
@@ -1093,6 +1095,7 @@ class FibreSightGUI(QMainWindow):
 
         self._layout_auto_tab()
         self._layout_prediction_tab()
+        self._layout_mser_tab()
         self._layout_training_tab()
 
         self.resources_panel = QWidget()
@@ -1245,20 +1248,22 @@ class FibreSightGUI(QMainWindow):
     def controls_tab_changed(self, _index):
         auto_selected = self.tabs.currentWidget() is self.auto_tab
         segment_selected = self.tabs.currentWidget() is self.predict_tab
+        mser_selected = self.tabs.currentWidget() is self.mser_tab
+        curation_selected = segment_selected or mser_selected
         auto_trace_ready = (
             auto_selected
             and self.auto_loaded_config is not None
             and self.trace_cache is not None
             and self.nwb_path == Path(self.auto_loaded_config['output_path'])
             )
-        self.resources_panel.setVisible(segment_selected)
-        self.persistent_panel.setVisible(segment_selected or auto_trace_ready)
-        self.curation_bar.setVisible(segment_selected)
-        self.stage_header.setVisible(segment_selected)
-        self.right_stack.setVisible(segment_selected or auto_trace_ready)
-        if segment_selected:
+        self.resources_panel.setVisible(curation_selected)
+        self.persistent_panel.setVisible(curation_selected or auto_trace_ready)
+        self.curation_bar.setVisible(curation_selected)
+        self.stage_header.setVisible(curation_selected)
+        self.right_stack.setVisible(curation_selected or auto_trace_ready)
+        if curation_selected:
             self.right_stack.setCurrentIndex(0)
-            self.activity_tabs.setCurrentIndex(1)
+            self.activity_tabs.setCurrentIndex(0 if mser_selected else 1)
         elif auto_trace_ready:
             self.right_stack.setCurrentIndex(0)
             self.activity_tabs.setCurrentIndex(0)
@@ -1518,22 +1523,21 @@ class FibreSightGUI(QMainWindow):
         layout.setSpacing(8)
         layout.setContentsMargins(10, 10, 10, 10)
         self._layout_prediction_section(layout)
-        self.mser_advanced_button = QPushButton('MSER proposal controls')
-        self.mser_advanced_button.setCheckable(True)
-        self.set_button_role(self.mser_advanced_button, 'quiet')
-        self.mser_panel = QWidget()
-        mser_layout = QVBoxLayout(self.mser_panel)
-        mser_layout.setContentsMargins(0, 0, 0, 0)
-        mser_layout.setSpacing(6)
-        self._layout_mser_section(mser_layout)
-        mser_actions = QHBoxLayout()
-        mser_actions.addWidget(self.segment_button, 1)
-        mser_actions.addWidget(self.reset_segment_button)
-        mser_layout.addLayout(mser_actions)
-        self.mser_panel.hide()
-        self.mser_advanced_button.toggled.connect(self.mser_panel.setVisible)
-        layout.addWidget(self.mser_advanced_button)
-        layout.addWidget(self.mser_panel)
+        layout.addStretch(1)
+
+    def _layout_mser_tab(self):
+        layout = QVBoxLayout(self.mser_tab_content)
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 10, 10, 10)
+        mser_heading = self.make_section_label('MSER proposals')
+        mser_heading.setFont(load_gui_font(size=11, bold=True))
+        layout.addWidget(mser_heading)
+        layout.addSpacing(8)
+        self._layout_mser_section(layout)
+        actions = QHBoxLayout()
+        actions.addWidget(self.segment_button, 1)
+        actions.addWidget(self.reset_segment_button)
+        layout.addLayout(actions)
         layout.addStretch(1)
 
     def _layout_training_tab(self):
