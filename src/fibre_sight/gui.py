@@ -3997,19 +3997,19 @@ class FibreSightGUI(QMainWindow):
                 ha='center',
                 va='center',
                 color=theme['muted'],
-                fontsize=gui_size + 2,
+                fontsize=gui_size + 1,
                 fontweight='normal',
                 fontfamily=_GUI_FONT_FAMILY,
                 )
             self.ax.text(
                 0.5,
-                0.47,
+                0.45,
                 'click anywhere on this canvas to browse',
                 transform=self.ax.transAxes,
                 ha='center',
                 va='center',
                 color=theme['muted'],
-                fontsize=gui_size,
+                fontsize=gui_size - 1,
                 alpha=0.8,
                 fontfamily=_GUI_FONT_FAMILY,
                 )
