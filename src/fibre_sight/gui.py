@@ -387,7 +387,9 @@ class FibreSightGUI(QMainWindow):
         self.auto_tab.setObjectName('autoTab')
         self.auto_tab_scroll, self.auto_tab_content = self._make_scroll_tab()
         self.predict_tab, self.predict_tab_content = self._make_scroll_tab()
-        self.mser_tab, self.mser_tab_content = self._make_scroll_tab()
+        self.mser_tab = QWidget()
+        self.mser_tab.setObjectName('mserTab')
+        self.mser_tab_scroll, self.mser_tab_content = self._make_scroll_tab()
         # predict fits inside the rounded Qt tab at its minimum width
         self.predict_tab.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.training_tab, self.training_tab_content = self._make_scroll_tab()
@@ -1348,6 +1350,8 @@ class FibreSightGUI(QMainWindow):
             current_scroll = (
                 self.auto_tab_scroll
                 if self.tabs.currentWidget() is self.auto_tab else
+                self.mser_tab_scroll
+                if self.tabs.currentWidget() is self.mser_tab else
                 self.tabs.currentWidget()
                 )
             tab_chrome = max(
@@ -1526,6 +1530,10 @@ class FibreSightGUI(QMainWindow):
         layout.addStretch(1)
 
     def _layout_mser_tab(self):
+        tab_layout = QVBoxLayout(self.mser_tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.setSpacing(6)
+
         layout = QVBoxLayout(self.mser_tab_content)
         layout.setSpacing(8)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -1534,11 +1542,13 @@ class FibreSightGUI(QMainWindow):
         layout.addWidget(mser_heading)
         layout.addSpacing(8)
         self._layout_mser_section(layout)
+        tab_layout.addWidget(self.mser_tab_scroll, 1)
+
         actions = QHBoxLayout()
+        actions.setContentsMargins(10, 0, 10, 10)
         actions.addWidget(self.segment_button, 1)
         actions.addWidget(self.reset_segment_button)
-        layout.addLayout(actions)
-        layout.addStretch(1)
+        tab_layout.addLayout(actions)
 
     def _layout_training_tab(self):
         layout = QVBoxLayout(self.training_tab_content)
@@ -1909,6 +1919,9 @@ class FibreSightGUI(QMainWindow):
             }}
             QWidget#controlsPanel, QWidget#mainPane, QWidget#canvasStage {{
                 background: transparent;
+            }}
+            QWidget#mserTab {{
+                background: {theme['surface']};
             }}
             QWidget#resourcesPanel, QWidget#persistentPanel {{
                 border: 1px solid {theme['border']};
